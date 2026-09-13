@@ -1,0 +1,49 @@
+# Voice_to_Text - default settings
+# Every value here can be overridden on the command line (see: python transcribe.py -h)
+
+# ---- model -----------------------------------------------------------------
+# "large-v3-turbo"  fast, near-large-v3 quality, lowest VRAM   (default)
+# "large-v2"        most robust against hallucination / looping
+# "large-v3"        highest raw accuracy, slightly more prone to loops
+model = "large-v3-turbo"
+
+language = ""          # "" = autodetect per file; or force e.g. "en"
+device = "cuda"
+compute_type = "auto"  # auto picks float16, or int8_float16 when the GPU is busy
+batch_size = 8         # lower to 4 if you hit CUDA out-of-memory
+threads = 8
+
+# ---- word-level alignment (wav2vec2 forced alignment) ---------------------
+align = true
+# align_model = "WAV2VEC2_ASR_LARGE_LV60K_960H"   # default for English; leave unset otherwise
+
+# ---- speaker diarization (token-free pyannote 3.1) -----------------------
+diarize = true
+# num_speakers = 2      # set if you know the exact count
+# min_speakers = 1
+# max_speakers = 6
+
+# ---- outputs -------------------------------------------------------------
+# any of: txt, json, srt, vtt, tsv, "words.json", "speakers.txt"   (or "all")
+formats = ["txt", "json", "srt", "vtt", "tsv", "words.json", "speakers.txt"]
+# output_dir = "out"   # unset = write next to each input
+highlight_words = false
+# max_line_width = 42
+# max_line_count = 2
+overwrite = false
+
+# ---- decoding / anti-hallucination -------------------------------------
+beam_size = 5
+temperature = 0.0
+vad_method = "pyannote"          # "pyannote" (default) or "silero"
+vad_onset = 0.500
+vad_offset = 0.363
+chunk_size = 30
+no_speech_threshold = 0.6
+log_prob_threshold = -1.0
+compression_ratio_threshold = 2.4
+condition_on_previous_text = false   # key setting that prevents runaway loops
+repetition_penalty = 1.15
+no_repeat_ngram_size = 3
+suppress_numerals = false
+# initial_prompt = "Proper nouns: ACME Corp, Jane Doe."

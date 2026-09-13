@@ -1,0 +1,1482 @@
+#!/usr/bin/env python
+"""
+Profanity_Filter - remove flagged profanity from a media file's audio.
+
+End-to-end from a single media file:
+
+  1. transcript  reuse "<name>.json" next to the input, else run Voice_to_Text
+  2. flag        flag_language.py (this folder) finds every hit + timestamp
+  3. backfill    the embedded SubRip track (if any) is cross-checked for words
+                 the transcript missed entirely; found ones are timed via the
+                 transcript's own word timings where possible (see
+                 flag_language.backfill_from_srt)
+  4. remove      ffmpeg pulls ONE audio track out and removes each flagged span:
+       method "mute"  (default) - silence. If the track has more than two
+                 channels, the center channel's real content is checked first
+                 (see detect_center_dominance): when dialogue really does live
+                 on the center channel alone, ONLY that channel is muted -
+                 music/effects on the other channels play through unbroken.
+                 Otherwise, by default (mute_fill = "stems"), the muted span
+                 isn't dead air either: a high-quality stemmer (audio-separator,
+                 see STEM_VENV) pulls the ambient noise/music out of the whole
+                 track ahead of time and that plays through the muted span
+                 instead - so even a plain stereo track keeps its room tone/
+                 score under a bleep. Set mute_fill = "silence" for the old
+                 dead-air behaviour, or if no stemmer is installed (it's the
+                 automatic fallback when STEM_VENV isn't found).
+       method "bleep" - every channel is muted and a 1 kHz tone laid over it.
+       method "cut"   - the flagged span is spliced out entirely, shortening
+                 the file. AUDIO-ONLY INPUTS ONLY (e.g. audiobooks) - cutting
+                 a video file's audio would desync it from the picture, so a
+                 video track refuses this method. There is no "keep the
+                 original as an alt track" for cut (the duration changed, so
+                 that's not meaningful); the output is the cut file itself,
+                 same container/codec as the input, no mkvmerge remux.
+                 On an mp3 source this is genuinely LOSSLESS (mp3_splice_cut):
+                 every kept region is a plain stream copy, bit-identical to
+                 the source - nothing is decoded or re-encoded, only the
+                 flagged spans disappear. Every other codec falls back to a
+                 decode+re-encode pass (cut_track) since naive concatenation
+                 glitches on codecs with inter-frame prediction (AAC, etc.).
+                 ID3v2 tags (including cover art and nonstandard frames) are
+                 copied from the source onto an mp3 output byte-for-byte via
+                 mutagen, not ffmpeg's lossier -map_metadata.
+       method "dialog" - a different job entirely: strip ALL dialogue from
+                 the track (not just flagged words - the wordlists/transcript
+                 aren't even consulted) into a new "(Wordless)" track, added
+                 as a non-default alt track alongside the original (see
+                 dialog_track_default to make it default instead). Same
+                 center-channel-first logic as "mute": if dialogue is clearly
+                 isolated on the center channel across the WHOLE file, only
+                 that channel is muted and every other channel is untouched
+                 (channel count trivially preserved). Otherwise the stemmer
+                 strips the dialogue out of every channel and the result -
+                 same channel count as the source wherever the stemmer can
+                 manage it - becomes the whole output track. See
+                 dialog_remove_track / build_instrumental_stem.
+  5. subs        (mute/bleep only) every cue that overlaps a removed span has
+                 its profane words replaced with *** (subs_mask). "dialog"
+                 leaves subtitles completely alone (there's nothing left to
+                 censor, and the removed dialogue may still be worth reading).
+  6. remux       (mute/bleep/dialog) mkvmerge muxes the cleaned audio (+
+                 cleaned subtitle, mute/bleep only) back in. mute/bleep add it
+                 as a new DEFAULT track named "<original label> (Cleaned)";
+                 dialog adds "<original label> (Wordless)" as a non-default
+                 track by default. Video and all other tracks are copied
+                 bit-for-bit.
+
+Usage:
+  clean.py "Movie (2002).mkv"
+  clean.py "Movie.mkv" --method bleep --beep-gain-db -8
+  clean.py "Audiobook.m4b" --method cut
+  clean.py "Movie.mkv" --method dialog
+  clean.py "Movie.mkv" --dry-run
+
+The stemmer (mute_fill="stems", and --method dialog whenever it can't just
+mute a center channel) needs a one-time setup - see README.md - and both
+features degrade automatically (to plain silence / a clear error) when it
+isn't installed.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import math
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+VOICE_TO_TEXT = HERE.parent / "voice_to_text"
+
+CODEC_EXT = {"flac": ".mka", "ac3": ".ac3", "eac3": ".eac3", "aac": ".m4a"}
+
+# "cut" method: re-encode with whatever the source audio codec already is (the
+# output KEEPS the source file's own extension/container - an audiobook.m4b
+# comes back as audiobook (Cleaned).m4b, just shorter).
+# {ffprobe codec_name: (ffmpeg encoder, lossless?)}
+CUT_CODEC_MAP = {
+    "mp3": ("libmp3lame", False), "aac": ("aac", False),
+    "vorbis": ("libvorbis", False), "opus": ("libopus", False),
+    "flac": ("flac", True), "alac": ("alac", True),
+    "ac3": ("ac3", False), "eac3": ("eac3", False),
+    "pcm_s16le": ("pcm_s16le", True), "pcm_s24le": ("pcm_s24le", True),
+    "pcm_f32le": ("pcm_f32le", True),
+}
+CUT_FALLBACK_CODEC = ("libmp3lame", False)  # unrecognised source codec
+
+# ffmpeg's standard channel layouts (`ffmpeg -layouts`) that occur in real
+# movie audio, channel order as ffmpeg defines it. Used to locate the center
+# (dialogue) channel by name rather than guessing an index from a bare count.
+CHANNEL_LAYOUTS = {
+    "mono": ["FC"], "stereo": ["FL", "FR"], "2.1": ["FL", "FR", "LFE"],
+    "3.0": ["FL", "FR", "FC"], "3.0(back)": ["FL", "FR", "BC"],
+    "4.0": ["FL", "FR", "FC", "BC"],
+    "quad": ["FL", "FR", "BL", "BR"], "quad(side)": ["FL", "FR", "SL", "SR"],
+    "3.1": ["FL", "FR", "FC", "LFE"],
+    "5.0": ["FL", "FR", "FC", "BL", "BR"], "5.0(side)": ["FL", "FR", "FC", "SL", "SR"],
+    "4.1": ["FL", "FR", "FC", "LFE", "BC"],
+    "5.1": ["FL", "FR", "FC", "LFE", "BL", "BR"],
+    "5.1(side)": ["FL", "FR", "FC", "LFE", "SL", "SR"],
+    "6.0": ["FL", "FR", "FC", "BC", "SL", "SR"],
+    "6.0(front)": ["FL", "FR", "FLC", "FRC", "SL", "SR"],
+    "6.1": ["FL", "FR", "FC", "LFE", "BC", "SL", "SR"],
+    "6.1(back)": ["FL", "FR", "FC", "LFE", "BL", "BR", "BC"],
+    "6.1(front)": ["FL", "FR", "LFE", "FLC", "FRC", "SL", "SR"],
+    "7.0": ["FL", "FR", "FC", "BL", "BR", "SL", "SR"],
+    "7.0(front)": ["FL", "FR", "FC", "FLC", "FRC", "SL", "SR"],
+    "7.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+    "7.1(wide)": ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC"],
+    "7.1(wide-side)": ["FL", "FR", "FC", "LFE", "FLC", "FRC", "SL", "SR"],
+}
+
+LANG_NAMES = {
+    "eng": "English", "spa": "Spanish", "fre": "French", "fra": "French",
+    "ger": "German", "deu": "German", "ita": "Italian", "jpn": "Japanese",
+    "por": "Portuguese", "rus": "Russian", "chi": "Chinese", "zho": "Chinese",
+    "kor": "Korean", "dut": "Dutch", "nld": "Dutch", "und": "",
+}
+
+try:
+    import tomllib  # py3.11+
+except ModuleNotFoundError:  # pragma: no cover
+    try:
+        import tomli as tomllib  # py3.10 and earlier: pip install tomli
+    except ModuleNotFoundError:
+        tomllib = None
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class Config:
+    method: str = "mute"               # "mute" (silence, center-channel-aware) | "bleep" | "cut"
+    categories: list = dataclasses.field(default_factory=lambda: ["profanity"])
+    pad_start: float = 0.10
+    pad_end: float = 0.10
+    merge_gap: float = 0.20
+    beep_hz: int = 1000
+    beep_gain_db: float = -6.0         # tone peak level, dBFS ("bleep" only)
+    clean_codec: str = "ac3"           # ac3 | eac3 | aac | flac (lossless)
+    clean_bitrate: str = "224k"        # lossy codecs only, for a <=2ch source
+    clean_bitrate_surround: str = "448k"  # lossy codecs only, for a >2ch source (unless --clean-bitrate given)
+    center_margin_db: float = 6.0      # "mute": center must be this many dB louder than
+    #                                    every other channel, during the flagged spans, to
+    #                                    be treated as dialogue-only-on-center
+    source_track: str = "default"      # "default" | index | 3-letter language
+    track_name_suffix: str = " (Cleaned)"
+    sync_ms: int = 0                   # mkvmerge --sync for the clean track
+
+    mute_fill: str = "stems"           # "mute" only, whenever there's no clean center channel to
+    #                                    mute alone (stereo/mono, or a >2ch track where dialogue
+    #                                    isn't center-only): "stems" (default) plays the stemmed-out
+    #                                    ambient noise/music through the muted span instead of dead
+    #                                    air; "silence" is the old behaviour.
+    stem_model: str = "UVR-MDX-NET-Inst_HQ_3.onnx"  # audio-separator model, Vocals/Instrumental stems
+
+    dialog_track_suffix: str = " (Wordless)"
+    dialog_track_default: bool = False  # "dialog": make the new (Wordless) track the default audio
+
+    cut_bitrate: str = "96k"           # "cut" only, lossy source codecs (audiobooks are low-bitrate speech)
+
+    subs_track: str = "default"        # SubRip track to clean: "default"|index|lang|"none"
+    subs_mask: str = "***"             # what bleeped words become in the subtitle
+    subs_pad: float = 0.15            # s of slack when matching cues to bleep spans
+    srt_backfill: bool = True          # also cross-check the embedded SRT for missed words
+
+    output_dir: str = "out"
+    retranscribe: bool = False
+    overwrite: bool = False
+
+
+def load_config(path: Path) -> Config:
+    cfg = Config()
+    if path.is_file() and tomllib is not None:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        known = {f.name for f in dataclasses.fields(Config)}
+        for key, val in data.items():
+            if key in known:
+                setattr(cfg, key, val)
+            else:
+                print(f"[config] ignoring unknown key: {key}", file=sys.stderr)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# tools
+# ---------------------------------------------------------------------------
+def _find(name: str, extra_dirs=()) -> str | None:
+    for d in extra_dirs:
+        for cand in (Path(d) / f"{name}.exe", Path(d) / name):
+            if cand.is_file():
+                return str(cand)
+    return shutil.which(name)
+
+
+# A dedicated venv for the stemmer (audio-separator, which pulls in torch/
+# onnxruntime) so its dependency pins never touch the venv clean.py itself
+# runs under, or any other tool's torch build. Not auto-installed; see
+# README for the one-time setup command. Used by `mute_fill = "stems"` and
+# `--method dialog`; both degrade gracefully (silence / a hard error,
+# respectively) when it's missing.
+STEM_VENV = HERE / ".venv-stem"
+
+
+def locate_stem_tool() -> str | None:
+    exe = STEM_VENV / "Scripts" / "audio-separator.exe"
+    return str(exe) if exe.is_file() else None
+
+
+def locate_tools() -> dict:
+    bins = [HERE / "bin", HERE / "bin" / "mkvtoolnix"]
+    mkv_dirs = bins + [Path(r"C:\Program Files\MKVToolNix"),
+                       Path(r"C:\Program Files (x86)\MKVToolNix")]
+    tools = {
+        "ffmpeg": _find("ffmpeg", bins),
+        "ffprobe": _find("ffprobe", bins),
+        "mkvmerge": _find("mkvmerge", mkv_dirs),
+        "mkvextract": _find("mkvextract", mkv_dirs),
+    }
+    missing = [n for n, v in tools.items() if not v]
+    if missing:
+        raise SystemExit(
+            f"[error] tool(s) not found: {', '.join(missing)}\n"
+            f"        install MKVToolNix / ffmpeg on PATH, or drop the .exe(s) "
+            f"in {HERE / 'bin'}")
+    return tools
+
+
+def _q(s) -> str:
+    s = str(s)
+    return f'"{s}"' if (" " in s or not s) else s
+
+
+def run(cmd: list, **kw) -> subprocess.CompletedProcess:
+    print("  $ " + " ".join(_q(c) for c in cmd), flush=True)
+    return subprocess.run(cmd, check=True, **kw)
+
+
+def run_json(cmd: list) -> dict:
+    out = subprocess.run(cmd, check=True, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace").stdout
+    return json.loads(out)
+
+
+def probe_streams(ffprobe: str, media: Path) -> list[dict]:
+    return run_json([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(media)])["streams"]
+
+
+def has_video_track(streams: list[dict]) -> bool:
+    """A real video stream - not just embedded cover art (attached_pic), which
+    mp3/m4a/m4b audiobooks routinely carry and which is not a reason to treat
+    the file as video."""
+    return any(s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")
+              for s in streams)
+
+
+# ---------------------------------------------------------------------------
+# steps
+# ---------------------------------------------------------------------------
+def ensure_transcript(media: Path, cfg: Config) -> Path:
+    js = media.with_suffix(".json")
+    if js.is_file() and not cfg.retranscribe:
+        print(f"  transcript: {js.name} (reusing)")
+        return js
+    py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
+    script = VOICE_TO_TEXT / "transcribe.py"
+    if not py.is_file() or not script.is_file():
+        raise SystemExit(f"[error] no '{js.name}' next to the input and "
+                         f"Voice_to_Text not found at {VOICE_TO_TEXT}")
+    print(f"  transcript: running Voice_to_Text on {media.name} ...")
+    run([str(py), "-X", "utf8", str(script), str(media),
+         "--formats", "json", "--no-diarize"], cwd=str(VOICE_TO_TEXT))
+    if not js.is_file():
+        raise SystemExit("[error] transcription produced no .json")
+    return js
+
+
+def load_matchers(cfg: Config) -> dict:
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import flag_language  # lives in this folder
+    return flag_language.load_matchers(only=set(cfg.categories))
+
+
+def load_extra_spans(path: Path) -> list[dict]:
+    """Hand-reviewed spans that no wordlist can safely catch (e.g. sexual
+    content using otherwise-ordinary words) - a JSON list of
+    {"start": seconds, "end": seconds, "label": "...", "category": "..."}
+    in the TARGET FILE's own local timeline. Turned into hit-shaped dicts so
+    they flow through the exact same padding/merge/report path as a real
+    wordlist hit; unlike wordlist hits they're never filtered by
+    --categories, since picking one by hand already *is* the categorisation."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    hits = []
+    for e in data:
+        label = e.get("label") or e.get("text") or "manual"
+        hits.append({
+            "time": float(e["start"]), "end": float(e.get("end", e["start"] + 0.6)),
+            "categories": [e.get("category", "manual")], "match": label,
+            "context": e.get("text", label), "speaker": None,
+            "locator": "manual", "source": "manual",
+        })
+    return hits
+
+
+def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = None,
+               extra_hits: list[dict] | None = None):
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import flag_language
+
+    cats = set(cfg.categories)
+    hits, _fmt = flag_language.scan_file(js, matchers)
+
+    if cfg.srt_backfill and srt_path is not None and srt_path.is_file():
+        try:
+            words = flag_language.load_word_timeline(js)
+            extra = flag_language.backfill_from_srt(srt_path, matchers, words)
+            n_before = len(hits)
+            hits = hits + extra
+            if extra:
+                print(f"  srt backfill: +{len(extra)} word(s) the transcript missed entirely "
+                      f"({n_before} -> {len(hits)})")
+        except Exception as exc:
+            print(f"  [warn] srt backfill failed ({exc!r})", file=sys.stderr)
+
+    extra_hits = extra_hits or []
+    if extra_hits:
+        print(f"  extra spans: +{len(extra_hits)} hand-reviewed span(s) not from a wordlist")
+    all_hits = hits + extra_hits
+
+    raw = []
+    for h in hits:                        # wordlist-driven hits respect --categories
+        if not set(h["categories"]) & cats:
+            continue
+        st = h["time"]
+        if st is None:
+            continue
+        en = h["end"] if h["end"] is not None else st + 0.6
+        raw.append([max(0.0, st - cfg.pad_start), en + cfg.pad_end, [h]])
+    for h in extra_hits:                  # hand-reviewed: always included
+        st = h["time"]
+        en = h["end"] if h["end"] is not None else st + 0.6
+        raw.append([max(0.0, st - cfg.pad_start), en + cfg.pad_end, [h]])
+    raw.sort()
+
+    merged: list[list] = []
+    for s, e, hs in raw:
+        if merged and s - merged[-1][1] <= cfg.merge_gap:
+            merged[-1][1] = max(merged[-1][1], e)
+            merged[-1][2] += hs
+        else:
+            merged.append([s, e, list(hs)])
+    return merged, all_hits
+
+
+def _pick(pool: list, want: str, label: str):
+    """Pick one track from `pool` by 'default' / index / language."""
+    if want == "default":
+        return next((t for t in pool if t["properties"].get("default_track")), pool[0])
+    if str(want).isdigit():
+        i = int(want)
+        if i >= len(pool):
+            raise SystemExit(f"[error] {label} track {i} out of range (0..{len(pool) - 1})")
+        return pool[i]
+    t = next((t for t in pool
+              if (t["properties"].get("language", "") or "").lower() == want.lower()), None)
+    if not t:
+        raise SystemExit(f"[error] no {label} track with language '{want}'")
+    return t
+
+
+def choose_audio(tracks: list, want: str):
+    audio = [t for t in tracks if t["type"] == "audio"]
+    if not audio:
+        raise SystemExit("[error] input has no audio tracks")
+    t = _pick(audio, want, "audio")
+    return t, audio.index(t)
+
+
+def choose_subs(tracks: list, want: str):
+    """The SubRip text subtitle track to clean, or (None, None) to skip."""
+    if str(want).lower() in ("none", "skip", "off", ""):
+        return None, None
+    srt = [t for t in tracks if t["type"] == "subtitles"
+           and (t["properties"].get("codec_id") or "").upper().startswith("S_TEXT/UTF8")]
+    if not srt:
+        return None, None
+    t = _pick(srt, want, "subtitle")
+    return t, t["id"]
+
+
+def clean_label(track: dict, suffix: str) -> str:
+    p = track["properties"]
+    name = p.get("track_name") or ""
+    lang = p.get("language") or "und"
+    if name:
+        return name + suffix
+    if LANG_NAMES.get(lang):
+        return LANG_NAMES[lang] + suffix
+    return suffix.strip()
+
+
+def _span_expr(spans) -> str:
+    return "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e, _ in spans)
+
+
+def build_bleep_filter(spans, cfg: Config, n_channels: int, sample_rate: int, audio_pos: int) -> str:
+    expr = _span_expr(spans)
+    layout = {1: "mono", 2: "stereo", 3: "2.1", 4: "quad", 6: "5.1", 8: "7.1"}.get(
+        n_channels, f"{n_channels}c")
+    pan = "|".join([f"pan={layout}"] + [f"c{i}=c0" for i in range(n_channels)])
+    af = f"aformat=sample_fmts=fltp:sample_rates={sample_rate}"
+    amp = 10.0 ** (cfg.beep_gain_db / 20.0)  # beep_gain_db is target peak dBFS
+    tone = f"aevalsrc=exprs='{amp:.4f}*sin(2*PI*{cfg.beep_hz}*t)':sample_rate={sample_rate}"
+    return (
+        f"[0:a:{audio_pos}]volume=0:enable='{expr}',{af}[main];\n"
+        f"{tone},{pan},volume=0:enable='not({expr})',{af}[beep];\n"
+        f"[main][beep]amix=inputs=2:normalize=0:duration=first[out]"
+    )
+
+
+def build_mute_filter(spans, audio_pos: int, n_channels: int,
+                      center_idx: int | None, layout_name: str | None) -> str:
+    """Silence `spans`. If `center_idx` is given (a recognised named layout
+    with a center channel), only that channel is muted - every other channel
+    passes through untouched, sample for sample. Otherwise the whole track
+    is muted."""
+    expr = _span_expr(spans)
+    if center_idx is None:
+        return f"[0:a:{audio_pos}]volume=0:enable='{expr}'[out]"
+
+    names = CHANNEL_LAYOUTS[layout_name]
+    pads = "".join(f"[cs{i}]" for i in range(n_channels))
+    lines = [f"[0:a:{audio_pos}]channelsplit=channel_layout={layout_name}{pads};"]
+    for i in range(n_channels):
+        if i == center_idx:
+            lines.append(f"[cs{i}]volume=0:enable='{expr}'[cm{i}];")
+        else:
+            lines.append(f"[cs{i}]anull[cm{i}];")
+    joins = "".join(f"[cm{i}]" for i in range(n_channels))
+    chan_map = "|".join(f"{i}.0-{names[i]}" for i in range(n_channels))
+    lines.append(f"{joins}join=inputs={n_channels}:channel_layout={layout_name}:map={chan_map}[out]")
+    return "\n".join(lines)
+
+
+def build_duck_filter(spans, audio_pos: int, sample_rate: int) -> str:
+    """Like build_mute_filter()'s all-channels-silenced case, except the muted
+    span isn't dead air: input [1:a] - a pre-separated instrumental/ambient
+    stem covering the whole track, same channel count, see
+    build_instrumental_stem() - plays through instead. Same "gate two signals
+    then amix them" trick as build_bleep_filter's tone insertion."""
+    expr = _span_expr(spans)
+    af = f"aformat=sample_fmts=fltp:sample_rates={sample_rate}"
+    return (
+        f"[0:a:{audio_pos}]volume=0:enable='{expr}',{af}[main];\n"
+        f"[1:a]volume=0:enable='not({expr})',{af}[fill];\n"
+        f"[main][fill]amix=inputs=2:normalize=0:duration=first[out]"
+    )
+
+
+_ASTATS_CHANNEL_RE = re.compile(r"Channel:\s*(\d+)")
+_ASTATS_RMS_RE = re.compile(r"RMS level dB:\s*(-?[\d.]+|-inf)")
+
+
+def _parse_astats_rms(stderr_text: str) -> dict[int, float]:
+    """{0-based channel index: RMS level dB} from ffmpeg astats stderr text
+    (stops at the "Overall" section)."""
+    levels: dict[int, float] = {}
+    cur: int | None = None
+    for line in stderr_text.splitlines():
+        m = _ASTATS_CHANNEL_RE.search(line)
+        if m:
+            cur = int(m.group(1)) - 1
+            continue
+        if "Overall" in line:
+            cur = None
+            continue
+        if cur is not None:
+            r = _ASTATS_RMS_RE.search(line)
+            if r:
+                levels[cur] = float("-inf") if r.group(1) == "-inf" else float(r.group(1))
+    return levels
+
+
+# ffmpeg's `enable` option runs its value through the AVExpr boolean parser,
+# which hard-fails ("Error when evaluating the expression") once a chained
+# between(...)+between(...)+... expression passes a fixed term count -
+# bisected empirically against a real ffmpeg build: 99 terms parse fine, 100
+# fails every time, so this really is a hard-coded limit in ffmpeg itself,
+# not a length/performance thing. A span list past this size (one span per
+# subtitle cue across a whole episode routinely runs into the hundreds) is
+# processed in batches and the per-batch RMS levels combined - see
+# _combine_batch_rms. Kept comfortably under the observed 99-term ceiling.
+_ASTATS_BATCH_LIMIT = 80
+
+
+def _combine_batch_rms(per_batch: list[dict[int, float]], whole_file_duration: float,
+                       span_duration: float) -> dict[int, float]:
+    """Combine per-channel RMS-dB readings from several `detect_center_dominance`
+    batches into the single figure one pass over ALL spans together would
+    have produced, correcting for each batch's own dilution.
+
+    Each batch's astats RMS is computed by ffmpeg over the WHOLE file
+    duration with everything outside that batch's spans zeroed (`volume=0:
+    enable=`doesn't drop samples, it silences them in place) - so a batch's
+    reported dB is `10*log10(sum_of_squares_in_its_spans / whole_file_samples)`,
+    diluted by however much of the file its spans don't cover. Converting
+    back to linear power, undoing that per-batch dilution (multiply by
+    whole_file_duration), summing across batches, then dividing by the TRUE
+    total span duration (not the whole file) reconstructs the correct
+    mean-square over just the dialogue time - physically the same number a
+    single ffmpeg pass over every span at once would report, if ffmpeg's
+    expression parser could actually take that many terms."""
+    if span_duration <= 0:
+        return {}
+    power_sum: dict[int, float] = {}
+    for levels in per_batch:
+        for ch, db in levels.items():
+            p = 0.0 if db == float("-inf") else 10.0 ** (db / 10.0)
+            power_sum[ch] = power_sum.get(ch, 0.0) + p * whole_file_duration
+    return {ch: (10.0 * math.log10(p / span_duration) if p > 0 else float("-inf"))
+            for ch, p in power_sum.items()}
+
+
+def detect_center_dominance(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans,
+                            center_idx: int, cfg: Config) -> tuple[bool, dict[int, float]]:
+    """During exactly `spans` (every channel silenced everywhere else, so the
+    comparison is unaffected by the rest of the film), is the center
+    channel's RMS level clearly the loudest? That means dialogue in this
+    track really does live on the center channel alone.
+
+    `spans` can be arbitrarily long - see _ASTATS_BATCH_LIMIT/_combine_batch_rms.
+    For mute_track this is the flagged-word spans being muted; for
+    dialog_remove_track it's normally the whole episode's dialogue moments
+    derived from its subtitles (see subtitle_dialogue_spans) rather than the
+    whole file - testing across the whole file dilutes the comparison with
+    every narration-free stretch and can hide a center channel that's
+    genuinely dominant specifically while someone is talking."""
+    span_duration = sum(e - s for s, e, *_ in spans)
+    if span_duration <= 0:
+        return False, {}
+    whole_file_duration = probe_duration(ffprobe, media)
+    per_batch: list[dict[int, float]] = []
+    for i in range(0, len(spans), _ASTATS_BATCH_LIMIT):
+        batch = spans[i:i + _ASTATS_BATCH_LIMIT]
+        expr = _span_expr(batch)
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", str(media), "-map", f"0:a:{audio_pos}",
+             "-af", f"volume=0:enable='not({expr})',astats=metadata=0", "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        per_batch.append(_parse_astats_rms(proc.stderr))
+    levels = _combine_batch_rms(per_batch, whole_file_duration, span_duration)
+    if center_idx not in levels:
+        return False, levels
+    center = levels[center_idx]
+    others = [v for i, v in levels.items() if i != center_idx]
+    if not others:
+        return False, levels
+    loudest_other = max(others)
+    dominant = center - loudest_other >= cfg.center_margin_db or (center > -90 and loudest_other <= -90)
+    return dominant, levels
+
+
+def _encode_track(ffmpeg: str, media: Path, graph: str, n_channels: int, cfg: Config, tmp: Path,
+                  extra_inputs: list[Path] | None = None) -> Path:
+    (tmp / "filter.txt").write_text(graph, encoding="utf-8")  # kept for --keep-temp / debugging
+    bitrate = cfg.clean_bitrate if n_channels <= 2 else cfg.clean_bitrate_surround
+    codec_args = {
+        "flac": ["-c:a", "flac", "-compression_level", "5"],
+        "ac3": ["-c:a", "ac3", "-b:a", bitrate],
+        "eac3": ["-c:a", "eac3", "-b:a", bitrate],
+        "aac": ["-c:a", "aac", "-b:a", bitrate],
+    }[cfg.clean_codec]
+    out = tmp / f"clean{CODEC_EXT[cfg.clean_codec]}"
+    extra: list[str] = []
+    for p in (extra_inputs or []):
+        extra += ["-i", str(p)]
+    run([ffmpeg, "-hide_banner", "-y", "-i", str(media), *extra,
+         "-filter_complex", graph,
+         "-map", "[out]", "-map_metadata", "-1", *codec_args, str(out)])
+    return out
+
+
+def bleep_track(ffmpeg: str, media: Path, audio_pos: int, spans, cfg: Config,
+                chosen: dict, tmp: Path) -> Path:
+    props = chosen["properties"]
+    n_ch = int(props.get("audio_channels") or 2)
+    sr = int(props.get("audio_sampling_frequency") or 48000)
+    graph = build_bleep_filter(spans, cfg, n_ch, sr, audio_pos)
+    return _encode_track(ffmpeg, media, graph, n_ch, cfg, tmp)
+
+
+def _center_channel_dominance(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans,
+                              n_ch: int, cfg: Config):
+    """For a >2ch track: is there a named layout with a center (FC) channel,
+    and - during `spans` - is it clearly the loudest? Returns (center_idx,
+    layout_name, dominant, levels, raw_layout); center_idx/layout_name/
+    dominant are all None when the probed layout isn't a recognised one with
+    a center channel at all (raw_layout is ffprobe's string in that case, for
+    logging - may be empty)."""
+    raw = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", f"a:{audio_pos}",
+         "-show_entries", "stream=channel_layout", "-of", "csv=p=0", str(media)],
+        capture_output=True, text=True, check=True).stdout.strip()
+    names = CHANNEL_LAYOUTS.get(raw)
+    if not (names and len(names) == n_ch and "FC" in names):
+        return None, None, None, {}, raw
+    center_idx = names.index("FC")
+    dominant, levels = detect_center_dominance(ffmpeg, ffprobe, media, audio_pos, spans, center_idx, cfg)
+    return center_idx, raw, dominant, levels, raw
+
+
+def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cfg: Config,
+              chosen: dict, tmp: Path, stem_tool: str | None = None) -> Path:
+    props = chosen["properties"]
+    n_ch = int(props.get("audio_channels") or 2)
+    sr = int(props.get("audio_sampling_frequency") or 48000)
+
+    center_idx = None
+    layout_name = None
+    if n_ch > 2:
+        center_idx, layout_name, dominant, levels, raw = _center_channel_dominance(
+            ffmpeg, ffprobe, media, audio_pos, spans, n_ch, cfg)
+        if layout_name is None:
+            print(f"  channels: {n_ch}ch, layout {raw or 'unknown'} has no recognised center "
+                  f"channel -> muting all channels")
+        else:
+            lv = ", ".join(f"ch{i}={v:.1f}dB" for i, v in sorted(levels.items()))
+            if dominant:
+                print(f"  channels: {layout_name}, center=FC(#{center_idx}) dominant during flagged "
+                      f"speech ({lv}) -> muting center channel only")
+            else:
+                print(f"  channels: {layout_name}, center=FC(#{center_idx}) NOT clearly dominant "
+                      f"({lv}) -> muting all channels")
+                center_idx = None
+
+    if center_idx is not None:
+        graph = build_mute_filter(spans, audio_pos, n_ch, center_idx, layout_name)
+        return _encode_track(ffmpeg, media, graph, n_ch, cfg, tmp)
+
+    # No clean center channel to mute alone (stereo/mono, or a >2ch track
+    # where dialogue isn't center-only) - by default, back the muted spans
+    # with the stemmed-out ambient noise/music instead of dead silence.
+    if cfg.mute_fill == "stems":
+        if stem_tool is not None:
+            print(f"  fill: stemming ambient noise/music to play through the muted span(s) "
+                  f"(mute_fill=stems, model={cfg.stem_model})")
+            inst_wav = build_instrumental_stem(ffmpeg, stem_tool, media, audio_pos, n_ch, sr, tmp,
+                                               cfg, layout_name)
+            graph = build_duck_filter(spans, audio_pos, sr)
+            return _encode_track(ffmpeg, media, graph, n_ch, cfg, tmp, extra_inputs=[inst_wav])
+        print(f"  [note] mute_fill=stems but no stemmer found at {STEM_VENV} - falling back to "
+              f"silence (see README for one-time setup)", file=sys.stderr)
+
+    graph = build_mute_filter(spans, audio_pos, n_ch, None, None)
+    return _encode_track(ffmpeg, media, graph, n_ch, cfg, tmp)
+
+
+# ---------------------------------------------------------------------------
+# stemming: separate dialogue from "everything else" (music/effects/ambience)
+# via audio-separator (see STEM_VENV / locate_stem_tool). Used by
+# mute_track()'s mute_fill="stems" and by --method dialog.
+# ---------------------------------------------------------------------------
+def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config) -> Path:
+    """Run the stemmer on a (fake-)stereo wav, asking for only the
+    Instrumental stem (--single_stem), and return its output path."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run([stem_tool, str(wav_in), "-m", cfg.stem_model,
+         "--output_dir", str(out_dir), "--output_format", "WAV",
+         "--single_stem", "Instrumental"])
+    matches = sorted(out_dir.glob("*Instrumental*.wav"))
+    if not matches:
+        raise SystemExit(f"[error] stemmer produced no Instrumental output in {out_dir} - "
+                         f"check that model {cfg.stem_model!r} labels its stems Vocals/Instrumental")
+    return matches[0]
+
+
+def _mono_to_fake_stereo(ffmpeg: str, mono_wav: Path, out_wav: Path) -> None:
+    """Duplicate a mono channel to L=R - most separator models are trained on
+    stereo and refuse (or do badly on) a true mono input."""
+    run([ffmpeg, "-hide_banner", "-y", "-i", str(mono_wav),
+         "-af", "pan=stereo|c0=c0|c1=c0", str(out_wav)])
+
+
+def _stereo_instrumental_to_mono(ffmpeg: str, stereo_wav: Path, out_wav: Path) -> None:
+    """Fold a fake-stereo separator output back down to the single real
+    channel it came from."""
+    run([ffmpeg, "-hide_banner", "-y", "-i", str(stereo_wav),
+         "-af", "pan=mono|c0=0.5*c0+0.5*c1", str(out_wav)])
+
+
+def build_instrumental_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos: int, n_ch: int,
+                            sample_rate: int, tmp: Path, cfg: Config,
+                            layout_name: str | None) -> Path:
+    """A wav with the SAME channel count as the source audio track, holding
+    only its non-dialogue content ("everything else" - music/effects/room
+    tone) with the dialogue stemmed out.
+
+    <=2 channels: the track goes through the separator as-is (mono is faked
+    up to stereo first, then folded back down - see above).
+
+    >2 channels: the separator model only knows stereo, so there's no single
+    call that preserves a 5.1/7.1 layout. Instead each channel is split out,
+    faked up to stereo, stemmed, and folded back to mono ON ITS OWN - then all
+    of them are rejoined into one file with the original layout. Slower (one
+    separator pass per channel) but it's the only way to keep the channel
+    count the caller asked for."""
+    if n_ch <= 2:
+        src_wav = tmp / "stem_src.wav"
+        run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
+             "-map", f"0:a:{audio_pos}", str(src_wav)])
+        if n_ch == 1:
+            fake = tmp / "stem_src_stereo.wav"
+            _mono_to_fake_stereo(ffmpeg, src_wav, fake)
+            inst = _run_separator(stem_tool, fake, tmp / "stem_out", cfg)
+            mono_out = tmp / "instrumental.wav"
+            _stereo_instrumental_to_mono(ffmpeg, inst, mono_out)
+            return mono_out
+        return _run_separator(stem_tool, src_wav, tmp / "stem_out", cfg)
+
+    ch_dir = tmp / "stem_channels"
+    ch_dir.mkdir(exist_ok=True)
+    inst_paths = []
+    for i in range(n_ch):
+        mono = ch_dir / f"ch{i}.wav"
+        run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
+             "-map", f"0:a:{audio_pos}", "-af", f"pan=mono|c0=c{i}", str(mono)])
+        fake = ch_dir / f"ch{i}_stereo.wav"
+        _mono_to_fake_stereo(ffmpeg, mono, fake)
+        inst = _run_separator(stem_tool, fake, ch_dir / f"out{i}", cfg)
+        mono_inst = ch_dir / f"ch{i}_inst.wav"
+        _stereo_instrumental_to_mono(ffmpeg, inst, mono_inst)
+        inst_paths.append(mono_inst)
+
+    layout = layout_name if layout_name in CHANNEL_LAYOUTS else f"{n_ch}c"
+    merged = tmp / "instrumental.wav"
+    inputs = [a for p in inst_paths for a in ("-i", str(p))]
+    pads = "".join(f"[{i}:a]" for i in range(n_ch))
+    graph = f"{pads}join=inputs={n_ch}:channel_layout={layout}[out]"
+    run([ffmpeg, "-hide_banner", "-y", *inputs,
+         "-filter_complex", graph, "-map", "[out]", "-ar", str(sample_rate), str(merged)])
+    return merged
+
+
+# subtitle codec IDs (mkvmerge's -J naming) that carry exact per-cue start/end
+# timing as text - vs. image-based formats (PGS/VobSub) that only give a
+# presentation start per cue, so an end has to be estimated (see _pgs_cue_starts).
+_TEXT_SUB_CODECS = {"S_TEXT/UTF8", "S_TEXT/ASS", "S_TEXT/SSA", "S_TEXT/USF"}
+_IMAGE_SUB_CODECS = {"S_HDMV/PGS", "S_VOBSUB"}
+
+
+def _pick_dialogue_subs_track(tracks: list) -> dict | None:
+    """The best subtitle track in `tracks` for deriving dialogue timing (see
+    subtitle_dialogue_spans) - a text track over an image-based one (exact
+    cue end times vs. an estimate), the default/English one when there's a
+    choice. None if the file has no subtitle track at all."""
+    subs = [t for t in tracks if t["type"] == "subtitles"]
+    if not subs:
+        return None
+
+    def rank(t: dict) -> tuple[int, int, int]:
+        p = t["properties"]
+        is_text = (p.get("codec_id") or "").upper() in _TEXT_SUB_CODECS
+        is_default = bool(p.get("default_track"))
+        is_eng = (p.get("language") or "").lower() in ("eng", "en")
+        return (0 if is_text else 1, 0 if is_default else 1, 0 if is_eng else 1)
+
+    return sorted(subs, key=rank)[0]
+
+
+def _pgs_cue_starts(ffprobe: str, sup_path: Path) -> list[float]:
+    """Distinct subtitle-presentation start times (s) in a PGS/VobSub .sup -
+    each on-screen cue shows up as several packets sharing one PTS (its
+    separate PCS/WDS/PDS/ODS segments), so this only needs the packet
+    timestamps, not their (image) content."""
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "s", "-show_entries", "packet=pts_time",
+         "-of", "csv=p=0", str(sup_path)],
+        capture_output=True, text=True, check=True).stdout
+    return sorted(set(round(float(x), 3) for x in out.split() if x.strip()))
+
+
+def subtitle_dialogue_spans(mkvextract: str, ffprobe: str, media: Path, track: dict, tmp: Path,
+                            merge_gap: float = 1.5, max_cue_dur: float = 4.0) -> list[tuple]:
+    """[(start, end, None), ...] for every dialogue moment in subtitle
+    `track` of `media`, nearby cues merged into one span (gap <= `merge_gap`)
+    - used to test center-channel dominance only where someone is actually
+    talking (see detect_center_dominance) instead of being diluted by long
+    narration-free/music-only stretches, which a nature documentary can have
+    a lot of. A text track (SRT/ASS/...) gives exact cue end times via
+    flag_language.parse_srt; an image-based one (PGS/VobSub) only carries a
+    presentation start per cue, so its end is estimated as either
+    `max_cue_dur` later or the next cue's start, whichever comes first.
+    Can run into the hundreds of spans for a full episode - that's fine,
+    detect_center_dominance batches internally (see _ASTATS_BATCH_LIMIT)."""
+    codec = (track["properties"].get("codec_id") or "").upper()
+    if codec in _TEXT_SUB_CODECS:
+        srt_path = tmp / "dialogue_subs.srt"
+        run([mkvextract, "tracks", str(media), f"{track['id']}:{srt_path}"])
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        import flag_language  # lives in this folder
+        starts_ends = [(u.start, u.end) for u in flag_language.parse_srt(srt_path)
+                       if u.start is not None and u.end is not None]
+    else:
+        sup_path = tmp / "dialogue_subs.sup"
+        run([mkvextract, "tracks", str(media), f"{track['id']}:{sup_path}"])
+        starts = _pgs_cue_starts(ffprobe, sup_path)
+        starts_ends = []
+        for i, s in enumerate(starts):
+            nxt = starts[i + 1] if i + 1 < len(starts) else s + max_cue_dur
+            e = min(s + max_cue_dur, nxt)
+            if e > s:
+                starts_ends.append((s, e))
+
+    starts_ends.sort()
+    merged: list[list[float]] = []
+    for s, e in starts_ends:
+        if merged and s - merged[-1][1] <= merge_gap:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e, None) for s, e in merged]
+
+
+def dialog_remove_track(ffmpeg: str, ffprobe: str, mkvextract: str, media: Path, audio_pos: int,
+                        cfg: Config, chosen: dict, tmp: Path, stem_tool: str | None,
+                        tracks: list | None = None) -> tuple[Path, bool]:
+    """--method dialog: strip ALL dialogue from the track (not just flagged
+    words). Returns (clean_audio_path, used_center_trick).
+
+    If the track has a recognised center channel and dialogue is dominant
+    there DURING THE TRACK'S DIALOGUE MOMENTS (derived from an embedded
+    subtitle track via subtitle_dialogue_spans - falls back to testing the
+    whole file when there's no usable subtitle track), only that channel is
+    muted for the entire runtime - every other channel's music/effects play
+    through untouched, and the channel count is trivially preserved. If not
+    (stereo/mono, or a >2ch track without a clean center), the stemmer
+    extracts the non-dialogue content from every channel instead (see
+    build_instrumental_stem) and that becomes the whole output track.
+
+    Testing against the whole file instead of just the dialogue moments is a
+    real trap on this kind of source: a nature-documentary mix can spend most
+    of its runtime on narration-free music/effects, which dilutes an
+    over-the-whole-file measurement enough to hide a center channel that's
+    actually clearly dominant specifically while the narrator is talking -
+    confirmed on a real nature-documentary track, where the whole-file reading
+    put the center channel as the QUIETEST of the six (~-86 dB, everything
+    else ~-30 to -43 dB) while its subtitle-gated reading told the opposite
+    story once the astats batching fix (_ASTATS_BATCH_LIMIT) made measuring
+    that many spans possible at all."""
+    props = chosen["properties"]
+    n_ch = int(props.get("audio_channels") or 2)
+    sr = int(props.get("audio_sampling_frequency") or 48000)
+    duration = probe_duration(ffprobe, media)
+    whole_span = [(0.0, duration, None)]
+
+    dialogue_spans = whole_span
+    span_note = "the whole file (no usable subtitle track found)"
+    subs_track = _pick_dialogue_subs_track(tracks) if tracks else None
+    if subs_track is not None:
+        try:
+            derived = subtitle_dialogue_spans(mkvextract, ffprobe, media, subs_track, tmp)
+        except Exception as exc:
+            derived = []
+            print(f"  [warn] couldn't derive dialogue timing from subtitles ({exc!r}) - "
+                  f"testing the center channel across the whole file instead", file=sys.stderr)
+        if derived:
+            dialogue_spans = derived
+            cov = sum(e - s for s, e, _ in derived)
+            span_note = f"{len(derived)} dialogue span(s) from subtitles ({cov:.0f}s covered)"
+    print(f"  center-channel test uses: {span_note}")
+
+    center_idx = layout_name = None
+    if n_ch > 2:
+        center_idx, layout_name, dominant, levels, raw = _center_channel_dominance(
+            ffmpeg, ffprobe, media, audio_pos, dialogue_spans, n_ch, cfg)
+        if layout_name is None:
+            print(f"  channels: {n_ch}ch, layout {raw or 'unknown'} has no recognised center "
+                  f"channel -> stemming dialogue out of every channel")
+        else:
+            lv = ", ".join(f"ch{i}={v:.1f}dB" for i, v in sorted(levels.items()))
+            if dominant:
+                print(f"  channels: {layout_name}, center=FC(#{center_idx}) carries the dialogue "
+                      f"alone ({lv}) -> muting center channel only, for the whole file")
+            else:
+                print(f"  channels: {layout_name}, center=FC(#{center_idx}) NOT clearly dialogue-only "
+                      f"({lv}) -> stemming dialogue out of every channel")
+                center_idx = None
+
+    if center_idx is not None:
+        graph = build_mute_filter(whole_span, audio_pos, n_ch, center_idx, layout_name)
+        return _encode_track(ffmpeg, media, graph, n_ch, cfg, tmp), True
+
+    if stem_tool is None:
+        raise SystemExit(
+            f"[error] --method dialog needs the stemmer for this source (no clean center channel "
+            f"to mute alone) but none was found at {STEM_VENV} - see README for one-time setup")
+    inst_wav = build_instrumental_stem(ffmpeg, stem_tool, media, audio_pos, n_ch, sr, tmp, cfg,
+                                       layout_name)
+    bitrate = cfg.clean_bitrate if n_ch <= 2 else cfg.clean_bitrate_surround
+    codec_args = {
+        "flac": ["-c:a", "flac", "-compression_level", "5"],
+        "ac3": ["-c:a", "ac3", "-b:a", bitrate],
+        "eac3": ["-c:a", "eac3", "-b:a", bitrate],
+        "aac": ["-c:a", "aac", "-b:a", bitrate],
+    }[cfg.clean_codec]
+    out = tmp / f"clean{CODEC_EXT[cfg.clean_codec]}"
+    run([ffmpeg, "-hide_banner", "-y", "-i", str(inst_wav), *codec_args, str(out)])
+    return out, False
+
+
+def build_cut_filter(spans, audio_pos: int) -> str:
+    """Splice the flagged spans out entirely and close the resulting gaps -
+    the standard ffmpeg aselect+asetpts idiom."""
+    expr = _span_expr(spans)
+    return f"[0:a:{audio_pos}]aselect='not({expr})',asetpts=N/SR/TB[out]"
+
+
+def remap_time(t: float, spans) -> float:
+    """Where original timestamp `t` lands on the post-cut timeline: shifted
+    left by the total duration of every cut span before it. A `t` that falls
+    inside a cut span collapses to that span's (already-remapped) start,
+    matching where aselect+asetpts actually puts the surrounding audio."""
+    cut = sum(max(0.0, min(t, e) - s) for s, e, _ in spans)
+    return max(0.0, t - cut)
+
+
+def build_remapped_chapters(chapters: list[dict], spans) -> tuple[str | None, int]:
+    """FFMETADATA1 text with every chapter's start/end shifted onto the
+    post-cut timeline. A chapter entirely swallowed by cut span(s) - its
+    remapped start >= end - is dropped. Returns (text_or_None, kept_count)."""
+    lines = [";FFMETADATA1", ""]
+    kept = 0
+    for i, ch in enumerate(chapters):
+        start = remap_time(float(ch["start_time"]), spans)
+        end = remap_time(float(ch["end_time"]), spans)
+        if end <= start:
+            continue
+        title = (ch.get("tags") or {}).get("title") or f"Chapter {i + 1}"
+        lines += ["[CHAPTER]", "TIMEBASE=1/1000",
+                  f"START={round(start * 1000)}", f"END={round(end * 1000)}",
+                  f"title={title}", ""]
+        kept += 1
+    return ("\n".join(lines) if kept else None), kept
+
+
+def cut_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cfg: Config,
+             tmp: Path) -> tuple[Path, str]:
+    """Cut the flagged spans out of the audio. Returns (file, output extension)
+    - the output keeps the source file's own container/extension, re-encoded
+    with a matching codec (cutting requires a decode, so a bit-exact stream
+    copy isn't possible)."""
+    streams = probe_streams(ffprobe, media)
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    src = audio_streams[audio_pos] if audio_pos < len(audio_streams) else {}
+    encoder, lossless = CUT_CODEC_MAP.get(src.get("codec_name", ""), CUT_FALLBACK_CODEC)
+    if src.get("codec_name") not in CUT_CODEC_MAP:
+        print(f"  [note] unrecognised source codec {src.get('codec_name')!r} - "
+              f"cutting to mp3 instead of matching it")
+
+    graph = build_cut_filter(spans, audio_pos)
+    (tmp / "filter.txt").write_text(graph, encoding="utf-8")
+
+    # chapters: remap every mark onto the post-cut timeline rather than drop
+    # them - cutting shifts every timestamp after the first cut, so they'd
+    # otherwise silently go out of sync with the (now shorter) audio.
+    chapters = run_json([ffprobe, "-v", "error", "-show_chapters", "-of", "json",
+                         str(media)]).get("chapters", [])
+    extra_inputs: list[str] = []
+    chapter_args = ["-map_chapters", "-1"]
+    if chapters:
+        meta_text, kept = build_remapped_chapters(chapters, spans)
+        if meta_text:
+            meta_path = tmp / "chapters.ffmeta"
+            meta_path.write_text(meta_text, encoding="utf-8")
+            extra_inputs = ["-i", str(meta_path)]
+            chapter_args = ["-map_chapters", "1"]
+            dropped = len(chapters) - kept
+            note = f" ({dropped} dropped - entirely inside a cut span)" if dropped else ""
+            print(f"  chapters: remapped {kept}/{len(chapters)} through the cut{note}")
+        else:
+            print(f"  chapters: all {len(chapters)} chapter(s) were entirely inside cut "
+                  f"spans - none carried over")
+
+    ext = media.suffix if src.get("codec_name") in CUT_CODEC_MAP else ".mp3"
+    codec_args = ["-c:a", encoder] if lossless else ["-c:a", encoder, "-b:a", cfg.cut_bitrate]
+    out = tmp / f"cut{ext}"
+    run([ffmpeg, "-hide_banner", "-y", "-i", str(media), *extra_inputs,
+         "-filter_complex", graph, "-map", "[out]",
+         "-map_metadata", "0", *chapter_args, *codec_args, str(out)])
+    return out, ext
+
+
+# ---------------------------------------------------------------------------
+# "cut" on an mp3 source: genuinely lossless splice
+# ---------------------------------------------------------------------------
+# MP3 is one of the few codecs where cutting doesn't have to mean decoding:
+# every KEPT region can be a plain stream copy (bit-identical to the source,
+# snapped to the nearest frame boundary) and only the flagged spans actually
+# disappear - nothing is ever decoded or re-encoded. cut_track() above still
+# exists as the general fallback for every other codec (AAC/Opus/etc. don't
+# splice cleanly - inter-frame prediction/priming makes a naive concat click
+# or glitch at the seams - so they go through the old decode+re-encode path).
+def probe_duration(ffprobe: str, media: Path) -> float:
+    d = run_json([ffprobe, "-v", "error", "-show_format", "-of", "json", str(media)])
+    return float(d["format"]["duration"])
+
+
+def build_keep_regions(spans, duration: float, min_len: float = 0.05) -> list[tuple[float, float]]:
+    """The complement of the flagged spans within [0, duration] - the audio
+    that survives. A sliver shorter than `min_len` (back-to-back cuts, or a
+    cut flush against either end of the file) is dropped rather than kept as
+    a near-zero-length segment."""
+    regions: list[tuple[float, float]] = []
+    cursor = 0.0
+    for s, e, _ in spans:
+        s, e = max(0.0, s), min(duration, e)
+        if s > cursor + min_len:
+            regions.append((cursor, s))
+        cursor = max(cursor, e)
+    if duration - cursor > min_len:
+        regions.append((cursor, duration))
+    return regions
+
+
+def mp3_splice_cut(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
+                   spans, tmp: Path) -> tuple[Path, float, float]:
+    """Remove `spans` from an mp3 with no re-encoding at all. Returns
+    (spliced_file, source_duration, new_duration).
+
+    Each kept region is extracted with `-c copy` (output-side -ss/-to, which
+    for a stream copy just picks the first/last whole MP3 frame in range -
+    exact even on a VBR source, unlike input-side seeking which trusts a
+    possibly-stale Xing TOC). The regions are then joined with ffmpeg's
+    concat demuxer, still `-c copy` - MP3 frames are independently decodable,
+    so a frame-aligned concat plays back seamlessly.
+
+    Known imperfection: the source's Xing/LAME VBR header (a fake first
+    frame carrying the original total frame/byte count for fast duration
+    display and gapless-playback trimming) is dropped rather than
+    regenerated - regenerating it correctly requires re-encoding, which
+    would defeat the point. Every player this was tested with falls back to
+    scanning frame headers - ffprobe's own reported duration on the spliced
+    file matches the sum of the kept regions exactly - but a strict/old
+    player that trusts a Xing TOC without a sanity check could show a wrong
+    duration or seek slightly off. Gapless-playback padding metadata (LAME's
+    encoder delay/padding) is also lost for the same reason.
+    """
+    duration = probe_duration(ffprobe, media)
+    regions = build_keep_regions(spans, duration)
+    if not regions:
+        raise SystemExit("[error] every second of the file is flagged - nothing would remain")
+
+    seg_paths = []
+    for i, (s, e) in enumerate(regions):
+        seg = tmp / f"keep_{i:04d}.mp3"
+        run([ffmpeg, "-hide_banner", "-y", "-i", str(media), "-map", f"0:a:{audio_pos}",
+             "-ss", f"{s:.3f}", "-to", f"{e:.3f}", "-c:a", "copy", "-map_metadata", "-1", str(seg)])
+        seg_paths.append(seg)
+
+    list_path = tmp / "concat_list.txt"
+    list_path.write_text(
+        "\n".join(f"file '{p.as_posix()}'" for p in seg_paths) + "\n", encoding="utf-8")
+    spliced = tmp / "spliced.mp3"
+    run([ffmpeg, "-hide_banner", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+         "-c", "copy", "-map_metadata", "-1", str(spliced)])
+
+    new_duration = probe_duration(ffprobe, spliced)
+    return spliced, duration, new_duration
+
+
+def preserve_id3_tags(source: Path, dest: Path, spans=None) -> dict:
+    """Copy every ID3v2 frame from `source` onto `dest` byte-for-byte via
+    mutagen - title/artist/album/track/genre/comment, cover art (APIC),
+    nonstandard frames (Audible rips carry WOAS/UFID/NARRATEDBY, etc.), the
+    lot. ffmpeg's -map_metadata only round-trips the text frames it
+    recognises and drops attached pictures entirely, which is exactly the
+    "careful not to lose metadata" failure mode this avoids.
+
+    If `spans` (the removed audio spans) is given and the source has ID3v2
+    chapter frames (CHAP/CTOC - rare for a book already split one-file-per-
+    chapter, but common for a single-file audiobook), each CHAP's start/end
+    is remapped onto the post-cut timeline with the same remap_time() used
+    for ffprobe chapters elsewhere in this file; a chapter entirely swallowed
+    by a cut span is dropped. Byte offsets in remapped CHAP frames (an
+    optional, rarely-used alternative to time offsets) are set to the ID3
+    "not used" sentinel (0xFFFFFFFF) since splicing invalidates them."""
+    try:
+        from mutagen.id3 import ID3, CHAP
+    except ImportError:
+        return {"copied": False, "reason": "mutagen not installed"}
+
+    try:
+        src_id3 = ID3(source)
+    except Exception as exc:
+        return {"copied": False, "reason": f"source has no readable ID3 tag ({exc!r})"}
+
+    n_chapters = 0
+    if spans:
+        for key in list(src_id3.keys()):
+            frame = src_id3[key]
+            if not isinstance(frame, CHAP):
+                continue
+            new_start = round(remap_time(frame.start_time / 1000.0, spans) * 1000)
+            new_end = round(remap_time(frame.end_time / 1000.0, spans) * 1000)
+            if new_end <= new_start:
+                del src_id3[key]
+                continue
+            frame.start_time, frame.end_time = new_start, new_end
+            frame.start_offset = frame.end_offset = 0xFFFFFFFF
+            n_chapters += 1
+
+    src_id3.save(dest, v2_version=3)
+    return {"copied": True, "frames": len(src_id3.keys()), "chapters_remapped": n_chapters}
+
+
+_SRT_TIME = re.compile(r"(\d{1,3}):([0-5]?\d):([0-5]?\d)[,.](\d{1,3})")
+
+
+def _srt_sec(m) -> float:
+    h, mm, ss, ms = m
+    return int(h) * 3600 + int(mm) * 60 + int(ss) + int(ms.ljust(3, "0")) / 1000.0
+
+
+def censor_srt(text: str, spans, matchers: dict, mask: str, pad: float):
+    """Replace matcher hits with `mask` in every cue that overlaps a bleep span."""
+    ivals = [(s - pad, e + pad) for s, e, _ in spans]
+    blocks = re.split(r"\r?\n\r?\n", text.lstrip("﻿").strip())
+    out, cues_hit, words = [], 0, 0
+    for block in blocks:
+        lines = [ln.rstrip("\r") for ln in block.split("\n")]
+        ti = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        times = _SRT_TIME.findall(lines[ti]) if ti is not None else []
+        if ti is None or len(times) < 2:
+            out.append(block)
+            continue
+        cs, ce = _srt_sec(times[0]), _srt_sec(times[1])
+        if not any(cs < ie and lo < ce for lo, ie in ivals):
+            out.append(block)
+            continue
+        body = lines[ti + 1:]
+        new_body = []
+        for ln in body:
+            for rx in matchers.values():
+                if rx is not None:
+                    ln, n = rx.subn(mask, ln)
+                    words += n
+            new_body.append(ln)
+        if new_body != body:
+            cues_hit += 1
+        out.append("\n".join(lines[:ti + 1] + new_body))
+    return "\n\n".join(out) + "\n", cues_hit, words
+
+
+def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
+          clean_audio: Path, chosen_audio: dict,
+          clean_srt: Path | None, chosen_subs: dict | None,
+          audio_suffix: str | None = None, audio_default: bool = True) -> None:
+    suffix = cfg.track_name_suffix if audio_suffix is None else audio_suffix
+    a_lang = chosen_audio["properties"].get("language") or "und"
+    a_name = clean_label(chosen_audio, suffix)
+
+    args = [mkvmerge, "-o", str(out_mkv)]
+    if audio_default:                                   # clear default on the track(s) it replaces
+        for t in tracks:
+            if t["type"] == "audio" or (clean_srt and t["type"] == "subtitles"):
+                args += ["--default-track-flag", f"{t['id']}:0"]
+    args += [str(media)]
+
+    args += ["--language", f"0:{a_lang}", "--track-name", f"0:{a_name}",
+             "--default-track-flag", f"0:{1 if audio_default else 0}",
+             "--sync", f"0:{cfg.sync_ms}", str(clean_audio)]
+    print(f'  new audio track: "{a_name}"  [{a_lang}]  {"default" if audio_default else "alt (non-default)"}')
+
+    subs_ref = None
+    if clean_srt and chosen_subs is not None:
+        s_lang = chosen_subs["properties"].get("language") or "und"
+        s_name = clean_label(chosen_subs, cfg.track_name_suffix)
+        args += ["--language", f"0:{s_lang}", "--track-name", f"0:{s_name}",
+                 "--default-track-flag", "0:1", str(clean_srt)]
+        subs_ref = "2:0"
+        print(f'  new subtitle track: "{s_name}"  [{s_lang}]  default')
+
+    order = [f"0:{t['id']}" for t in tracks if t["type"] == "video"]
+    order += ["1:0"] + [f"0:{t['id']}" for t in tracks if t["type"] == "audio"]
+    if subs_ref:
+        order.append(subs_ref)
+    order += [f"0:{t['id']}" for t in tracks if t["type"] == "subtitles"]
+    order += [f"0:{t['id']}" for t in tracks
+             if t["type"] not in ("video", "audio", "subtitles")]
+    args += ["--track-order", ",".join(order)]
+
+    run(args)
+
+
+# ---------------------------------------------------------------------------
+def fmt_hms(t: float) -> str:
+    h, rem = divmod(max(0.0, t), 3600)
+    m, s = divmod(rem, 60)
+    return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="clean.py", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("input", help="media file (mkv recommended)")
+    p.add_argument("--method", choices=["mute", "bleep", "cut", "dialog"],
+                   help="removal method: 'mute' (default, silence, center-channel-aware), "
+                        "'bleep', 'cut' (splice out entirely - audio-only inputs only), or "
+                        "'dialog' (strip ALL dialogue - not just flagged words - into a new "
+                        "(Wordless) track; ignores the wordlists/--categories entirely)")
+    p.add_argument("--categories", help="comma list: profanity,irreverence")
+    p.add_argument("--extra-spans", dest="extra_spans",
+                   help="JSON file of hand-reviewed [{start,end,label,category}] spans (input's "
+                        "own local timeline) to remove in addition to whatever the wordlists find "
+                        "- e.g. sexual content that can't be safely regex-matched. Always included, "
+                        "regardless of --categories.")
+    p.add_argument("--pad", type=float, help="shortcut: set --pad-start and --pad-end")
+    p.add_argument("--pad-start", dest="pad_start", type=float)
+    p.add_argument("--pad-end", dest="pad_end", type=float)
+    p.add_argument("--merge-gap", dest="merge_gap", type=float)
+    p.add_argument("--beep-hz", dest="beep_hz", type=int, help="'bleep' only")
+    p.add_argument("--beep-gain-db", dest="beep_gain_db", type=float, help="'bleep' only")
+    p.add_argument("--center-margin-db", dest="center_margin_db", type=float,
+                   help="'mute'/'dialog' only: how many dB louder the center channel must be than "
+                        "every other channel to mute it alone (default 6)")
+    p.add_argument("--mute-fill", dest="mute_fill", choices=["stems", "silence"],
+                   help="'mute' only: what plays during a muted span with no clean center channel "
+                        "to mute alone - the stemmed-out ambient noise/music (default) or dead "
+                        "silence (old behaviour)")
+    p.add_argument("--stem-model", dest="stem_model",
+                   help="audio-separator model filename used for stemming (mute_fill=stems, and "
+                        "--method dialog whenever it can't just mute a center channel)")
+    p.add_argument("--dialog-default", dest="dialog_track_default", action="store_true", default=None,
+                   help="'dialog' only: make the new (Wordless) track the default audio track "
+                        "instead of adding it as a non-default alt track")
+    p.add_argument("--clean-codec", dest="clean_codec", choices=["flac", "ac3", "eac3", "aac"],
+                   help="'mute'/'bleep' only")
+    p.add_argument("--clean-bitrate", dest="clean_bitrate", help="'mute'/'bleep' only, for a <=2ch source")
+    p.add_argument("--clean-bitrate-surround", dest="clean_bitrate_surround",
+                   help="'mute'/'bleep' only, for a >2ch source")
+    p.add_argument("--cut-bitrate", dest="cut_bitrate", help="'cut' only, for a lossy source codec")
+    p.add_argument("--source-track", dest="source_track",
+                   help='"default", an audio index (0,1,...), or a language (eng)')
+    p.add_argument("--sync-ms", dest="sync_ms", type=int, help="delay the clean track by N ms")
+    p.add_argument("--subs-track", dest="subs_track",
+                   help='SubRip track to clean: "default", index, language, or "none"')
+    p.add_argument("--no-subs", dest="subs_track", action="store_const", const="none",
+                   help="do not touch subtitles")
+    p.add_argument("--no-srt-backfill", dest="srt_backfill", action="store_false", default=None,
+                   help="don't cross-check the embedded SRT for words the transcript missed")
+    p.add_argument("--output-dir", dest="output_dir")
+    p.add_argument("--retranscribe", action="store_true", default=None)
+    p.add_argument("--overwrite", action="store_true", default=None)
+    p.add_argument("--keep-temp", action="store_true", help="copy the bleeped track + filter graph to output-dir")
+    p.add_argument("--dry-run", action="store_true", help="print the spans and stop before ffmpeg/mkvmerge")
+    p.add_argument("--config", default=str(HERE / "config.toml"))
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    args = build_arg_parser().parse_args(argv)
+    cfg = load_config(Path(args.config))
+
+    if args.pad is not None:
+        cfg.pad_start = cfg.pad_end = args.pad
+    for name in ["method", "pad_start", "pad_end", "merge_gap", "beep_hz",
+                 "beep_gain_db", "center_margin_db", "mute_fill", "stem_model",
+                 "dialog_track_default", "clean_codec", "clean_bitrate",
+                 "clean_bitrate_surround", "cut_bitrate", "source_track",
+                 "sync_ms", "subs_track", "srt_backfill", "output_dir", "retranscribe", "overwrite"]:
+        val = getattr(args, name, None)
+        if val is not None:
+            setattr(cfg, name, val)
+    if args.categories:
+        cfg.categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+
+    tools = locate_tools()
+    ffmpeg, ffprobe = tools["ffmpeg"], tools["ffprobe"]
+    mkvmerge, mkvextract = tools["mkvmerge"], tools["mkvextract"]
+
+    media = Path(args.input).expanduser().resolve()
+    if not media.is_file():
+        raise SystemExit(f"[error] not found: {media}")
+
+    is_video = has_video_track(probe_streams(ffprobe, media))
+    if cfg.method == "cut":
+        if is_video:
+            raise SystemExit(
+                f"[error] --method cut only supports audio-only input (e.g. audiobooks) - "
+                f"{media.name} has a video track, and cutting audio out of a video would "
+                f"desync it from the picture. Use --method mute or --method bleep instead.")
+        out_ext = media.suffix or ".mp3"
+    else:
+        if media.suffix.lower() != ".mkv":
+            print(f"  [note] input is {media.suffix}, not .mkv - mkvmerge will still "
+                  f"try to read it; output is always .mkv")
+        out_ext = ".mkv"
+
+    out_dir = Path(cfg.output_dir)
+    if not out_dir.is_absolute():
+        out_dir = HERE / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name_suffix = cfg.dialog_track_suffix if cfg.method == "dialog" else cfg.track_name_suffix
+    out_path = out_dir / f"{media.stem}{name_suffix}{out_ext}"
+    if out_path.exists() and not cfg.overwrite:
+        raise SystemExit(f"[error] {out_path} exists (use --overwrite)")
+
+    print(f"== {media.name} ==")
+    matchers, js = {}, None
+    if cfg.method != "dialog":                    # 'dialog' strips ALL dialogue - no wordlists needed
+        matchers = load_matchers(cfg)
+        js = ensure_transcript(media, cfg)
+
+    tracks = run_json([mkvmerge, "-J", str(media)])["tracks"]
+    chosen, audio_pos = choose_audio(tracks, cfg.source_track)
+    cp = chosen["properties"]
+    print(f"  cleaning audio #{audio_pos}: "
+          f"{cp.get('language', 'und')} / {cp.get('track_name') or '<no name>'} / "
+          f"{cp.get('audio_channels', '?')}ch {cp.get('codec_id', '')}")
+
+    chosen_subs, subs_tid = (None, None)
+    if cfg.method not in ("cut", "dialog"):
+        chosen_subs, subs_tid = choose_subs(tracks, cfg.subs_track)
+        if str(cfg.subs_track).lower() not in ("none", "skip", "off", "") and chosen_subs is None:
+            print("  subtitles: no SubRip text track to clean - skipping")
+
+    stem_tool = locate_stem_tool()
+    subs_stats = None
+    with tempfile.TemporaryDirectory(prefix="pf_", dir=out_dir) as td:
+        tmp = Path(td)
+
+        raw_srt = None
+        if chosen_subs is not None:
+            raw_srt = tmp / "orig.srt"
+            run([mkvextract, "tracks", str(media), f"{subs_tid}:{raw_srt}"])
+
+        if cfg.method == "dialog":
+            print("  method: dialog removal - stripping ALL dialogue (not just flagged words) "
+                  "into a new (Wordless) track")
+            if args.dry_run:
+                print("  (dry run - stopping before ffmpeg / mkvmerge)")
+                return 0
+            spans, all_hits, total = [], [], 0.0
+            clean_audio, used_center = dialog_remove_track(
+                ffmpeg, ffprobe, mkvextract, media, audio_pos, cfg, chosen, tmp, stem_tool, tracks)
+            clean_srt = None
+        else:
+            extra_hits = load_extra_spans(args.extra_spans) if args.extra_spans else None
+            spans, all_hits = find_spans(js, cfg, matchers, raw_srt, extra_hits)
+            total = sum(e - s for s, e, _ in spans)
+            print(f"  flagged: {len(all_hits)} hit(s) -> {len(spans)} span(s) to {cfg.method}, {total:.1f}s")
+            for s, e, hs in spans:
+                words = ", ".join(sorted({h["match"] for h in hs}))
+                tag = "  [srt-only]" if hs and all(h.get("source") == "srt-backfill" for h in hs) else ""
+                print(f"    {fmt_hms(s)} - {fmt_hms(e)}  {words}{tag}")
+            if not spans:
+                print("  nothing flagged - no output written")
+                return 0
+            if args.dry_run:
+                print("  (dry run - stopping before ffmpeg / mkvmerge)")
+                return 0
+
+            src_codec = None
+            if cfg.method == "cut":
+                src_audio_streams = [s for s in probe_streams(ffprobe, media) if s.get("codec_type") == "audio"]
+                if audio_pos < len(src_audio_streams):
+                    src_codec = src_audio_streams[audio_pos].get("codec_name")
+
+            lossless_splice = False
+            if cfg.method == "bleep":
+                clean_audio = bleep_track(ffmpeg, media, audio_pos, spans, cfg, chosen, tmp)
+            elif cfg.method == "mute":
+                clean_audio = mute_track(ffmpeg, ffprobe, media, audio_pos, spans, cfg, chosen, tmp, stem_tool)
+            elif src_codec == "mp3":
+                clean_audio, src_dur, new_dur = mp3_splice_cut(ffmpeg, ffprobe, media, audio_pos, spans, tmp)
+                lossless_splice = True
+                print(f"  lossless splice (mp3, no re-encode): {src_dur:.1f}s -> {new_dur:.1f}s")
+            else:
+                clean_audio, _ext = cut_track(ffmpeg, ffprobe, media, audio_pos, spans, cfg, tmp)
+
+            clean_srt = None
+            if raw_srt is not None:
+                new_text, ncues, nwords = censor_srt(
+                    raw_srt.read_text(encoding="utf-8-sig"), spans, matchers,
+                    cfg.subs_mask, cfg.subs_pad)
+                clean_srt = tmp / "clean.srt"
+                clean_srt.write_text(new_text, encoding="utf-8")
+                subs_stats = {"cues": ncues, "words": nwords}
+                print(f"  subtitles: {cfg.subs_mask!r} into {nwords} word(s) across {ncues} cue(s)")
+
+        id3_info = None
+        if cfg.method == "cut":
+            shutil.copy2(clean_audio, out_path)
+            print(f"  cut {total:.1f}s of flagged audio out of the file (no alt track - "
+                  f"the duration changed)")
+            if src_codec == "mp3":
+                id3_info = preserve_id3_tags(media, out_path, spans)
+                if id3_info.get("copied"):
+                    print(f"  id3 tags: {id3_info['frames']} frame(s) carried over from the source"
+                          + (f", {id3_info['chapters_remapped']} chapter mark(s) remapped"
+                             if id3_info["chapters_remapped"] else ""))
+                else:
+                    print(f"  [warn] id3 tags NOT copied ({id3_info.get('reason')})", file=sys.stderr)
+            if args.keep_temp and (tmp / "filter.txt").is_file():
+                shutil.copy2(tmp / "filter.txt", out_dir / f"{media.stem}.filter.txt")
+        elif cfg.method == "dialog":
+            remux(mkvmerge, media, tracks, cfg, out_path, clean_audio, chosen, None, None,
+                  audio_suffix=cfg.dialog_track_suffix, audio_default=cfg.dialog_track_default)
+            if args.keep_temp:
+                shutil.copy2(clean_audio, out_dir / f"{media.stem}{name_suffix}{clean_audio.suffix}")
+                if (tmp / "filter.txt").is_file():
+                    shutil.copy2(tmp / "filter.txt", out_dir / f"{media.stem}.filter.txt")
+        else:
+            remux(mkvmerge, media, tracks, cfg, out_path,
+                  clean_audio, chosen, clean_srt, chosen_subs)
+            if args.keep_temp:
+                shutil.copy2(clean_audio, out_dir / f"{media.stem}{cfg.track_name_suffix}{clean_audio.suffix}")
+                shutil.copy2(tmp / "filter.txt", out_dir / f"{media.stem}.filter.txt")
+                if clean_srt:
+                    shutil.copy2(clean_srt, out_dir / f"{media.stem}{cfg.track_name_suffix}.srt")
+
+    report = out_dir / f"{media.stem}{name_suffix}.bleeps.json"
+    report.write_text(json.dumps({
+        "source": str(media),
+        "output": str(out_path),
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "method": cfg.method,
+        "beep_hz": cfg.beep_hz if cfg.method == "bleep" else None,
+        "beep_gain_db": cfg.beep_gain_db if cfg.method == "bleep" else None,
+        "pad_start": cfg.pad_start if cfg.method != "dialog" else None,
+        "pad_end": cfg.pad_end if cfg.method != "dialog" else None,
+        "hits": len(all_hits),
+        "hits_from_srt_backfill": sum(1 for h in all_hits if h.get("source") == "srt-backfill"),
+        "subtitles": subs_stats,
+        "lossless_splice": lossless_splice if cfg.method == "cut" else None,
+        "id3_tags": id3_info if cfg.method == "cut" else None,
+        "used_center_channel_trick": used_center if cfg.method == "dialog" else None,
+        "spans": [{"start": round(s, 3), "end": round(e, 3),
+                   "matches": sorted({h["match"] for h in hs})} for s, e, hs in spans],
+    }, indent=2), encoding="utf-8")
+
+    print(f"  wrote: {out_path}")
+    print(f"         {report.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

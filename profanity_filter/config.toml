@@ -1,0 +1,102 @@
+# Profanity_Filter - defaults  (override any of these on the command line)
+
+# "mute"  (default) - silence the flagged span. If the source track has more
+#          than two channels, the center channel is checked first: when
+#          dialogue really is isolated there (see center_margin_db below),
+#          ONLY the center channel is muted - music/effects on every other
+#          channel keep playing right through, unbroken. Otherwise (stereo,
+#          no recognised center channel, or dialogue isn't center-only) the
+#          muted span is filled per mute_fill below.
+# "bleep" - every channel is muted and a 1 kHz tone laid over it.
+# "cut"   - the flagged span is spliced out entirely, shortening the file.
+#           AUDIO-ONLY INPUTS ONLY (e.g. audiobooks) - refuses any input with
+#           a real video track (embedded cover art doesn't count), since
+#           cutting a video's audio would desync it from the picture. No
+#           "keep the original as an alt track" either, since the duration
+#           changed - the output is just the cut file itself, same
+#           container/codec as the source, no mkvmerge remux.
+# "dialog" - a different job: strip ALL dialogue (not just flagged words -
+#           the wordlists aren't consulted) into a new "(Wordless)" alt
+#           track. See dialog_track_suffix / dialog_track_default below.
+method = "mute"
+
+# which flag_language categories to act on (from Voice_to_Text/wordlists/)
+categories = ["profanity", "irreverence"]
+
+# padding (seconds) added before / after each flagged word before removing it.
+# aligned word timestamps often start a hair late, so pad_start >= pad_end.
+pad_start = 0.10
+pad_end = 0.10
+merge_gap = 0.20             # merge two flagged spans closer than this into one
+
+# "mute" only: during exactly the flagged spans (with the rest of the track
+# silenced, so the comparison is unaffected by everything else in the film),
+# how many dB louder must the center channel be than every other channel to
+# be treated as dialogue-only-on-center and muted alone?
+center_margin_db = 6.0
+
+# "mute" only, whenever there's no clean center channel to mute alone (stereo/
+# mono, or a >2ch track where dialogue isn't center-only):
+#   "stems"   (default) - a high-quality stemmer (audio-separator) pulls the
+#             ambient noise/music out of the whole track ahead of time, and
+#             THAT plays through the muted span instead of dead air. Falls
+#             back to "silence" automatically if the stemmer isn't installed
+#             (see README.md for the one-time setup - it's a separate venv,
+#             nothing this needs touches your global Python packages).
+#   "silence" - the old behaviour: the muted span is dead air.
+mute_fill = "stems"
+
+# audio-separator model used for stemming (mute_fill = "stems", and
+# method = "dialog" whenever it can't just mute a center channel). Must be a
+# model that splits into Vocals/Instrumental stems - only the Instrumental
+# one is ever kept.
+stem_model = "UVR-MDX-NET-Inst_HQ_3.onnx"
+
+# "bleep" only: the tone
+beep_hz = 1000
+beep_gain_db = -6.0          # tone PEAK level, dBFS (0 = full scale; -6 is a loud, clear bleep)
+
+# "cut" only: bitrate for a lossy source codec (audiobooks are low-bitrate
+# speech; lossless sources - flac/wav/alac - re-encode losslessly instead)
+cut_bitrate = "96k"
+
+# encoding of the cleaned audio track - the ONLY thing re-encoded.
+# everything else (video, subs, other audio) is a straight mkvmerge remux.
+# ac3/eac3/aac keep the output size close to the source; flac is lossless but
+# much bigger.
+clean_codec = "ac3"                # ac3 | eac3 | aac | flac (lossless)
+clean_bitrate = "224k"             # lossy codecs only, for a <=2 channel source
+clean_bitrate_surround = "448k"    # lossy codecs only, for a >2 channel source
+#                                    (ignored if --clean-bitrate is passed explicitly)
+
+# which source audio track to clean:
+#   "default"  -> the file's default audio track
+#   "0","1"..  -> that audio track by index
+#   "eng"      -> first audio track with that language
+source_track = "default"
+
+track_name_suffix = " (Cleaned)"
+sync_ms = 0                  # mkvmerge --sync for the clean track; bump if lip-sync drifts
+
+# "dialog" only: name/default-ness of the new dialogue-free track.
+dialog_track_suffix = " (Wordless)"
+dialog_track_default = false  # true = make it the default audio track (like "(Cleaned)" does);
+#                                false (default) = add it as a non-default alt track instead
+
+# embedded SubRip subtitles: every cue that overlaps a bleep gets its profane
+# words replaced with subs_mask, then re-muxed as a new default "(Cleaned)" track.
+# ("default" below means subtitle cleaning is ON whenever the source has a usable
+# text-based subtitle track - "none" is the only way to turn it off.)
+subs_track = "default"       # "default" | index | language | "none" to leave subs alone
+subs_mask = "***"
+subs_pad = 0.15            # seconds of slack when matching cues to bleep spans
+
+# cross-check the embedded SRT for profanity the transcript missed entirely
+# (dropped or mis-heard words); located via the transcript's own word timings
+# where possible, interpolated between neighbours otherwise. See
+# flag_language.backfill_from_srt().
+srt_backfill = true
+
+output_dir = "out"           # relative to this folder, or an absolute path
+retranscribe = false         # true = always re-run Voice_to_Text even if <name>.json exists
+overwrite = false

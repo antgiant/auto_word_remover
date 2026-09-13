@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# dedicated venv - recreate per README.md
+/.venv/
+
+# whisper + wav2vec2 weights - re-downloaded/placed per README.md
+/models/
+
+# self-contained caches (see README.md "Models")
+/hf_cache/
+/torch_cache/
+
+# optional bin (uv.exe etc.) - see README.md
+/bin/
+
+# run output, logs, local samples - never source
+/out/
+/logs/
+/samples/

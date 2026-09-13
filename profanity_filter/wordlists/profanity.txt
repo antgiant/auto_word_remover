@@ -1,0 +1,48 @@
+# profanity.txt  --  coarse language
+#
+# One entry per line. A line that starts with '#' is a comment.
+#   plain text   = literal word / phrase, matched case-insensitively, whole-word
+#   re:<pattern> = a raw (case-insensitive) regular expression
+#
+# This is a starting point. Add or remove entries to match your own standard;
+# flag_language.py re-reads this file on every run.
+
+re:fu+ck\w*
+re:mother ?fu+ck\w*
+re:motherf\w*
+re:sh[i1]+t\w*
+bullshit
+horseshit
+batshit
+re:\bdumbass\w*
+re:\bjackass\w*
+re:\basshole\w*
+re:\basshat\w*
+re:\bass ?wipe\w*
+re:\bass ?clown\w*
+re:\bdamn\w*
+re:\bdammit\b
+re:b[i1]+tch\w*
+re:\bbastard\w*
+re:\bdick(head|wad|face|bag)\w*
+re:\bdicks?\b
+re:\bpiss(ed|ing|er|es)?\b
+re:\bpiss off\b
+re:\bhell\b
+re:\bass\b
+re:\bcunt\w*
+re:\bcocksuck\w*
+re:\btwat\w*
+re:\bwank(er|ing|ed|s)?\b
+re:\bbollocks\b
+re:\bprick\b
+re:\bslut\w*
+re:\bwhore\w*
+re:\bnigg(a|er)\w*
+re:\bfag(got)?s?\b
+re:\bretard\w*
+re:\bcrap(py|ping|ped|s)?\b
+re:\bbugger\w*
+re:\bbloody hell\b
+re:\bson of a bitch\b
+re:\bpiece of (shit|crap)\b

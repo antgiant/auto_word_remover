@@ -1,0 +1,58 @@
+# irreverence.txt  --  irreverent / "in vain" use of sacred names
+#
+# IMPORTANT: words like God, Lord, Jesus and Christ have ordinary reverent
+# uses. The entries ACTIVE by default target only the common exclamatory /
+# expletive patterns, to keep false positives low. A second block of bare
+# sacred-name patterns is included at the bottom but COMMENTED OUT -- uncomment
+# it if you want every spoken "God" / "Jesus" / "Lord" flagged for manual
+# review. Always check flagged hits in context.
+#
+# Syntax (same as profanity.txt):
+#   plain text   = literal phrase, case-insensitive, whole-word
+#   re:<pattern> = raw case-insensitive regex
+#   '#'          = comment
+
+# --- expletive compounds built on "God" ---
+re:\bgod ?damn\w*
+re:\bgod ?dam+it\b
+re:\bgoddamn\w*
+re:\bg[ -]?d\b
+re:\bgod (almighty|in heaven|help (me|us|you)|forbid|willing)\b
+re:\b(oh|my|good|great|dear|sweet|holy|almighty) god\b
+re:\bfor (the love of )?(god|christ|heaven|pete|pity|goodness)'?s? sakes?\b
+re:\bfor the love of (god|christ|pete|all that is holy)\b
+re:\b(i )?swear to god\b
+re:\bhonest to (god|goodness)\b
+
+# --- "Jesus" / "Christ" as an exclamation ---
+re:\bjesus (h\.? )?christ\b
+re:\bjesus (wept|fricking christ|freaking christ|fucking christ)\b
+re:\bjesus,? mary,? (and )?joseph\b
+re:\bchrist (almighty|on a \w+)\b
+re:\bholy (christ|jesus|mother of god)\b
+re:\bsweet (jesus|lord|mother of god)\b
+re:\bgood lord\b
+re:\blord have mercy\b
+re:\bmy lord\b
+
+# --- minced oaths / euphemisms ---
+re:\boh my (god|gosh|goodness|lord|word)\b
+re:\bomg\b
+re:\bgee+z\w*
+re:\bjee+z\w*
+re:\bgosh darn\w*
+re:\bgol ?dang\w*
+re:\bdad ?gum\w*
+re:\bgod ?dang\w*
+re:\bjeepers( creepers)?\b
+re:\bcripes\b
+re:\bgolly\b
+re:\bgadzooks\b
+re:\bjiminy( cricket| christmas)?\b
+
+# --- bare sacred names: high false-positive rate, OFF by default ---
+# Uncomment any of these to flag every occurrence for manual review.
+# re:\bgod'?s?\b
+# re:\blord'?s?\b
+# re:\bjesus\b
+# re:\bchrist\b

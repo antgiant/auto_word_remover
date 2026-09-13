@@ -1,0 +1,14 @@
+# bundled/fetched tools - re-created per README.md ("Installation")
+/bin/
+
+# generated output (cleaned media, reports, temp dirs) - never source
+/out/*
+!/out/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+
+# stemmer venv (audio-separator + CUDA torch/onnxruntime, several GB) - see
+# README.md "Stemmer setup" to recreate
+/.venv-stem/
