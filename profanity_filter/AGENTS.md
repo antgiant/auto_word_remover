@@ -102,17 +102,22 @@ hard-coding terms in the script.
 
 Steps:
 1. **transcript** — reuse `<name>.json` beside the input, else run
-   `Voice_to_Text\transcribe.py --formats json --no-diarize`.
+   `voice_to_text\transcribe.py --formats json --no-diarize`.
 2. **flag** — `flag_language.scan_file` on the json, categories from config
-   (`profanity` by default); if the media has an embedded SubRip track,
+   (`profanity` and `irreverence` by default); if the media has an embedded SubRip track,
    `mkvextract` pulls it and `backfill_from_srt` adds anything the transcript
    missed entirely (`cfg.srt_backfill`, default on; `--no-srt-backfill`).
-3. **remove** — one `ffmpeg` pass over ONE audio track, method-dependent:
-   - `method = "mute"` **(default)** — silence. See "Center-channel muting"
-     below: on a >2-channel track it first checks whether dialogue really is
-     isolated to the center channel and, if so, mutes only that channel.
-     Otherwise (stereo, no center channel, or not center-isolated) the whole
-     track is muted.
+3. **remove** — one `ffmpeg` pass over ONE audio track (`source_track` picks
+   the highest-channel-count track among whichever language the container's
+   default-track flag would have selected, not just that flag blindly - see
+   `choose_audio()`), method-dependent:
+   - `method = "mute"` **(default)** — never dead air: every flagged span gets
+     vocals stemmed out of every channel for just that clip (ambient noise/
+     music keeps playing through, unbroken) and spliced back into the
+     otherwise-untouched original; the whole track is stemmed once instead
+     above `stem_whole_track_words` flagged words (fixed cost regardless of
+     span count). No stemmer installed -> falls back to `volume=0` silence.
+     See "Always-stem muting" below.
    - `method = "bleep"` — `volume=0` on each padded span + a gated `aevalsrc`
      1 kHz tone at `beep_gain_db` peak dBFS (`amix ... normalize=0`).
    - `method = "cut"` — the flagged span is spliced out and the gap closed
@@ -129,10 +134,16 @@ Steps:
    matching the *source's own codec* (`CUT_CODEC_MAP`) and writes directly to
    `out/<name> (Cleaned)<source's own extension>` - no mkvmerge step at all (see
    below).
-4. **subs** (`mute`/`bleep` only) — `mkvextract` pulls the SubRip track
-   (`subs_track`, text/UTF-8 only); every cue that overlaps a removed span
-   (± `subs_pad` s) has its profanity-list matches replaced with `subs_mask`
-   (`***`). Image subs (PGS/VobSub) and ASS are skipped with a note.
+4. **subs** (`mute`/`bleep` only) — the chosen text subtitle track (Matroska
+   SubRip, MP4 "Timed Text"/tx3g via ffmpeg's built-in conversion, or an
+   embedded CEA-608 closed-caption track as a fallback when the primary pick
+   turns out to be an empty/placeholder track - mkvmerge doesn't even list
+   CEA-608 tracks, so that fallback probes with ffprobe instead, see
+   `find_cc608_track`) has every cue that overlaps a removed span (± `subs_pad`
+   s) censored: `method = "mute"` deletes the flagged word(s) entirely
+   (matching the audio, which has no audible trace left either);
+   `method = "bleep"` replaces them with `subs_mask` (`***`) instead, matching
+   the audible tone. Image subs (PGS/VobSub) and ASS are skipped with a note.
 5. **remux** (`mute`/`bleep` only) — `mkvmerge` copies the original bit-for-bit
    and appends the clean audio **and** clean subtitle as new **default**
    tracks named `<original label> (Cleaned)` (same `clean_label()` rule for
@@ -236,45 +247,91 @@ intact. A second test with a chapter tiny enough to sit entirely inside the
 cut span confirmed it's dropped cleanly, with the chapters on either side
 meeting exactly at the cut point (no gap, no overlap).
 
-### Center-channel muting (`method = "mute"`, the default)
+### Always-stem muting (`method = "mute"`, the default)
+
+`mute_track()` no longer does center-channel-only muting at all - every
+flagged span is stemmed instead (see "Center-channel-only removal" below for
+where that logic still lives, now `--method dialog` only). Why: the old
+approach silenced every channel everywhere *except* the flagged spans with
+`volume=0:enable='not(SPANS)'` and compared each channel's RMS to decide
+center-only vs whole-track muting, but that whole-file `enable=` expression
+was found to **not reach true silence** when evaluated from the start of a
+long file - confirmed reproducible even with a single span and with lossless
+FLAC (rules out both the ~100-term AVExpr limit below and codec artifacts as
+the cause). Stemming sidesteps the bug entirely and reads as the better
+result anyway: ambient noise/music keeps playing through a flagged word
+instead of a silent gap, or, on a track with no clean center channel, the
+whole mix dropping out.
+
+Two paths, picked by `stem_whole_track_words` (default 30):
+
+- **Per-span** (`splice_stemmed_spans`, at or below the threshold): each
+  flagged span (plus ~2s of context for the separator to work with) is
+  extracted, stemmed, trimmed back to the exact span, and spliced into the
+  otherwise-untouched original via ffmpeg's concat demuxer. Cheap for a
+  handful of spans; the separator's model-load overhead is paid once per span.
+- **Whole-track** (`splice_whole_track_stem`, above the threshold): the
+  entire track is stemmed once (`build_instrumental_stem` - one fixed cost
+  regardless of span count), then the flagged spans are sliced out of that
+  and spliced against the original the same way. Cheaper once per-span
+  overhead adds up on a heavily-flagged file. `stem_whole_track_words` is a
+  rough word-count proxy for cost, not a real time estimate - it ignores the
+  source's own runtime, so a long movie's real breakeven point is higher than
+  a short one's; tune per-library.
+
+Every splice, in both paths, is built from short, independently-seeked
+segments rather than one filter pass across the whole file - the identical
+filter graph on a pre-seeked short clip *is* exact, which is exactly why the
+old whole-file approach was dropped in favor of this.
+
+No stemmer installed (`STEM_VENV` not found) -> falls back to the old plain
+`volume=0:enable='SPANS'` silence on the whole track.
+
+### Center-channel-only removal (`--method dialog` only)
 
 Movie 5.1/7.1 mixes almost always carry dialogue on the center channel alone,
-with music/effects spread across the others. When that's true, muting only
-the center channel removes the word with the background continuing completely
-unbroken - a much less jarring result than silencing (or bleeping) the whole
-mix. `mute_track()` in `clean.py`:
+with music/effects spread across the others. `--method dialog` (which strips
+*all* dialogue from the track, not just flagged words) exploits that: when
+dialogue really is isolated to the center channel, muting only that channel
+removes every spoken word with the background continuing completely
+unbroken - a much better result than stemming dialogue out of every channel,
+which is the fallback whenever the center channel isn't clean. (`method =
+"mute"` used to make this same per-flagged-word decision - see "Always-stem
+muting" above for why it doesn't anymore; everything below is
+`dialog_remove_track()` only.)
 
 1. Skip entirely if the chosen track has <=2 channels (no center channel is
-   possible) - mute the whole track.
+   possible) - stem dialogue out of the whole (mono/stereo) track.
 2. Otherwise `ffprobe` the track's `channel_layout` (e.g. `5.1(side)`, `7.1`)
    and look it up in `CHANNEL_LAYOUTS` (built from `ffmpeg -layouts`, the
    authoritative channel-order source). If the layout isn't recognised or has
-   no `FC` (center) position - e.g. plain `stereo`, `quad`, `6.0(front)` - mute
-   the whole track; don't guess an index from the channel count alone.
+   no `FC` (center) position - e.g. plain `stereo`, `quad`, `6.0(front)` -
+   stem dialogue out of every channel; don't guess an index from the channel
+   count alone.
 3. **Detect** (`detect_center_dominance`): silence every channel everywhere
-   *except* the flagged spans (`volume=0:enable='not(SPANS)'`), then run
-   `astats` and compare each channel's RMS *during just those spans*. Because
-   every channel gets the identical silence mask elsewhere, this comparison is
-   unaffected by the rest of the film - it purely measures who's loudest while
-   the flagged words are being spoken. If the center channel is at least
-   `center_margin_db` (default 6 dB) louder than every other channel, dialogue
-   is confirmed center-only.
-4. **Mute**: if confirmed, `channelsplit` the track into its named channels,
-   apply `volume=0:enable='SPANS'` to *only* the center pad, pass every other
-   pad through with `anull`, then `join` them back with an explicit
-   `map=i.0-<ChannelName>` (so the container keeps its real layout tag).
-   If not confirmed, it's the same single-track `volume=0:enable='SPANS'` as
-   the whole-track fallback.
+   *except* a set of test spans, then run `astats` and compare each channel's
+   RMS *during just those spans*. Because every channel gets the identical
+   silence mask elsewhere, this comparison is unaffected by the rest of the
+   file - it purely measures who's loudest while dialogue is actually
+   happening. If the center channel is at least `center_margin_db` (default
+   6 dB) louder than every other channel, dialogue is confirmed center-only.
+   Test spans come from the source's own subtitle track when one exists (see
+   the subtitle-gating note below), falling back to the whole file only when
+   there's no usable subtitle track.
+4. **Remove**: if confirmed, `channelsplit` the track into its named
+   channels, mute *only* the center pad for the entire runtime, pass every
+   other pad through with `anull`, then `join` them back with an explicit
+   `map=i.0-<ChannelName>` (so the container keeps its real layout tag) -
+   channel count trivially preserved. If not confirmed, the stemmer extracts
+   the non-dialogue content from every channel instead
+   (`build_instrumental_stem`) and that becomes the whole output track.
 
 Validated with synthetic 5.1 WAVs (`ffmpeg -f lavfi ... amerge ... aformat=
-channel_layouts=5.1`) rather than a real 5.1 movie transcript - this project
-doesn't yet have one fully transcribed. Confirmed: (a) center-dominant case ->
-non-center channels measured **bit-identical** (via `astats`) inside vs.
-outside the muted span, center channel drops ~64 dB (silence) only inside it;
-(b) even-energy case -> correctly falls back to muting every channel instead
-of guessing. Re-validate against a real multichannel film's transcript before
-trusting this on a title with music playing very loudly under dialogue (the
-6 dB margin is a starting point, not a proven-safe threshold for every mix).
+channel_layouts=5.1`) plus real multichannel sources (see below). Confirmed
+on synthetic data: (a) center-dominant case -> non-center channels measured
+**bit-identical** (via `astats`) inside vs. outside the muted span, center
+channel drops ~64 dB (silence) only inside it; (b) even-energy case ->
+correctly falls back to stemming every channel instead of guessing.
 
 #### `detect_center_dominance` span-count ceiling (fixed) + `--method dialog`'s default test window
 
@@ -283,9 +340,10 @@ ffmpeg's AVExpr boolean parser, which **hard-fails past ~100 chained
 `between(...)+between(...)+...` terms** - bisected empirically against a real
 build: 99 terms parse fine, 100 fails every time ("Error when evaluating the
 expression"), so it's a hard-coded limit in ffmpeg itself, not a length/perf
-thing. `mute_track`'s own spans (flagged words) rarely hit that, so this went
-unnoticed; a span-per-subtitle-cue list for a whole episode routinely does.
-Fixed by batching (`_ASTATS_BATCH_LIMIT = 80`) and combining the per-batch dB
+thing. This was originally found via the old `mute_track()`'s per-flagged-word
+spans, which rarely hit it (that whole code path is gone now - see
+"Always-stem muting" above); `dialog_remove_track`'s spans (one per subtitle
+cue, for a whole episode) hit it routinely. Fixed by batching (`_ASTATS_BATCH_LIMIT = 80`) and combining the per-batch dB
 readings correctly (`_combine_batch_rms`) - dB doesn't average linearly, and
 each batch is itself diluted by measuring across the WHOLE file with only its
 own spans un-silenced, so naive averaging would double-count that dilution.
@@ -332,11 +390,12 @@ WhisperX validator below, which doesn't need a margin at all.
 
 A dB-margin test is a proxy for "is there residual narration" - it can't
 actually tell whether what leaks through is intelligible. `_whisperx_check.py`
-(standalone, not yet merged into `clean.py`) asks the real question directly:
-pick the longest subtitle-confirmed dialogue spans, run WhisperX (via
-voice_to_text) on both the real audio and a center-channel-muted version of
-the same spans (the exact `build_mute_filter` graph production would use),
-and compare. A clean mute leaves only short generic hallucinated phrases
+(standalone, not yet merged into `clean.py`) asks the real question directly
+for `--method dialog`'s center-channel-only case: pick the longest
+subtitle-confirmed dialogue spans, run WhisperX (via voice_to_text) on both
+the real audio and a center-channel-muted version of the same spans (the
+exact `build_mute_filter` graph `dialog_remove_track` would use), and
+compare. A clean mute leaves only short generic hallucinated phrases
 ("Thank you.", "Oh, God.") with near-zero word overlap against the real
 transcript (which reads as actual coherent, on-topic narration - "Columbus
 crabs are thriving...", not word salad); real bleed-through shows up as an
@@ -390,14 +449,20 @@ against the embedded track before trusting a sidecar as input to anything.
 
 - Word-level timestamps drive the spans; `pad_start`/`pad_end` (default 0.10s)
   cover alignment slop. Tune per source.
-- Only the selected audio track is cleaned (`source_track`, default = the file's
-  default track). Multi-track / commentary handling is not built.
+- Only one audio track is cleaned (`source_track`, default = the highest-
+  channel-count track among the container-default's language - see
+  `choose_audio()`). Multi-track / commentary handling is not built.
 - If lip-sync of the clean track drifts, measure the offset and set
   `sync_ms` (passed to `mkvmerge --sync`).
-- Subtitle masking is cue-level: a cue holding both a removed word and an
-  un-removed profanity gets both masked (no per-word sub timing to split on).
-  Different subtitle wording than the ASR (e.g. "friggin'") is not caught.
-- `center_margin_db` (6 dB) was chosen from a synthetic test, not a corpus of
+- Subtitle censoring is cue-level: a cue holding both a removed word and an
+  un-removed profanity gets both censored (no per-word sub timing to split
+  on). Different subtitle wording than the ASR (e.g. "friggin'") is not
+  caught.
+- `stem_whole_track_words` (default 30) is a rough word-count proxy for
+  per-span vs. whole-track stemming cost, not measured against real runtime -
+  tune per-library if the breakeven point feels wrong (see "Always-stem
+  muting" above).
+- `center_margin_db` (6 dB, `--method dialog` only now) was chosen from a synthetic test, not a corpus of
   real mixes - loud action/music scenes with softer dialogue may need a lower
   margin, tune per source with `--center-margin-db`.
 
