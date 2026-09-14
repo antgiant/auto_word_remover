@@ -52,6 +52,15 @@ mute_fill = "stems"
 # one is ever kept.
 stem_model = "UVR-MDX-NET-Inst_HQ_3.onnx"
 
+# mute_fill = "stems" only: at or below this many flagged words, stem each
+# flagged span separately (cheap for a handful of spans); above it, stem the
+# whole track once and slice spans out of that instead (one fixed cost
+# regardless of span count, cheaper once per-span separator overhead adds up).
+# Rough word-count proxy for cost, not a real time estimate - it ignores the
+# source's own runtime, so a long movie's real breakeven point is higher than
+# a short one's. Tune if it matters for your library.
+stem_whole_track_words = 30
+
 # "bleep" only: the tone
 beep_hz = 1000
 beep_gain_db = -6.0          # tone PEAK level, dBFS (0 = full scale; -6 is a loud, clear bleep)
@@ -83,12 +92,14 @@ dialog_track_suffix = " (Wordless)"
 dialog_track_default = false  # true = make it the default audio track (like "(Cleaned)" does);
 #                                false (default) = add it as a non-default alt track instead
 
-# embedded SubRip subtitles: every cue that overlaps a bleep gets its profane
-# words replaced with subs_mask, then re-muxed as a new default "(Cleaned)" track.
+# embedded SubRip subtitles: every cue that overlaps a removed span gets its
+# profane words censored, then re-muxed as a new default "(Cleaned)" track.
+# method="mute" removes the word entirely (no audible trace is left either);
+# method="bleep" replaces it with subs_mask instead, matching the audible tone.
 # ("default" below means subtitle cleaning is ON whenever the source has a usable
 # text-based subtitle track - "none" is the only way to turn it off.)
 subs_track = "default"       # "default" | index | language | "none" to leave subs alone
-subs_mask = "***"
+subs_mask = "***"            # used only when method="bleep" - method="mute" always removes the word
 subs_pad = 0.15            # seconds of slack when matching cues to bleep spans
 
 # cross-check the embedded SRT for profanity the transcript missed entirely
