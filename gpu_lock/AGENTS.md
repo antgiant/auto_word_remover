@@ -33,7 +33,8 @@ writing) never touch it, so they never wait on anything.
 | Component | Hook point | How |
 |---|---|---|
 | `voice_to_text/transcribe.py` | around the WhisperX model load + the transcription loop, only when `device == "cuda"` | in-process `with gpu_lock.hold(...)` |
-| `profanity_filter` | none directly — `clean.py` / `_whisperx_check.py` both shell out to `transcribe.py`, which already holds the lock for that subprocess's lifetime | inherited |
+| `profanity_filter` | `clean.py`'s `_run_separator()` (the audio-separator stemmer, `mute_fill = "stems"` / `--method dialog`) | in-process `with gpu_lock.hold(...)`, per invocation |
+| `profanity_filter` (transcription) | none directly — `clean.py` / `_whisperx_check.py` shell out to `transcribe.py`, which already holds the lock for that subprocess's lifetime | inherited |
 
 Both import this file with
 `sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gpu_lock"))`

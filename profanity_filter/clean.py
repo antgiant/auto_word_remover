@@ -83,6 +83,7 @@ isn't installed.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import math
@@ -96,6 +97,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 VOICE_TO_TEXT = HERE.parent / "voice_to_text"
+GPU_LOCK_DIR = HERE.parent / "gpu_lock"
 
 CODEC_EXT = {"flac": ".mka", "ac3": ".ac3", "eac3": ".eac3", "aac": ".m4a"}
 
@@ -953,11 +955,24 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
 # ---------------------------------------------------------------------------
 def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config) -> Path:
     """Run the stemmer on a (fake-)stereo wav, asking for only the
-    Instrumental stem (--single_stem), and return its output path."""
+    Instrumental stem (--single_stem), and return its output path. Holds the
+    shared GPU lock (../gpu_lock, if present) for the duration -
+    audio-separator uses CUDA the same as anything else that might be
+    sharing the GPU, and running it with no coordination can crash outright
+    under contention, not just run slowly."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    run([stem_tool, str(wav_in), "-m", cfg.stem_model,
-         "--output_dir", str(out_dir), "--output_format", "WAV",
-         "--single_stem", "Instrumental"])
+    gpu_ctx = contextlib.nullcontext()
+    if str(GPU_LOCK_DIR) not in sys.path:
+        sys.path.insert(0, str(GPU_LOCK_DIR))
+    try:
+        import gpu_lock
+        gpu_ctx = gpu_lock.hold("Profanity_Filter", f"stemming {wav_in.name}")
+    except ImportError:
+        pass  # gpu_lock is optional - only useful if you have other GPU tools to share with
+    with gpu_ctx:
+        run([stem_tool, str(wav_in), "-m", cfg.stem_model,
+             "--output_dir", str(out_dir), "--output_format", "WAV",
+             "--single_stem", "Instrumental"])
     matches = sorted(out_dir.glob("*Instrumental*.wav"))
     if not matches:
         raise SystemExit(f"[error] stemmer produced no Instrumental output in {out_dir} - "

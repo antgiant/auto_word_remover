@@ -20,11 +20,17 @@ logic in this toolkit (the detection logic used to live in voice_to_text).
 No venv of its own — `clean.ps1` / callers use `..\voice_to_text\.venv\Scripts\python.exe`
 (Python 3.11, already has everything). `flag_language.py` itself is pure stdlib.
 
-**GPU lock**: neither `clean.py` nor `_whisperx_check.py` touches the GPU lock
-directly — both invoke `voice_to_text\transcribe.py` as a subprocess for any
-WhisperX work, and `transcribe.py` itself holds `../gpu_lock` (if present) for
-the duration of that call. mkvmerge/ffmpeg/flag_language steps here are
-CPU-only and never wait on it. See `../gpu_lock/AGENTS.md`.
+**GPU lock**: two paths touch it now. `clean.py`/`_whisperx_check.py` invoke
+`voice_to_text\transcribe.py` as a subprocess for any WhisperX work, and
+`transcribe.py` itself holds `../gpu_lock` (if present) for that call.
+Separately, `clean.py`'s own `_run_separator()` (the stemmer,
+`mute_fill = "stems"` and `--method dialog`'s fallback path) holds the same
+lock directly for each `audio-separator` invocation — it uses CUDA too, and
+running it with no coordination was observed to crash outright under
+contention on the machine this was built on, not just run slowly. Both
+paths degrade to "no queuing" if `../gpu_lock` isn't present. mkvmerge/
+ffmpeg/flag_language steps here are CPU-only and never wait on it. See
+`../gpu_lock/AGENTS.md`.
 
 ## flag_language.py
 
