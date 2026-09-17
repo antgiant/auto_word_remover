@@ -1,4 +1,4 @@
-# media-toolkit
+# auto_word_remover
 
 Three small, local-first tools that work together on one machine with one GPU:
 
@@ -21,7 +21,7 @@ paths — clone this once and they find each other, no path editing required
 for the default layout:
 
 ```
-media-toolkit/
+auto_word_remover/
 ├── gpu_lock/
 ├── voice_to_text/
 └── profanity_filter/
