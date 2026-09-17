@@ -54,3 +54,16 @@ Outputs per input: `.txt .json .srt .vtt .tsv .words.json .speakers.txt`
   keeps heavy imports (`torch`, `whisperx`) inside functions so `--help` and
   `doctor.py` stay fast.
 - After changing deps or moving assets, run `doctor.py` and paste the result.
+- **If you ever relocate `.venv`** (this folder was itself moved once - see repo
+  history): every pip console-script `.exe` in `.venv\Scripts\` (including
+  `whisperx.exe`, `pip.exe` itself, `torchrun.exe`, etc.) embeds an **absolute**
+  path to that same venv's `python.exe` at install time. Moving the venv breaks
+  every one of them instantly and silently (no error text, just exit code 1) -
+  `python.exe script.py` invocations and `import`s are unaffected, only a
+  directly-invoked `.exe` shim breaks. Fix by reinstalling each affected
+  package with `--force-reinstall --no-deps` at the new location (pin exact
+  versions from `uv pip freeze` first so it hits the local cache instead of
+  re-downloading - this venv's own fix needed no real downloads beyond one
+  small `sympy` wheel). Map broken launchers to owning packages via
+  `importlib.metadata.entry_points(group="console_scripts")` rather than
+  guessing from the script name.

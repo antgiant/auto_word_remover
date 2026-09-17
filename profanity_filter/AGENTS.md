@@ -484,6 +484,13 @@ against the embedded track before trusting a sidecar as input to anything.
 - `center_margin_db` (6 dB, `--method dialog` only now) was chosen from a synthetic test, not a corpus of
   real mixes - loud action/music scenes with softer dialogue may need a lower
   margin, tune per source with `--center-margin-db`.
+- **If you ever relocate `.venv-stem`**: every pip console-script `.exe` in
+  `Scripts\` (`audio-separator.exe` included) embeds an absolute path to that
+  venv's own `python.exe`, so moving the folder breaks them all instantly and
+  silently (exit code 1, no error text). See `../voice_to_text/AGENTS.md`'s
+  matching note for the fix (`--force-reinstall --no-deps` per affected
+  package, pinned to the currently-installed version so it hits the local
+  cache).
 
 ## External tools
 
