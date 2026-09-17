@@ -27,9 +27,12 @@ Separately, `clean.py`'s own `_run_separator()` (the stemmer,
 `mute_fill = "stems"` and `--method dialog`'s fallback path) holds the same
 lock directly for each `audio-separator` invocation — it uses CUDA too, and
 running it with no coordination was observed to crash outright under
-contention on the machine this was built on, not just run slowly. Both
-paths degrade to "no queuing" if `../gpu_lock` isn't present. mkvmerge/
-ffmpeg/flag_language steps here are CPU-only and never wait on it. See
+contention on the machine this was built on, not just run slowly.
+`_run_separator()` also retries a failed invocation up to `STEM_RETRY_ATTEMPTS`
+times (a movie with many flagged spans calls it hundreds of times, and a rare
+transient failure shouldn't sink the whole run). Both paths degrade to "no
+queuing" if `../gpu_lock` isn't present. mkvmerge/ffmpeg/flag_language steps
+here are CPU-only and never wait on it. See
 `../gpu_lock/AGENTS.md`.
 
 ## flag_language.py
@@ -120,10 +123,10 @@ Steps:
    - `method = "mute"` **(default)** — never dead air: every flagged span gets
      vocals stemmed out of every channel for just that clip (ambient noise/
      music keeps playing through, unbroken) and spliced back into the
-     otherwise-untouched original; the whole track is stemmed once instead
-     above `stem_whole_track_words` flagged words (fixed cost regardless of
-     span count). No stemmer installed -> falls back to `volume=0` silence.
-     See "Always-stem muting" below.
+     otherwise-untouched original; whichever of per-span or whole-track
+     stemming a calibrated time-cost model predicts will be faster is used
+     (`_predict_stem_seconds`). No stemmer installed -> falls back to
+     `volume=0` silence. See "Always-stem muting" below.
    - `method = "bleep"` — `volume=0` on each padded span + a gated `aevalsrc`
      1 kHz tone at `beep_gain_db` peak dBFS (`amix ... normalize=0`).
    - `method = "cut"` — the flagged span is spliced out and the gap closed
@@ -269,21 +272,31 @@ result anyway: ambient noise/music keeps playing through a flagged word
 instead of a silent gap, or, on a track with no clean center channel, the
 whole mix dropping out.
 
-Two paths, picked by `stem_whole_track_words` (default 30):
+Two paths, picked by `_predict_stem_seconds()` - a calibrated time-cost model,
+not a word-count guess:
 
-- **Per-span** (`splice_stemmed_spans`, at or below the threshold): each
-  flagged span (plus ~2s of context for the separator to work with) is
-  extracted, stemmed, trimmed back to the exact span, and spliced into the
+- **Per-span** (`splice_stemmed_spans`): each flagged span (plus
+  `SPLICE_CONTEXT_S` of context for the separator to work with) is extracted,
+  stemmed, trimmed back to the exact span, and spliced into the
   otherwise-untouched original via ffmpeg's concat demuxer. Cheap for a
-  handful of spans; the separator's model-load overhead is paid once per span.
-- **Whole-track** (`splice_whole_track_stem`, above the threshold): the
-  entire track is stemmed once (`build_instrumental_stem` - one fixed cost
-  regardless of span count), then the flagged spans are sliced out of that
-  and spliced against the original the same way. Cheaper once per-span
-  overhead adds up on a heavily-flagged file. `stem_whole_track_words` is a
-  rough word-count proxy for cost, not a real time estimate - it ignores the
-  source's own runtime, so a long movie's real breakeven point is higher than
-  a short one's; tune per-library.
+  handful of spans; the separator's model-load overhead is paid once per
+  span per channel.
+- **Whole-track** (`splice_whole_track_stem`): the entire track is stemmed
+  once (`build_instrumental_stem` - one fixed cost regardless of span count),
+  then the flagged spans are sliced out of that and spliced against the
+  original the same way. Cheaper once per-span overhead adds up on a
+  heavily-flagged file.
+
+`_predict_stem_seconds()` models each separator invocation as
+`STEM_STARTUP_S + STEM_RATE * duration` (fixed per-call startup - ONNX model
+load + CUDA context init + the surrounding ffmpeg extract/fold calls - plus
+throughput once past startup) and sums that per-channel over every span
+(per-span path) vs. once over the whole file (whole-track path), picking
+whichever total is lower. `STEM_STARTUP_S`/`STEM_RATE` were empirically
+calibrated against real per-span and whole-track runs - re-measure both if
+the GPU or stemmer model changes. This replaced an earlier
+`stem_whole_track_words` word-count threshold, which was a rough proxy that
+ignored the source's own runtime.
 
 Every splice, in both paths, is built from short, independently-seeked
 segments rather than one filter pass across the whole file - the identical
@@ -464,10 +477,10 @@ against the embedded track before trusting a sidecar as input to anything.
   un-removed profanity gets both censored (no per-word sub timing to split
   on). Different subtitle wording than the ASR (e.g. "friggin'") is not
   caught.
-- `stem_whole_track_words` (default 30) is a rough word-count proxy for
-  per-span vs. whole-track stemming cost, not measured against real runtime -
-  tune per-library if the breakeven point feels wrong (see "Always-stem
-  muting" above).
+- The per-span-vs-whole-track stemming choice (`_predict_stem_seconds`,
+  "Always-stem muting" above) is calibrated against a specific GPU and
+  stemmer model - re-measure `STEM_STARTUP_S`/`STEM_RATE` if either changes,
+  it's not something exposed as a per-run/per-library setting anymore.
 - `center_margin_db` (6 dB, `--method dialog` only now) was chosen from a synthetic test, not a corpus of
   real mixes - loud action/music scenes with softer dialogue may need a lower
   margin, tune per source with `--center-margin-db`.

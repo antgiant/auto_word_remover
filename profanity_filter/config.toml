@@ -52,14 +52,11 @@ mute_fill = "stems"
 # one is ever kept.
 stem_model = "UVR-MDX-NET-Inst_HQ_3.onnx"
 
-# mute_fill = "stems" only: at or below this many flagged words, stem each
-# flagged span separately (cheap for a handful of spans); above it, stem the
-# whole track once and slice spans out of that instead (one fixed cost
-# regardless of span count, cheaper once per-span separator overhead adds up).
-# Rough word-count proxy for cost, not a real time estimate - it ignores the
-# source's own runtime, so a long movie's real breakeven point is higher than
-# a short one's. Tune if it matters for your library.
-stem_whole_track_words = 30
+# mute_fill = "stems" only: whether to stem each flagged span separately or
+# the whole track once is decided automatically per movie, from a real
+# time-cost model calibrated against this machine's GPU (see
+# STEM_STARTUP_S/STEM_RATE/_predict_stem_seconds in clean.py) - not
+# something to configure here.
 
 # "bleep" only: the tone
 beep_hz = 1000

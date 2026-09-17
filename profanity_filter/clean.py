@@ -99,6 +99,24 @@ HERE = Path(__file__).resolve().parent
 VOICE_TO_TEXT = HERE.parent / "voice_to_text"
 GPU_LOCK_DIR = HERE.parent / "gpu_lock"
 
+# Empirically calibrated audio-separator per-invocation cost model, used by
+# mute_track() to predict per-span vs. whole-track total wall-clock time and
+# pick whichever is actually faster on this machine's GPU, instead of a
+# rough word-count proxy. cost(duration) = STEM_STARTUP_S + STEM_RATE *
+# duration: STEM_STARTUP_S is the fixed per-invocation cost (ONNX model
+# load + CUDA context init + the surrounding ffmpeg channel-extract/fold
+# calls) that dominates for short clips; STEM_RATE is the actual chunk-
+# processing throughput once past startup, which dominates for long
+# (whole-track) inputs. Measured during this rollout: STEM_STARTUP_S=9.0
+# from ~9.3s/channel-invocation across dozens of real ~4-5s per-span clips
+# from a real movie's per-span run; STEM_RATE=0.10 by holding that same
+# startup fixed and solving against three other real whole-track movie runs,
+# which independently agreed to within about 10% of each other (0.111, 0.096,
+# 0.094). Re-measure both constants if the GPU or stemmer model changes.
+STEM_STARTUP_S = 9.0
+STEM_RATE = 0.10
+SPLICE_CONTEXT_S = 2.0  # padding added on each side of a span before stemming - see splice_stemmed_spans
+
 CODEC_EXT = {"flac": ".mka", "ac3": ".ac3", "eac3": ".eac3", "aac": ".m4a"}
 
 # "cut" method: re-encode with whatever the source audio codec already is (the
@@ -184,18 +202,6 @@ class Config:
     #                                    ambient noise/music through the muted span instead of dead
     #                                    air; "silence" is the old behaviour.
     stem_model: str = "UVR-MDX-NET-Inst_HQ_3.onnx"  # audio-separator model, Vocals/Instrumental stems
-    stem_whole_track_words: int = 30  # "mute"/mute_fill=stems only: at or below this many flagged
-    #                                   words, stem each flagged span separately (splice_stemmed_spans -
-    #                                   low fixed per-span overhead, cheap for a handful of spans);
-    #                                   above it, stem the WHOLE track once instead (splice_whole_track_
-    #                                   stem) and slice spans out of that - one fixed cost regardless of
-    #                                   how many hundreds of spans there are, cheaper once per-span
-    #                                   overhead (each span = one separator invocation per channel) adds
-    #                                   up past roughly this many words. This is a rough word-count proxy
-    #                                   for total cost, not a real time estimate - it doesn't account for
-    #                                   the source's own runtime (whole-track cost scales with runtime,
-    #                                   per-span cost doesn't), so a long movie's breakeven point is
-    #                                   higher than a short one's; tune per-library if it matters.
 
     dialog_track_suffix: str = " (Wordless)"
     dialog_track_default: bool = False  # "dialog": make the new (Wordless) track the default audio
@@ -277,6 +283,20 @@ def _q(s) -> str:
 def run(cmd: list, **kw) -> subprocess.CompletedProcess:
     print("  $ " + " ".join(_q(c) for c in cmd), flush=True)
     return subprocess.run(cmd, check=True, **kw)
+
+
+def run_mkvmerge(cmd: list) -> None:
+    # mkvmerge's own exit codes: 0 = success, 1 = success but warnings were
+    # issued, 2 = real error. Treating 1 as fatal (like a generic check=True
+    # run() call would) causes false failures on multiplexes that actually
+    # completed fine - this bit us repeatedly on real movies.
+    print("  $ " + " ".join(_q(c) for c in cmd), flush=True)
+    result = subprocess.run(cmd)
+    if result.returncode == 1:
+        print("  [warn] mkvmerge exited 1 (warnings only, multiplexing completed) - continuing",
+              file=sys.stderr)
+    elif result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd)
 
 
 def run_json(cmd: list) -> dict:
@@ -786,7 +806,7 @@ def stem_clip_all_channels(ffmpeg: str, stem_tool: str, clip_wav: Path, n_ch: in
 
 def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, n_ch: int,
                          sample_rate: int, layout_name: str | None, stem_tool: str, cfg: Config,
-                         tmp: Path, context: float = 2.0) -> Path:
+                         tmp: Path, context: float = SPLICE_CONTEXT_S) -> Path:
     """Replace every flagged span with a freshly-stemmed (vocals removed,
     ambient/music kept - never dead silence) version of just that short clip;
     everything outside the flagged spans is the untouched original, byte for
@@ -856,8 +876,8 @@ def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: i
     invocation's model-load overhead per span (splice_stemmed_spans) adds up
     past a certain point: stem the WHOLE track's vocals out ONCE
     (build_instrumental_stem - a fixed cost regardless of span count) and
-    slice the flagged spans out of that instead. See mute_track's word-count
-    heuristic (stem_whole_track_words) for which of the two gets picked."""
+    slice the flagged spans out of that instead. See _predict_stem_seconds
+    for the time-cost model mute_track() uses to pick between the two."""
     total_dur = probe_duration(ffprobe, media)
     print(f"  stemming the whole track once (~{total_dur / 60:.0f} min, {n_ch}ch)...")
     whole_inst = build_instrumental_stem(ffmpeg, stem_tool, media, audio_pos, n_ch, sample_rate,
@@ -899,6 +919,22 @@ def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: i
     return spliced
 
 
+def _predict_stem_seconds(n_ch: int, spans, total_dur: float) -> tuple[float, float]:
+    """Predict total separator wall-clock time for the per-span approach
+    (splice_stemmed_spans: n_ch invocations per span, one per padded clip)
+    vs. the whole-track approach (splice_whole_track_stem: n_ch invocations
+    total, one per channel, covering the whole file) using the
+    STEM_STARTUP_S/STEM_RATE cost model. mute_track() picks whichever comes
+    out lower - see that model's derivation above."""
+    per_span = 0.0
+    for s, e, _ in spans:
+        clip_s = max(0.0, s - SPLICE_CONTEXT_S)
+        clip_e = min(total_dur, e + SPLICE_CONTEXT_S)
+        per_span += n_ch * (STEM_STARTUP_S + STEM_RATE * (clip_e - clip_s))
+    whole_track = n_ch * (STEM_STARTUP_S + STEM_RATE * total_dur)
+    return per_span, whole_track
+
+
 def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cfg: Config,
               chosen: dict, tmp: Path, stem_tool: str | None = None) -> tuple[Path, bool]:
     """Never leaves dead air and never mutes a channel that doesn't need it:
@@ -926,18 +962,20 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
                     capture_output=True, text=True, check=True).stdout.strip()
                 names = CHANNEL_LAYOUTS.get(raw)
                 layout_name = raw if names and len(names) == n_ch else None
-            n_words = sum(len(hits) for _, _, hits in spans)
-            if n_words > cfg.stem_whole_track_words:
-                print(f"  fill: {n_words} flagged word(s) across {len(spans)} span(s) exceeds "
-                      f"stem_whole_track_words ({cfg.stem_whole_track_words}) - stemming the whole "
-                      f"track once instead of paying separator overhead per span (mute_fill=stems, "
-                      f"model={cfg.stem_model})")
+            total_dur = probe_duration(ffprobe, media)
+            per_span_s, whole_track_s = _predict_stem_seconds(n_ch, spans, total_dur)
+            if whole_track_s < per_span_s:
+                print(f"  fill: predicted {whole_track_s / 60:.1f} min whole-track vs "
+                      f"{per_span_s / 60:.1f} min per-span ({len(spans)} span(s)) - stemming the "
+                      f"whole track once (mute_fill=stems, model={cfg.stem_model})")
                 spliced = splice_whole_track_stem(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
                                                   layout_name, stem_tool, cfg, tmp)
             else:
-                print(f"  fill: stemming vocals out of every channel for just the {len(spans)} flagged "
-                      f"span(s) (mute_fill=stems, model={cfg.stem_model}) - ambient noise/music keeps "
-                      f"playing throughout, nothing is ever fully silenced")
+                print(f"  fill: predicted {per_span_s / 60:.1f} min per-span vs "
+                      f"{whole_track_s / 60:.1f} min whole-track - stemming vocals out of every "
+                      f"channel for just the {len(spans)} flagged span(s) (mute_fill=stems, "
+                      f"model={cfg.stem_model}) - ambient noise/music keeps playing throughout, "
+                      f"nothing is ever fully silenced")
                 spliced = splice_stemmed_spans(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
                                                layout_name, stem_tool, cfg, tmp)
             return _encode_track_from_wav(ffmpeg, spliced, n_ch, cfg, tmp), False
@@ -953,26 +991,48 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
 # via audio-separator (see STEM_VENV / locate_stem_tool). Used by
 # mute_track()'s mute_fill="stems" and by --method dialog.
 # ---------------------------------------------------------------------------
+STEM_RETRY_ATTEMPTS = 3    # a movie with many flagged spans makes hundreds of these
+STEM_RETRY_DELAY_S = 5.0  # calls in a row; a rare transient one shouldn't sink the whole run
+
+
 def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config) -> Path:
     """Run the stemmer on a (fake-)stereo wav, asking for only the
     Instrumental stem (--single_stem), and return its output path. Holds the
     shared GPU lock (../gpu_lock, if present) for the duration -
     audio-separator uses CUDA the same as anything else that might be
     sharing the GPU, and running it with no coordination can crash outright
-    under contention, not just run slowly."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    gpu_ctx = contextlib.nullcontext()
+    under contention (a real access-violation crash was hit this way), not
+    just run slowly.
+
+    Retries a few times on failure: a movie with many flagged spans calls
+    this hundreds of times in a row (once per channel per span), and a rare
+    transient failure deep into that sequence shouldn't sink the entire run
+    (observed once as a spurious "invalid audio data" error on an input that,
+    re-run by hand afterward, turned out to be completely valid). A real,
+    reproducible bad input still fails after retrying."""
     if str(GPU_LOCK_DIR) not in sys.path:
         sys.path.insert(0, str(GPU_LOCK_DIR))
     try:
         import gpu_lock
-        gpu_ctx = gpu_lock.hold("Profanity_Filter", f"stemming {wav_in.name}")
     except ImportError:
-        pass  # gpu_lock is optional - only useful if you have other GPU tools to share with
-    with gpu_ctx:
-        run([stem_tool, str(wav_in), "-m", cfg.stem_model,
-             "--output_dir", str(out_dir), "--output_format", "WAV",
-             "--single_stem", "Instrumental"])
+        gpu_lock = None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, STEM_RETRY_ATTEMPTS + 1):
+        try:
+            gpu_ctx = (gpu_lock.hold("Profanity_Filter", f"stemming {wav_in.name}")
+                      if gpu_lock else contextlib.nullcontext())
+            with gpu_ctx:
+                run([stem_tool, str(wav_in), "-m", cfg.stem_model,
+                     "--output_dir", str(out_dir), "--output_format", "WAV",
+                     "--single_stem", "Instrumental"])
+            break
+        except subprocess.CalledProcessError:
+            if attempt == STEM_RETRY_ATTEMPTS:
+                raise
+            print(f"  [warn] stemmer failed on {wav_in.name} (attempt {attempt}/"
+                  f"{STEM_RETRY_ATTEMPTS}) - retrying in {STEM_RETRY_DELAY_S:.0f}s",
+                  file=sys.stderr)
+            time.sleep(STEM_RETRY_DELAY_S)
     matches = sorted(out_dir.glob("*Instrumental*.wav"))
     if not matches:
         raise SystemExit(f"[error] stemmer produced no Instrumental output in {out_dir} - "
@@ -1513,7 +1573,7 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
              if t["type"] not in ("video", "audio", "subtitles")]
     args += ["--track-order", ",".join(order)]
 
-    run(args)
+    run_mkvmerge(args)
 
 
 # ---------------------------------------------------------------------------
@@ -1554,9 +1614,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--stem-model", dest="stem_model",
                    help="audio-separator model filename used for stemming (mute_fill=stems, and "
                         "--method dialog whenever it can't just mute a center channel)")
-    p.add_argument("--stem-whole-track-words", dest="stem_whole_track_words", type=int,
-                   help="mute_fill=stems only: above this many flagged words, stem the whole track "
-                        "once and slice spans out of it instead of stemming each span separately")
     p.add_argument("--dialog-default", dest="dialog_track_default", action="store_true", default=None,
                    help="'dialog' only: make the new (Wordless) track the default audio track "
                         "instead of adding it as a non-default alt track")
@@ -1597,7 +1654,6 @@ def main(argv: list[str] | None = None) -> int:
         cfg.pad_start = cfg.pad_end = args.pad
     for name in ["method", "pad_start", "pad_end", "merge_gap", "beep_hz",
                  "beep_gain_db", "center_margin_db", "mute_fill", "stem_model",
-                 "stem_whole_track_words",
                  "dialog_track_default", "clean_codec", "clean_bitrate",
                  "clean_bitrate_surround", "cut_bitrate", "source_track",
                  "sync_ms", "subs_track", "srt_backfill", "output_dir", "retranscribe", "overwrite"]:
@@ -1685,6 +1741,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if subs_enabled and chosen_subs is None:
             print("  subtitles: no usable text subtitle track to clean - skipping")
+            print("  [warn] no text subtitle available to cross-check the transcript against - "
+                  "words the transcript mis-heard or dropped entirely can't be caught "
+                  "automatically for this file (only srt_backfill's safety net is affected; "
+                  "muting/bleeping still covers everything the transcript did catch). If you can "
+                  "find a subtitle for this movie elsewhere, it can be used to backfill "
+                  "and re-run the missed spots.")
 
         if cfg.method == "dialog":
             print("  method: dialog removal - stripping ALL dialogue (not just flagged words) "
@@ -1747,6 +1809,28 @@ def main(argv: list[str] | None = None) -> int:
                 action = "removed" if subs_mask == "" else f"masked ({subs_mask!r})"
                 print(f"  subtitles: {nwords} word(s) {action} across {ncues} cue(s)")
 
+        report = out_dir / f"{media.stem}{name_suffix}.bleeps.json"
+
+        def _build_report() -> dict:
+            return {
+                "source": str(media),
+                "output": str(out_path),
+                "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "method": cfg.method,
+                "beep_hz": cfg.beep_hz if cfg.method == "bleep" else None,
+                "beep_gain_db": cfg.beep_gain_db if cfg.method == "bleep" else None,
+                "pad_start": cfg.pad_start if cfg.method != "dialog" else None,
+                "pad_end": cfg.pad_end if cfg.method != "dialog" else None,
+                "hits": len(all_hits),
+                "hits_from_srt_backfill": sum(1 for h in all_hits if h.get("source") == "srt-backfill"),
+                "subtitles": subs_stats,
+                "lossless_splice": lossless_splice if cfg.method == "cut" else None,
+                "id3_tags": id3_info if cfg.method == "cut" else None,
+                "used_center_channel_trick": used_center,
+                "spans": [{"start": round(s, 3), "end": round(e, 3),
+                           "matches": sorted({h["match"] for h in hs})} for s, e, hs in spans],
+            }
+
         id3_info = None
         if cfg.method == "cut":
             shutil.copy2(clean_audio, out_path)
@@ -1763,6 +1847,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.keep_temp and (tmp / "filter.txt").is_file():
                 shutil.copy2(tmp / "filter.txt", out_dir / f"{media.stem}.filter.txt")
         elif cfg.method == "dialog":
+            try:
+                report.write_text(json.dumps(_build_report(), indent=2), encoding="utf-8")
+            except OSError:
+                pass
             remux(mkvmerge, media, tracks, cfg, out_path, clean_audio, chosen, None, None,
                   audio_suffix=cfg.dialog_track_suffix, audio_default=cfg.dialog_track_default)
             if args.keep_temp:
@@ -1770,6 +1858,10 @@ def main(argv: list[str] | None = None) -> int:
                 if (tmp / "filter.txt").is_file():
                     shutil.copy2(tmp / "filter.txt", out_dir / f"{media.stem}.filter.txt")
         else:
+            try:
+                report.write_text(json.dumps(_build_report(), indent=2), encoding="utf-8")
+            except OSError:
+                pass
             remux(mkvmerge, media, tracks, cfg, out_path,
                   clean_audio, chosen, clean_srt, chosen_subs)
             if args.keep_temp:
@@ -1778,25 +1870,7 @@ def main(argv: list[str] | None = None) -> int:
                 if clean_srt:
                     shutil.copy2(clean_srt, out_dir / f"{media.stem}{cfg.track_name_suffix}.srt")
 
-    report = out_dir / f"{media.stem}{name_suffix}.bleeps.json"
-    report.write_text(json.dumps({
-        "source": str(media),
-        "output": str(out_path),
-        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "method": cfg.method,
-        "beep_hz": cfg.beep_hz if cfg.method == "bleep" else None,
-        "beep_gain_db": cfg.beep_gain_db if cfg.method == "bleep" else None,
-        "pad_start": cfg.pad_start if cfg.method != "dialog" else None,
-        "pad_end": cfg.pad_end if cfg.method != "dialog" else None,
-        "hits": len(all_hits),
-        "hits_from_srt_backfill": sum(1 for h in all_hits if h.get("source") == "srt-backfill"),
-        "subtitles": subs_stats,
-        "lossless_splice": lossless_splice if cfg.method == "cut" else None,
-        "id3_tags": id3_info if cfg.method == "cut" else None,
-        "used_center_channel_trick": used_center,
-        "spans": [{"start": round(s, 3), "end": round(e, 3),
-                   "matches": sorted({h["match"] for h in hs})} for s, e, hs in spans],
-    }, indent=2), encoding="utf-8")
+    report.write_text(json.dumps(_build_report(), indent=2), encoding="utf-8")
 
     print(f"  wrote: {out_path}")
     print(f"         {report.name}")
