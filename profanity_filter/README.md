@@ -3,8 +3,11 @@
 Detect profanity / irreverent use of God's name in a video or audio file, and
 produce a cleaned copy with those moments removed from the audio — or, as a
 separate job, strip a track's dialogue entirely into a "No Narration"-style
-alt track. The source file is never modified in place; everything goes to a
-new file alongside it (original untouched) or into `out\`.
+alt track. The result **replaces the source file in place**: a new primary
+(default) audio track is added, and where possible a new primary subtitle
+track too, then the pre-clean original is moved to the **Windows Recycle
+Bin** — recoverable, never a hard delete — once the build succeeds. Nothing
+on disk is touched until then.
 
 Two scripts, no build step:
 
@@ -147,8 +150,10 @@ cut down how often that slow path actually triggers.
 .\clean.ps1 "Movie.mkv" --dry-run
 ```
 
-Output goes to `out\<name> (Cleaned).mkv` plus `out\<name> (Cleaned).bleeps.json`
-(exactly what was removed). The source file is never modified.
+The result replaces `Movie.mkv` itself (original moved to the Recycle Bin),
+plus a `Movie.bleeps.json` sidecar next to it (exactly what was removed).
+`out\` is scratch space only — temp files during the run, and `--keep-temp`
+debug artifacts.
 
 `clean.ps1` is a thin wrapper that runs `clean.py` under voice_to_text's venv
 with UTF-8 console output forced; calling `clean.py` directly works the same
@@ -209,10 +214,9 @@ needs, any Python 3.10+ — see the version note above).
    `mute`/`bleep`/`dialog` encode to a standalone track (AC-3 by default —
    224k for a stereo source, 448k for a multichannel one; `flac` for lossless
    instead) — the *only* re-encoding — then get muxed back in (step 5). `cut`
-   on a non-mp3 source re-encodes with a codec matching the source's own and
-   writes straight to `out\<name> (Cleaned)<source's extension>` — no remux, no
-   alt track (the duration changed, so keeping the original alongside
-   doesn't make sense).
+   on a non-mp3 source re-encodes with a codec matching the source's own —
+   no remux, no alt track (the duration changed, so keeping the original
+   alongside doesn't make sense).
 4. **Subtitles** (`mute`/`bleep` only) — the embedded SubRip track is pulled
    with `mkvextract`; every cue that overlaps a removed span gets its profane
    words replaced with `***`. `--method dialog` leaves subtitles completely
@@ -224,6 +228,13 @@ needs, any Python 3.10+ — see the version note above).
    `<original label> (Wordless)` as a **non-default** track by default
    (`--dialog-default` to flip that). Video and every other track are
    untouched either way.
+6. **Replace** — all of the above is built in a temp dir first, never
+   touching the source. Only once it succeeds: the pre-clean original is
+   moved to the **Recycle Bin** and the newly built file takes its place at
+   the source's own path (same folder/stem — the extension only changes for
+   `mute`/`bleep`/`dialog` on a non-`.mkv` source, since mkvmerge always
+   writes `.mkv`; `cut` always keeps the source's own extension). If nothing
+   was flagged, or `--dry-run` is passed, the source is never touched at all.
 
 ### Useful options
 
@@ -232,7 +243,7 @@ needs, any Python 3.10+ — see the version note above).
 | `--method mute\|bleep\|cut\|dialog` | removal method (default `mute`; `cut` is audio-only-input only; `dialog` strips ALL dialogue, ignores the wordlists) |
 | `--dry-run` | print the spans and stop |
 | `--pad 0.15` | padding (s) before & after each word (`--pad-start` / `--pad-end` for asymmetry) |
-| `--categories profanity,irreverence` | which lists to act on (default `profanity`) |
+| `--categories profanity,irreverence` | which lists to act on (default `profanity`) — **quote this value** (`--categories "profanity,irreverence"`); PowerShell mangles an unquoted comma into a space before it reaches `clean.py`, silently emptying the matcher list (see AGENTS.md) |
 | `--center-margin-db` | `mute`/`dialog`: how many dB louder the center channel must be than every other channel to mute it alone (default 6) |
 | `--mute-fill stems\|silence` | `mute` only: fill a center-less muted span with the stemmed-out ambient noise/music (default) or dead silence |
 | `--stem-model` | audio-separator model for stemming (default `UVR-MDX-NET-Inst_HQ_3.onnx`) |
@@ -245,8 +256,8 @@ needs, any Python 3.10+ — see the version note above).
 | `--sync-ms N` | `mute`/`bleep`/`dialog` only: delay the clean track by N ms if lip-sync drifts |
 | `--extra-spans file.json` | hand-reviewed `[{start,end,label,category}]` spans to remove in addition to the wordlists (e.g. content no regex can safely catch) — always included, regardless of `--categories` |
 | `--keep-temp` | also drop the cleaned track + ffmpeg filter graph in `out\` |
-| `--output-dir DIR` | write output somewhere other than `out\` |
-| `--overwrite` | allow clobbering an existing output file |
+| `--output-dir DIR` | scratch dir for temp files (default `out\`) — not where the result ends up; that always replaces the source |
+| `--overwrite` | allow clobbering a leftover file at the destination from an earlier run where the extension changed; irrelevant when the destination is the source's own path (always replaced) |
 
 Run `clean.ps1 --help` (or `clean.py --help`) for the full list, including
 `--retranscribe`, `--no-srt-backfill`, and `--config` (point at a different
@@ -335,7 +346,8 @@ config.toml          defaults for clean.py (copy + --config to override)
 wordlists\           profanity.txt / irreverence.txt - edit freely
 bin\                 gitignored - mkvmerge/mkvextract go here (see Install)
 .venv-stem\          gitignored - optional stemmer venv (see Install step 4)
-out\                 default output location
+out\                 scratch dir (temp files + --keep-temp debug artifacts) -
+                     the cleaned result replaces the source in place instead
 AGENTS.md            engineering notes: how things work, known gotchas,
                      design rationale - read this before changing behavior
 ```

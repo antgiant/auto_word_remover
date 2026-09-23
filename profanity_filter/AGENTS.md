@@ -15,7 +15,7 @@ logic in this toolkit (the detection logic used to live in voice_to_text).
 | `config.toml` | `clean.py` defaults |
 | `bin/mkvtoolnix/` | portable MKVToolNix (mkvmerge v101) — `clean.py` finds it here automatically |
 | `bin/7zr.exe` | standalone 7-Zip extractor (used to unpack the portable MKVToolNix) |
-| `out/` | cleaned files + `.bleeps.json` sidecars land here; source is never touched |
+| `out/` | scratch dir only now — temp files during a run, plus `--keep-temp` debug artifacts. The cleaned result replaces the source file in place; see "Replacing the source in place" below |
 
 No venv of its own — `clean.ps1` / callers use `..\voice_to_text\.venv\Scripts\python.exe`
 (Python 3.11, already has everything). `flag_language.py` itself is pure stdlib.
@@ -274,11 +274,59 @@ Steps:
    tracks named `<original label> (Cleaned)` (same `clean_label()` rule for
    both); the originals' default flags are cleared; `--track-order` puts each
    clean track first among its type. Video / other tracks untouched.
+6. **replace** — the build (steps 1-5) lands in a temp dir under `output_dir`
+   (`out/` by default), never touching the source. Only once it succeeds:
+   the pre-clean original is moved to the **Recycle Bin** (`send_to_recycle_bin`
+   - `ctypes` + `shell32.SHFileOperationW`, `FOF_ALLOWUNDO` - recoverable, not
+   a hard delete, no `send2trash` pip dependency needed) and the build is
+   staged next to it and renamed into its place (`main()`'s `final_dest`/
+   `staging` dance - see "Replacing the source in place" below).
 
-Output: `out/<name> (Cleaned).mkv` (or, for `cut`, the source's own extension)
-+ `out/<name> (Cleaned).bleeps.json` (name is a holdover from the POC; the
-sidecar covers whichever method ran - `subtitles` field records cues/words
-masked, null for `cut`).
+Output: replaces the source file at its own path (same folder/stem; the
+extension only changes for `mute`/`bleep`/`dialog` on a non-`.mkv` source,
+since mkvmerge always writes `.mkv` - `cut` always keeps the source's own
+extension, so its destination path is always identical to the source's) +
+`<name>.bleeps.json` next to it (`subtitles` field records cues/words masked,
+null for `cut`).
+
+### Replacing the source in place
+
+`main()` computes `final_dest = media.with_name(f"{media.stem}{out_ext}")`
+early (right after `out_ext` is decided) and guards it the same way the old
+`out_path` was guarded: `--overwrite` is only consulted when `final_dest !=
+media` (extension changed) and something already sits there from an earlier
+run - when `final_dest == media` (the common case: source and result are both
+`.mkv`), there's nothing to guard, since replacing the source *is* the point.
+
+The actual build target inside the run is `build_path = tmp / f"build{out_ext}"`
+(inside the per-run `TemporaryDirectory`, `dir=out_dir`) — every method
+(`cut`'s `shutil.copy2`, `dialog`'s and `mute`/`bleep`'s `remux()` calls)
+writes there, never to `media` or `final_dest` directly, since mkvmerge/ffmpeg
+are still reading `media` at that point. Only after that build finishes does
+`main()` touch the source, and in a specific order chosen for safety:
+
+1. `shutil.move(build_path, staging)` where `staging = final_dest.with_name(
+   final_dest.name + ".pf-staging")` — this is the one step that can be a
+   slow **cross-drive** copy (e.g. `output_dir` on `D:` for a source on `J:`,
+   the `_batch_pe3.py` case) and it happens while the original is still
+   completely untouched.
+2. `send_to_recycle_bin(media)` — only now does the original move, and only
+   to the Recycle Bin, never a permanent delete.
+3. `staging.replace(final_dest)` — a same-drive rename, about as close to
+   atomic as this gets, now that the slow/fallible part is already done.
+
+If step 1 fails, the source is never touched. If step 3 somehow fails after
+step 2 succeeded, the built file is recoverable at `staging` and the original
+is recoverable from the Recycle Bin - the failure mode is "user has to
+reconcile two files by hand," never silent data loss.
+
+The `.bleeps.json` report path is derived from `final_dest`, not `media` -
+`final_dest.parent / f"{final_dest.stem}.bleeps.json"` - and is written mid-run
+(as a crash-safety net, before the source is touched) as well as again at the
+very end. `output_dir`/`--output-dir` (default `out/`) is scratch space only
+now: the `TemporaryDirectory` location and where `--keep-temp` drops debug
+copies of the clean track / filter graph / clean subtitle. It is **not** where
+the cleaned result ends up - that's always `final_dest`.
 
 ### "cut" (audio-only inputs only, e.g. audiobooks)
 
@@ -600,6 +648,24 @@ against the embedded track before trusting a sidecar as input to anything.
 - `center_margin_db` (6 dB, `--method dialog` only now) was chosen from a synthetic test, not a corpus of
   real mixes - loud action/music scenes with softer dialogue may need a lower
   margin, tune per source with `--center-margin-db`.
+- **Quote comma-separated values passed to `clean.ps1`** (`--categories
+  profanity,irreverence`, etc.) - `clean.ps1` captures forwarded args via
+  `[Parameter(ValueFromRemainingArguments=$true)][string[]]$Passthru`, and
+  PowerShell parses a bare unquoted comma as its array-constructor operator
+  at the call site, before the script ever runs. The resulting array then
+  collapses back into a single `[string]` slot by joining with `$OFS`
+  (a space), so `--categories profanity,irreverence` silently arrives at
+  `clean.py` as `--categories "profanity irreverence"` - a category name
+  that matches neither `profanity` nor `irreverence`, so `load_matchers`
+  builds an **empty** matcher dict and the run reports "0 hit(s)" with no
+  error, no warning. (Confirmed root cause of a real false-negative run on
+  a feature film that clearly had flaggable language - `--dry-run` even
+  reported the wrong "0 hit(s), nothing flagged" as if the source were
+  clean.) Quoting the value (`--categories "profanity,irreverence"`) avoids
+  it entirely - a quoted string is never parsed as an array literal.
+  Native-exe invocations (calling `python.exe` directly instead of through
+  a `.ps1`) are NOT affected - only PowerShell-script/function argument
+  binding triggers this.
 - **If you ever relocate `.venv-stem`**: every pip console-script `.exe` in
   `Scripts\` (`audio-separator.exe` included) embeds an absolute path to that
   venv's own `python.exe`, so moving the folder breaks them all instantly and

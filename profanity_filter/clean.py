@@ -67,6 +67,15 @@ End-to-end from a single media file:
                  dialog adds "<original label> (Wordless)" as a non-default
                  track by default. Video and all other tracks are copied
                  bit-for-bit.
+  7. replace     the source file is REPLACED IN PLACE: once the build above
+                 succeeds, the pre-clean original is moved to the Windows
+                 Recycle Bin (recoverable, never a hard delete - see
+                 send_to_recycle_bin) and the newly built file takes its
+                 place at the same path (same folder/stem; the extension
+                 changes only for mute/bleep/dialog on a non-.mkv source,
+                 since mkvmerge always writes .mkv). Nothing is touched on
+                 disk until the build finishes successfully.
+
 Usage:
   clean.py "Movie (2002).mkv"
   clean.py "Movie.mkv" --method bleep --beep-gain-db -8
@@ -219,7 +228,9 @@ class Config:
     pgs_ocr_lang: str = ""             # Tesseract language code, "" = derive from the track's own
     #                                    3-letter language tag (falls back to "eng" if unrecognised)
 
-    output_dir: str = "out"
+    output_dir: str = "out"             # scratch dir for temp files + --keep-temp debug artifacts only -
+    #                                    the cleaned result itself replaces the source in place (see
+    #                                    send_to_recycle_bin); this is NOT where it ends up
     retranscribe: bool = False
     overwrite: bool = False
 
@@ -323,6 +334,46 @@ def run_json(cmd: list) -> dict:
     out = subprocess.run(cmd, check=True, capture_output=True, text=True,
                          encoding="utf-8", errors="replace").stdout
     return json.loads(out)
+
+
+def send_to_recycle_bin(path: Path) -> None:
+    """Move `path` to the Windows Recycle Bin (recoverable) instead of
+    permanently deleting it, via the shell32 SHFileOperationW API. Kept in
+    ctypes/stdlib rather than adding a `send2trash` dependency, matching this
+    project's no-pip-install-needed design. Windows-only, same as the rest of
+    this toolkit."""
+    import ctypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p),
+            ("wFunc", ctypes.c_uint),
+            ("pFrom", ctypes.c_wchar_p),
+            ("pTo", ctypes.c_wchar_p),
+            ("fFlags", ctypes.c_uint16),
+            ("fAnyOperationsAborted", ctypes.c_int),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", ctypes.c_wchar_p),
+        ]
+
+    FO_DELETE = 0x0003
+    FOF_ALLOWUNDO = 0x0040       # send to Recycle Bin instead of a hard delete
+    FOF_NOCONFIRMATION = 0x0010
+    FOF_SILENT = 0x0004
+    FOF_NOERRORUI = 0x0400
+
+    # pFrom must be double-null-terminated for SHFileOperationW; ctypes'
+    # c_wchar_p marshalling appends its own trailing null on top of the one
+    # embedded here, satisfying that even for a single path.
+    op = SHFILEOPSTRUCTW(
+        hwnd=None, wFunc=FO_DELETE, pFrom=str(path) + "\0", pTo=None,
+        fFlags=FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
+        fAnyOperationsAborted=0, hNameMappings=None, lpszProgressTitle=None,
+    )
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if result != 0 or op.fAnyOperationsAborted:
+        raise OSError(f"could not move {path} to the Recycle Bin "
+                     f"(SHFileOperationW code {result})")
 
 
 def probe_streams(ffprobe: str, media: Path) -> list[dict]:
@@ -1672,9 +1723,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "track to use for srt_backfill/censoring")
     p.add_argument("--pgs-ocr-lang", dest="pgs_ocr_lang",
                    help="Tesseract language code for PGS OCR (default: eng)")
-    p.add_argument("--output-dir", dest="output_dir")
+    p.add_argument("--output-dir", dest="output_dir",
+                   help="scratch dir for temp files + --keep-temp debug artifacts (default 'out') - "
+                        "the cleaned result itself replaces the source file in place, it is never "
+                        "written here")
     p.add_argument("--retranscribe", action="store_true", default=None)
-    p.add_argument("--overwrite", action="store_true", default=None)
+    p.add_argument("--overwrite", action="store_true", default=None,
+                   help="allow clobbering a leftover file at the destination path from an earlier "
+                        "run where the extension changed (e.g. a non-.mkv source under mute/bleep/"
+                        "dialog); irrelevant when the destination IS the source's own path, since "
+                        "that's always replaced")
     p.add_argument("--keep-temp", action="store_true", help="copy the bleeped track + filter graph to output-dir")
     p.add_argument("--dry-run", action="store_true", help="print the spans and stop before ffmpeg/mkvmerge")
     p.add_argument("--config", default=str(HERE / "config.toml"))
@@ -1731,9 +1789,17 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = HERE / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     name_suffix = cfg.dialog_track_suffix if cfg.method == "dialog" else cfg.track_name_suffix
-    out_path = out_dir / f"{media.stem}{name_suffix}{out_ext}"
-    if out_path.exists() and not cfg.overwrite:
-        raise SystemExit(f"[error] {out_path} exists (use --overwrite)")
+    # The cleaned result replaces the source in place - same folder, same
+    # stem. Only the extension can change (mkvmerge always writes .mkv), so
+    # final_dest usually IS media's own path. out_dir is scratch space only
+    # now (temp files during the run, plus --keep-temp debug artifacts) -
+    # the source is never overwritten while still being read from; a build
+    # is finished in a temp dir first, then the original is moved to the
+    # Recycle Bin and the build takes its place (see the end of this
+    # function / send_to_recycle_bin).
+    final_dest = media.with_name(f"{media.stem}{out_ext}")
+    if final_dest != media and final_dest.exists() and not cfg.overwrite:
+        raise SystemExit(f"[error] {final_dest} exists (use --overwrite)")
 
     print(f"== {media.name} ==")
     matchers, js = {}, None
@@ -1757,6 +1823,7 @@ def main(argv: list[str] | None = None) -> int:
     subs_stats = None
     with tempfile.TemporaryDirectory(prefix="pf_", dir=out_dir) as td:
         tmp = Path(td)
+        build_path = tmp / f"build{out_ext}"
 
         raw_srt = None
         if chosen_subs is not None:
@@ -1909,12 +1976,12 @@ def main(argv: list[str] | None = None) -> int:
                 action = "removed" if subs_mask == "" else f"masked ({subs_mask!r})"
                 print(f"  subtitles: {nwords} word(s) {action} across {ncues} cue(s)")
 
-        report = out_dir / f"{media.stem}{name_suffix}.bleeps.json"
+        report = final_dest.parent / f"{final_dest.stem}.bleeps.json"
 
         def _build_report() -> dict:
             return {
                 "source": str(media),
-                "output": str(out_path),
+                "output": str(final_dest),
                 "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "method": cfg.method,
                 "beep_hz": cfg.beep_hz if cfg.method == "bleep" else None,
@@ -1933,11 +2000,11 @@ def main(argv: list[str] | None = None) -> int:
 
         id3_info = None
         if cfg.method == "cut":
-            shutil.copy2(clean_audio, out_path)
+            shutil.copy2(clean_audio, build_path)
             print(f"  cut {total:.1f}s of flagged audio out of the file (no alt track - "
                   f"the duration changed)")
             if src_codec == "mp3":
-                id3_info = preserve_id3_tags(media, out_path, spans)
+                id3_info = preserve_id3_tags(media, build_path, spans)
                 if id3_info.get("copied"):
                     print(f"  id3 tags: {id3_info['frames']} frame(s) carried over from the source"
                           + (f", {id3_info['chapters_remapped']} chapter mark(s) remapped"
@@ -1951,7 +2018,7 @@ def main(argv: list[str] | None = None) -> int:
                 report.write_text(json.dumps(_build_report(), indent=2), encoding="utf-8")
             except OSError:
                 pass
-            remux(mkvmerge, media, tracks, cfg, out_path, clean_audio, chosen, None, None,
+            remux(mkvmerge, media, tracks, cfg, build_path, clean_audio, chosen, None, None,
                   audio_suffix=cfg.dialog_track_suffix, audio_default=cfg.dialog_track_default)
             if args.keep_temp:
                 shutil.copy2(clean_audio, out_dir / f"{media.stem}{name_suffix}{clean_audio.suffix}")
@@ -1962,18 +2029,33 @@ def main(argv: list[str] | None = None) -> int:
                 report.write_text(json.dumps(_build_report(), indent=2), encoding="utf-8")
             except OSError:
                 pass
-            remux(mkvmerge, media, tracks, cfg, out_path,
+            remux(mkvmerge, media, tracks, cfg, build_path,
                   clean_audio, chosen, clean_srt, chosen_subs)
             if args.keep_temp:
                 shutil.copy2(clean_audio, out_dir / f"{media.stem}{cfg.track_name_suffix}{clean_audio.suffix}")
                 if (tmp / "filter.txt").is_file():  # not written by mute_track's stemmed-splice path
                     shutil.copy2(tmp / "filter.txt", out_dir / f"{media.stem}.filter.txt")
                 if clean_srt:
-                    shutil.copy2(clean_srt, out_dir / f"{media.stem}{cfg.track_name_suffix}.srt")
+                    shutil.copy2(clean_srt, out_dir / f"{media.stem}{cfg.track_name_suffix}{clean_srt.suffix}")
+
+        # Build succeeded - now, and only now, touch the source. Stage the
+        # finished build next to the destination FIRST (this can be a slow
+        # cross-drive copy if out_dir's drive differs from media's - e.g. a
+        # scratch dir on D: for a source on J:) while the original is still
+        # completely untouched; only once that's safely on disk do we move
+        # the pre-clean original to the Recycle Bin (recoverable, never a
+        # hard delete) and rename staging over it - a same-drive rename,
+        # about as close to atomic as this gets. Done while `tmp` is still
+        # alive, before the TemporaryDirectory context below tears it down.
+        staging = final_dest.with_name(final_dest.name + ".pf-staging")
+        shutil.move(str(build_path), str(staging))
+        print(f"  moving original to the Recycle Bin: {media}")
+        send_to_recycle_bin(media)
+        staging.replace(final_dest)
 
     report.write_text(json.dumps(_build_report(), indent=2), encoding="utf-8")
 
-    print(f"  wrote: {out_path}")
+    print(f"  wrote: {final_dest}")
     print(f"         {report.name}")
     return 0
 

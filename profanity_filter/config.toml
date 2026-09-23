@@ -105,6 +105,19 @@ subs_pad = 0.15            # seconds of slack when matching cues to bleep spans
 # flag_language.backfill_from_srt().
 srt_backfill = true
 
-output_dir = "out"           # relative to this folder, or an absolute path
+# scratch dir for temp files + --keep-temp debug artifacts (relative to this
+# folder, or an absolute path) - NOT where the cleaned result ends up. The
+# result always replaces the source file in place (new primary/default audio
+# track, and where possible a new primary/default subtitle track); the
+# pre-clean original is moved to the Windows Recycle Bin, never deleted
+# outright, once the build succeeds. See AGENTS.md "Replacing the source in
+# place".
+output_dir = "out"
 retranscribe = false         # true = always re-run Voice_to_Text even if <name>.json exists
+
+# only matters when the destination's extension differs from the source's
+# (mute/bleep/dialog on a non-.mkv source) and something from an earlier run
+# already sits there - when source and destination are the same path (the
+# common case), there's nothing to guard, since replacing the source IS the
+# point.
 overwrite = false
