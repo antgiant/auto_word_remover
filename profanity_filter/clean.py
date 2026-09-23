@@ -82,6 +82,7 @@ Usage:
   clean.py "Audiobook.m4b" --method cut
   clean.py "Movie.mkv" --method dialog
   clean.py "Movie.mkv" --dry-run
+  clean.py "Movie.mkv" --force  # rebuild even if a rerun finds the same words already covered
 
 The stemmer (mute_fill="stems", and --method dialog whenever it can't just
 mute a center channel) needs a one-time setup - see README.md - and both
@@ -637,6 +638,17 @@ def clean_label(track: dict, suffix: str) -> str:
     if LANG_NAMES.get(lang):
         return LANG_NAMES[lang] + suffix
     return suffix.strip()
+
+
+def is_own_output_track(t: dict, cfg: Config) -> bool:
+    """True for an audio/subtitle track this tool itself added on a PREVIOUS
+    run - its track_name ends with the "(Cleaned)"/"(Wordless)" suffix
+    clean_label() gives new tracks. Used by main() to always re-detect from
+    the true original source on a rerun (never re-clean an already-cleaned
+    track) and to replace, rather than pile up alongside, a stale one - see
+    "Re-running on an already-cleaned file" in AGENTS.md."""
+    name = t.get("properties", {}).get("track_name") or ""
+    return name.endswith(cfg.track_name_suffix) or name.endswith(cfg.dialog_track_suffix)
 
 
 def _span_expr(spans) -> str:
@@ -1613,7 +1625,17 @@ def censor_srt(text: str, spans, matchers: dict, mask: str, pad: float):
 def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
           clean_audio: Path, chosen_audio: dict,
           clean_srt: Path | None, chosen_subs: dict | None,
-          audio_suffix: str | None = None, audio_default: bool = True) -> None:
+          audio_suffix: str | None = None, audio_default: bool = True,
+          exclude_audio_ids=(), exclude_subs_ids=()) -> None:
+    """`tracks` must already have any stale own-output track (see
+    is_own_output_track) filtered OUT - it drives both the default-flag
+    loop below and --track-order, so a stale track left in would still get
+    an order/flag entry for a track this call is about to drop entirely.
+    `exclude_audio_ids`/`exclude_subs_ids` (from main()'s `tracks_all`,
+    where those ids still exist) are what actually drop them from `media`'s
+    import via mkvmerge's `!id,id` negation syntax - a rerun's fresh
+    (Cleaned)/(Wordless) track REPLACES the stale one instead of piling up
+    alongside it."""
     suffix = cfg.track_name_suffix if audio_suffix is None else audio_suffix
     a_lang = chosen_audio["properties"].get("language") or "und"
     a_name = clean_label(chosen_audio, suffix)
@@ -1634,6 +1656,10 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
         if t["type"] == "subtitles":
             keep = 0 if clean_srt else (1 if t["properties"].get("default_track") else 0)
             args += ["--default-track-flag", f"{t['id']}:{keep}"]
+    if exclude_audio_ids:
+        args += ["--audio-tracks", "!" + ",".join(str(i) for i in exclude_audio_ids)]
+    if exclude_subs_ids:
+        args += ["--subtitle-tracks", "!" + ",".join(str(i) for i in exclude_subs_ids)]
     args += [str(media)]
 
     args += ["--language", f"0:{a_lang}", "--track-name", f"0:{a_name}",
@@ -1660,6 +1686,25 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
     args += ["--track-order", ",".join(order)]
 
     run_mkvmerge(args)
+
+
+def _load_prev_flagged_words(report_path: Path) -> list[str] | None:
+    """Sorted, lowercased list of every word matched across `report_path`'s
+    spans (a prior run's own .bleeps.json) - or None if it doesn't exist or
+    can't be parsed as one. Used by main() to compare a fresh detection
+    pass's word set against what the current (Cleaned) track already
+    covers, so a rerun only rebuilds when that set actually changed - see
+    is_own_output_track."""
+    if not report_path.is_file():
+        return None
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    spans = data.get("spans")
+    if not isinstance(spans, list):
+        return None
+    return sorted({str(m).lower() for span in spans for m in span.get("matches", [])})
 
 
 # ---------------------------------------------------------------------------
@@ -1735,6 +1780,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "that's always replaced")
     p.add_argument("--keep-temp", action="store_true", help="copy the bleeped track + filter graph to output-dir")
     p.add_argument("--dry-run", action="store_true", help="print the spans and stop before ffmpeg/mkvmerge")
+    p.add_argument("--force", action="store_true",
+                   help="rebuild and replace the existing (Cleaned)/(Wordless) track even if a "
+                        "fresh detection pass would flag the exact same set of words - by default "
+                        "a rerun on an already-cleaned file skips the rebuild in that case ('mute'/"
+                        "'bleep' only; 'cut'/'dialog' always rerun, no word-set to compare)")
     p.add_argument("--config", default=str(HERE / "config.toml"))
     return p
 
@@ -1807,7 +1857,24 @@ def main(argv: list[str] | None = None) -> int:
         matchers = load_matchers(cfg)
         js = ensure_transcript(media, cfg)
 
-    tracks = run_json([mkvmerge, "-J", str(media)])["tracks"]
+    tracks_all = run_json([mkvmerge, "-J", str(media)])["tracks"]
+    stale_ids = {t["id"] for t in tracks_all
+                if t["type"] in ("audio", "subtitles") and is_own_output_track(t, cfg)}
+    already_cleaned = bool(stale_ids)
+    # Every track-selection function below gets the STALE-FILTERED list, so a
+    # rerun always re-detects from the true original source - never treats a
+    # previous run's own (Cleaned)/(Wordless) track as if it were the thing
+    # to clean (or, for subtitles, as a real text/PGS track to re-censor).
+    # tracks_all (with the stale ids still in it) is kept around for remux()'s
+    # exclude_audio_ids/exclude_subs_ids, so a fresh rebuild REPLACES the
+    # stale track instead of piling up another one alongside it.
+    tracks = [t for t in tracks_all if t["id"] not in stale_ids]
+    stale_audio_ids = [t["id"] for t in tracks_all if t["type"] == "audio" and t["id"] in stale_ids]
+    stale_subs_ids = [t["id"] for t in tracks_all if t["type"] == "subtitles" and t["id"] in stale_ids]
+    if already_cleaned:
+        print(f"  [note] {len(stale_ids)} pre-existing (Cleaned)/(Wordless) track(s) found - "
+              f"re-detecting from the original source; a fresh build only replaces them if the "
+              f"flagged words differ (--force to always replace)")
     chosen, audio_pos = choose_audio(tracks, cfg.source_track)
     cp = chosen["properties"]
     print(f"  cleaning audio #{audio_pos}: "
@@ -1918,8 +1985,30 @@ def main(argv: list[str] | None = None) -> int:
                 words = ", ".join(sorted({h["match"] for h in hs}))
                 tag = "  [srt-only]" if hs and all(h.get("source") == "srt-backfill" for h in hs) else ""
                 print(f"    {fmt_hms(s)} - {fmt_hms(e)}  {words}{tag}")
+            new_words = sorted({h["match"].lower() for s, e, hs in spans for h in hs})
+            if already_cleaned:
+                prev_report = final_dest.parent / f"{final_dest.stem}.bleeps.json"
+                old_words = _load_prev_flagged_words(prev_report)
+                if old_words is not None and old_words == new_words and not args.force:
+                    shown = ", ".join(new_words) if new_words else "(none)"
+                    print(f"  no change: a fresh detection pass flags the exact same "
+                          f"{len(new_words)} word(s) the current (Cleaned) track already covers "
+                          f"({shown}) - skipping rebuild (--force to replace anyway)")
+                    return 0
+                if old_words is not None and old_words != new_words:
+                    added = sorted(set(new_words) - set(old_words))
+                    removed = sorted(set(old_words) - set(new_words))
+                    print(f"  change detected vs. the current (Cleaned) track: "
+                          f"+{added or '[]'} -{removed or '[]'} - rebuilding")
+                elif args.force:
+                    print("  --force: rebuilding regardless of whether the flagged words changed")
+
             if not spans:
-                print("  nothing flagged - no output written")
+                if already_cleaned:
+                    print("  nothing flagged on this pass - leaving the existing (Cleaned) track "
+                          "as-is (nothing to rebuild it from)")
+                else:
+                    print("  nothing flagged - no output written")
                 return 0
             if args.dry_run:
                 print("  (dry run - stopping before ffmpeg / mkvmerge)")
@@ -2019,7 +2108,8 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 pass
             remux(mkvmerge, media, tracks, cfg, build_path, clean_audio, chosen, None, None,
-                  audio_suffix=cfg.dialog_track_suffix, audio_default=cfg.dialog_track_default)
+                  audio_suffix=cfg.dialog_track_suffix, audio_default=cfg.dialog_track_default,
+                  exclude_audio_ids=stale_audio_ids, exclude_subs_ids=stale_subs_ids)
             if args.keep_temp:
                 shutil.copy2(clean_audio, out_dir / f"{media.stem}{name_suffix}{clean_audio.suffix}")
                 if (tmp / "filter.txt").is_file():
@@ -2030,7 +2120,8 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 pass
             remux(mkvmerge, media, tracks, cfg, build_path,
-                  clean_audio, chosen, clean_srt, chosen_subs)
+                  clean_audio, chosen, clean_srt, chosen_subs,
+                  exclude_audio_ids=stale_audio_ids, exclude_subs_ids=stale_subs_ids)
             if args.keep_temp:
                 shutil.copy2(clean_audio, out_dir / f"{media.stem}{cfg.track_name_suffix}{clean_audio.suffix}")
                 if (tmp / "filter.txt").is_file():  # not written by mute_track's stemmed-splice path

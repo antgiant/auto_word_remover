@@ -328,6 +328,60 @@ now: the `TemporaryDirectory` location and where `--keep-temp` drops debug
 copies of the clean track / filter graph / clean subtitle. It is **not** where
 the cleaned result ends up - that's always `final_dest`.
 
+### Re-running on an already-cleaned file (`mute`/`bleep` only)
+
+Running `clean.py` a second time on a file it already cleaned doesn't just
+add another `(Cleaned)` track alongside the old one, and doesn't blindly
+redo the (often expensive - stemming, PGS OCR) work either. `main()`
+fetches `tracks_all` (mkvmerge `-J`) and splits off `stale_ids` - every
+audio/subtitle track whose `track_name` ends with `cfg.track_name_suffix`/
+`cfg.dialog_track_suffix` (`is_own_output_track()`) - i.e. a track THIS TOOL
+added on a prior run. Everything that picks a track to work from
+(`choose_audio`/`choose_subs`/`choose_pgs`/`dialog_remove_track`'s dialogue-
+timing derivation) only ever sees the **stale-filtered** `tracks` list, so a
+rerun always re-detects from the true original source, never re-cleans an
+already-cleaned track or re-censors an already-censored subtitle.
+
+A fresh detection pass then runs exactly as normal (transcript reused from
+cache, wordlists re-scanned, PGS OCR cache reused) and its word set -
+`sorted({h["match"].lower() for ... in spans for h in hs})` - is compared
+against the PREVIOUS run's own `<final_dest.stem>.bleeps.json`
+(`_load_prev_flagged_words()` - already exactly what that report's `spans`
+field records, no new state file needed):
+
+- **Same set** (and no `--force`): skip the rebuild entirely - no ffmpeg/
+  mkvmerge/stemming/PGS-censoring work, source untouched. This is the
+  common case for a rerun with no real reason to redo anything (e.g. a
+  scheduled recheck, or rerunning after an unrelated crash).
+- **Different set**, or `--force` given: rebuild as normal. `remux()`'s
+  `exclude_audio_ids`/`exclude_subs_ids` (built from `tracks_all`, since the
+  stale ids no longer exist in the filtered `tracks`) drop the stale
+  track(s) from `media`'s import via mkvmerge's `--audio-tracks
+  '!id,id'`/`--subtitle-tracks '!id,id'` negation syntax - the fresh track
+  REPLACES the stale one in the same build, rather than a second rebuild
+  needing to clean up after the first.
+- **Nothing flagged on this pass** (spans empty) but a `(Cleaned)` track
+  already exists: the existing track is left as-is - there's nothing to
+  build a replacement from, and this tool doesn't "un-clean" a file.
+
+Scoped to `mute`/`bleep` only, matching what the user actually asked for
+("only if that would result in a different set of words"): `dialog` doesn't
+use wordlists at all (it strips ALL dialogue, so there's no word set to
+compare - it always reruns), and `cut` fully replaces the file with a
+shorter one with no separate alt track to detect/compare against in the
+first place.
+
+**Known gap, not fixed here**: `ensure_transcript()` reuses `<name>.json` if
+present (the common case, and the only case this matters for) but otherwise
+hands the WHOLE media file to `voice_to_text\transcribe.py`, which picks its
+own default audio track - after a first clean.py run, the container's
+default track IS the `(Cleaned)` one. A rerun with no transcript cache
+(deleted, or `--retranscribe`) would transcribe the wrong (already-muted)
+track. Not hit in practice since the cache normally exists by the time a
+rerun happens; would need `ensure_transcript` to extract the chosen original
+track itself rather than handing the whole container to `transcribe.py` to
+close properly.
+
 ### "cut" (audio-only inputs only, e.g. audiobooks)
 
 Cutting removes time, so it fundamentally can't work the way `mute`/`bleep` do:

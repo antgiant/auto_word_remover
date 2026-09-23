@@ -258,6 +258,7 @@ needs, any Python 3.10+ — see the version note above).
 | `--keep-temp` | also drop the cleaned track + ffmpeg filter graph in `out\` |
 | `--output-dir DIR` | scratch dir for temp files (default `out\`) — not where the result ends up; that always replaces the source |
 | `--overwrite` | allow clobbering a leftover file at the destination from an earlier run where the extension changed; irrelevant when the destination is the source's own path (always replaced) |
+| `--force` | `mute`/`bleep` only: rerunning on an already-cleaned file re-detects from the true original source and only replaces the existing `(Cleaned)` track if the flagged words actually changed — `--force` rebuilds and replaces it anyway, even with no change (see AGENTS.md) |
 
 Run `clean.ps1 --help` (or `clean.py --help`) for the full list, including
 `--retranscribe`, `--no-srt-backfill`, and `--config` (point at a different
