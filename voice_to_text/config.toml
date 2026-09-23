@@ -46,4 +46,10 @@ condition_on_previous_text = false   # key setting that prevents runaway loops
 repetition_penalty = 1.15
 no_repeat_ngram_size = 3
 suppress_numerals = false
-# initial_prompt = "Proper nouns: ACME Corp, Jane Doe."
+# Real dialogue-style sentences, not a word list or instruction - Whisper
+# isn't instruction-tuned, initial_prompt only works as preceding TEXT
+# CONTEXT that shifts continuation-likelihood. A vocabulary-list-style
+# prompt was tested and did nothing (see AGENTS.md); this phrasing, tested
+# on the same real-miss dataset, gave a genuine (if modest, and not
+# side-effect-free - see AGENTS.md) net recovery gain on top of the VAD fix.
+initial_prompt = "God damn it, this is bullshit! What the hell is wrong with you, you stupid bastard? Get your ass over here right now, you son of a bitch. Holy shit, stop being such a dick about it."

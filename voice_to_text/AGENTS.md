@@ -136,6 +136,123 @@ No config lever tested here moved this. This is exactly the case
 `backfill_from_srt`/PGS-OCR/VobSub-OCR backfill exists to catch when a real
 subtitle track is available - it isn't going away by tuning Whisper harder.
 
+### Investigating the self-censorship bias specifically (2026-09-23, later)
+
+Follow-up to the finding above: how big is this bucket really, what causes
+it, and does anything cheap fix it? Re-ran the full 67-case set against the
+VAD fix above (confirmed identical: 42/67, 63% - the shipped default hadn't
+drifted) and manually categorized every still-missing case by what the
+transcript actually contains at that moment, rather than assuming they're
+all self-censorship:
+
+| Bucket | Count (of 25 still missing) | What it looks like |
+|---|---|---|
+| Empty/silence (still a VAD or acoustic gap, not censorship) | 3 | transcript is `''` for that whole clip |
+| Plausible phonetic ASR error (ordinary wrong word, sound-alike) | 3 | "CRAP" -> "crab" ("crab magic" for "crap magic"), "to hell" -> "Tell", "damn you" -> "Damien" |
+| **Genuine self-censorship** (high confidence) | **5** | all from one `I, Robot (2004)` scene - see below |
+| Unrelated/garbled, no clear pattern | 14 | wrong window content, whispered/overlapping dialogue, no phonetic or censorship link |
+
+**The self-censorship bucket is real but small and concentrated** - 5 of 67
+cases (7%), all from the same scene in one film. Worth knowing before
+investing further effort here: even a perfect fix for this specific failure
+mode caps out well below the VAD fix's own impact.
+
+**Mechanism, confirmed empirically, not assumed**: checked what
+`suppress_tokens=[-1]` (the default) actually resolves to -
+`faster_whisper.tokenizer.Tokenizer.non_speech_tokens` - and it is purely
+structural (brackets, music note symbols, formatting tokens like `[DAVID]`
+speaker tags) with nothing profanity-related in it at all. So this isn't a
+runtime filter that could be disabled. Confirmed the alternative
+(a bias learned into the model's weights from training data) directly with
+a forced-choice probe: passed the EXACT correct preceding dialogue as
+`prefix` (a stronger, different lever than `initial_prompt` - it forces the
+segment's output to literally start with that text, removing all ambiguity
+about context) on both self-censorship clips:
+
+```
+prefix=None                              -> '...You can kiss my ass, metal thing!'
+prefix='You can kiss my ass, metal'      -> 'You can kiss my ass, metal thing.'
+prefix=None                              -> 'Spawn, Spawn! Stop it! Stop! Stop cussing and go home.'
+prefix='Oh, shit. Spoon, Spoon, stop'    -> 'Oh, shit. Spoon, Spoon, stop! Stop it, stop. Stop cussing and go home.'
+```
+
+Even handed the real word's own exact preceding context as a forced prefix,
+the model still won't continue with "dick" or "shit" - decisive: this is a
+learned bias that survives perfect context, not a hearing/acoustic/context
+problem, so no decoding-parameter trick was ever going to fix it. (A
+follow-up "6 independent temp=0.7 samples" probe intended to check the
+N-best distribution came back byte-identical across all 6 draws - CTranslate2
+evidently doesn't reseed its RNG between separate Python-level `transcribe()`
+calls by default, so that probe just tested determinism, not the true
+sampled distribution - inconclusive, not a negative result; flagging so it
+isn't miscited as "sampling was tried and found no diversity.")
+
+**What was tested on top of the VAD fix, and the honest result of each**:
+
+| Change | Hard 25-case subset | Full 67 | Verdict |
+|---|---|---|---|
+| `initial_prompt` = a bare vocabulary list (prior round) | no change | - | doesn't work - not how Whisper uses prompt text |
+| `initial_prompt` = real dialogue-style SENTENCES using actual profanity (this round) | 4/25 recovered, all genuine on inspection | **45/67 (67%), +3 net vs. 42/67** | **shipped** - see caveat below |
+| `hotwords` (word list) | 8/25 "recovered" | not shipped | **rejected - see below, do not use** |
+| `beam_size=10, patience=2` | 1/25, dubious (see below) | not re-validated at full scale | not worth the 2x decode cost for an unconfirmed single case |
+| `no_repeat_ngram_size=0`, `repetition_penalty=1.0`, `suppress_blank=False`, `length_penalty=0.5` | 0/25 each | - | no effect |
+
+**`initial_prompt` (real sentences) - shipped, but read the caveat**: net
++3 cases on the full 67 (42 -> 45), from a free config change (same decode
+cost). NOT side-effect-free though - a full-67 diff against the VAD-only
+baseline found 1 genuine regression (a case the VAD-only config transcribed
+correctly lost its correct word when re-transcribed with the prompt: "Damn
+it, don't you leave me down there" -> "What the hell is wrong with you?" -
+still triggers a `hell` hit, just the wrong word/reason) plus 2 more cases
+where the prompt produces a different, ALSO-wrong wordlist word instead of
+the true one (functionally still triggers a mute near the right moment,
+just mislabeled in the `.bleeps.json` report). Net positive, real, but not
+free of the same class of failure (prompt-induced word substitution) it's
+trying to fix - just rarer and less severe than `hotwords`' version of it.
+
+**`hotwords` - investigated properly this time, confirmed unsafe, do NOT
+use**: raw recovery count on the hard subset (8/25) is higher than
+`initial_prompt`, but inspecting the actual transcripts shows why the prior
+round correctly avoided it - `hotwords` causes outright HALLUCINATION of
+wordlist vocabulary regardless of what was actually said:
+
+```
+clip [007] (I,Robot, target "SHIT")     -> 'shit bitch'
+clip [065] (Sleeping, target "SHIT")    -> 'shit bitch'      <- IDENTICAL two-word output, different movies
+clip [019] (Dundee LA, target "SHIT")   -> 'fuck'            <- wrong hotword entirely, nothing like it was said
+clip [040] (Indy 4, target "damn")      -> 'fuck god damn it now'   <- correct "damn" PLUS a hallucinated "fuck"
+```
+
+This is a materially worse failure mode than `initial_prompt`'s occasional
+wrong-word substitution: it can inject wordlist vocabulary into segments
+that may have had NO profanity at all, which for a tool whose whole job is
+deciding what audio to mute is a real false-positive risk, not just a
+labeling nuisance. Confirms and explains (rather than just restates) the
+prior round's "hotwords made it worse" finding - the mechanism is `get_prompt()`
+in faster_whisper's `transcribe.py`, which injects `hotwords` as literal
+prompt tokens whenever `hotwords and not prefix` regardless of
+`condition_on_previous_text`, biasing every segment toward that vocabulary
+whether or not it's actually present in the audio.
+
+**Full 67-case validation of the shipped config** (VAD fix + `initial_prompt`):
+**45/67 (67%) recovered**, up from 42/67 (63%) with the VAD fix alone and
+33/67 (49%) at the original baseline - a cumulative +12 case / +18 point
+improvement from two free config changes across this whole investigation,
+with the caveats above honestly on the record.
+
+**What would actually fix the remaining self-censorship bucket, for the
+record (not attempted here - real cost, a future call, not a free config
+change)**: fine-tuning Whisper (or a distilled variant) on audio paired with
+UNCENSORED transcripts would directly address a bias baked into training
+data, but needs a labeled dataset and training infrastructure this project
+doesn't have. Vocal isolation (tested in the prior round, not shipped) does
+NOT address this failure mode at all - the prefix probe proves the model
+hears these words fine already, it just won't reproduce them, so isolating
+the vocal track further changes nothing here. Practically, `backfill_from_srt`
++ PGS-OCR + VobSub-OCR backfill remains the real mitigation for this specific
+bucket, same conclusion as the prior round, now with direct mechanistic proof
+behind it instead of an inference from a small sample.
+
 **Retranscribing to benefit**: this only helps on a FUTURE transcription -
 an existing cached `<name>.json` next to an already-processed file was
 generated under the old VAD settings and won't improve until re-run with
