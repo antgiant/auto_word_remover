@@ -253,6 +253,106 @@ the vocal track further changes nothing here. Practically, `backfill_from_srt`
 bucket, same conclusion as the prior round, now with direct mechanistic proof
 behind it instead of an inference from a small sample.
 
+### Two more angles, tested in parallel with the investigation above (2026-09-23)
+
+Ran concurrently with the self-censorship deep-dive above, against the
+**VAD-fix-only** baseline (39/67 recovered in isolation - NOT the
+`initial_prompt` change above, which landed after this was already
+running; the two weren't tested in combination, though given the small
+effect sizes below, expect them to be close to additive, not confirmed).
+
+**Idea: a second, independent ASR opinion for free, reusing the wav2vec2
+alignment model already loaded for every transcription.** `whisperx.
+alignment.align()` never actually does independent decoding - it takes
+Whisper's own already-chosen text, keeps only the characters in the
+model's dictionary, and runs a Viterbi trellis/backtrack (`get_trellis`/
+`backtrack`) to force-align those specific tokens to frames. But the raw
+material it works from - `emissions = torch.log_softmax(model(waveform)..,
+dim=-1)` - is a full per-frame probability distribution over the ENTIRE
+character vocabulary, computed independent of anything Whisper said. A
+plain greedy CTC decode of that (argmax per frame, collapse repeats, drop
+blank/`-`) gives the wav2vec2 model's OWN opinion of the audio, with no
+shared decoder/LM bias with Whisper at all - genuinely free, since the
+model and the emissions are already being computed anyway.
+
+Tested via `torchaudio.pipelines.WAV2VEC2_ASR_LARGE_LV60K_960H` called
+directly (not through `align()`) on the same 67 clips - full run took
+about 5 seconds on GPU:
+- Independent CTC catches 12/67 on its own (vs Whisper's 39/67 isolated) -
+  expected, since CTC without a language-model prior is noisier on hard
+  acoustic conditions (overlapping music/effects, mumbled delivery) - most
+  "both miss" cases show genuinely garbled CTC output
+  (`"dttat tati tat ningn that rerat go i tad ptid t"` for a "SHIT" buried
+  in dialogue), not a clean recovery.
+- Overlap is high: 11 of its 12 hits were words Whisper ALSO already got.
+  Net new recovery beyond Whisper alone: **+1/67**.
+- That one new case is a clean, textbook self-censorship-shaped example:
+  Whisper (isolated) transcribed *Indiana Jones and the Last Crusade*'s
+  "the Cup of Life holds everlasting **damnation**" as `"I'm not saving
+  that nation"` - a fully fluent, grammatically clean SUBSTITUTION
+  preserving the "-nation" rhyme, not a dropped word or garble. The
+  independent CTC decode got `"damnation an"` - rough, but contains the
+  actual word. (Not one of the 5 cases the self-censorship deep-dive above
+  traced to the confirmed learned-bias mechanism via prefix-forcing - may
+  overlap with its "plausible phonetic ASR error" bucket instead; not
+  cross-checked against their categorization.)
+- **False-positive check**: ran the same raw CTC decode + wordlist scan on
+  20 ordinary clean dialogue clips (same movies, >15s from any known miss,
+  >10s apart from each other) - **0/20 produced a spurious wordlist
+  match**. The noise it does produce doesn't look like real words at all,
+  let alone specifically profanity-shaped ones.
+
+**Verdict: real signal, zero measured false-positive cost, genuinely free
+to compute - but NOT shipped**, because the standalone yield (+1/67, ~1.5
+points) doesn't currently justify the real integration cost: greedy CTC
+output has no built-in word-level timestamps (would need its own
+frame-to-time bookkeeping to slot into `flag_language`'s hit format), and
+wiring a second detection channel through `clean.py`'s pipeline is
+non-trivial plumbing for a single-digit-percentage gain. Worth revisiting
+specifically scoped to the "no usable subtitle" bucket in
+`profanity_filter/AGENTS.md` (movies with zero other safety net, where any
+independent catch is proportionally worth more) rather than as a
+library-wide default - not done here, flagging for a future call.
+
+**Idea: use per-word alignment confidence (`score` in the `.json`/
+`.words.json` output) to target an expensive verification pass only at
+suspicious words, instead of every word.** Compared the alignment
+confidence of transcript words immediately adjacent (within 3s) to a known
+miss's timestamp against ordinary words elsewhere in the same file (>10s
+from any miss, random sample) across all 67 cases:
+
+| | n | mean | median | p10 | p25 |
+|---|---|---|---|---|---|
+| words neighboring a miss | 89 | 0.698 | 0.761 | 0.269 | 0.510 |
+| ordinary words | 400 | 0.776 | 0.846 | 0.461 | 0.661 |
+
+There IS a real, consistent gap (~0.08-0.09 lower mean/median near a
+miss) - not nothing. But the distributions overlap heavily, and the
+practical targeting question is "how much of the film would you have to
+flag to catch most misses":
+
+| probe budget (% of ordinary words flagged) | % of miss-neighbor words caught |
+|---|---|
+| 10% | 22.5% |
+| 25% | 36.0% |
+| 40% | 52.8% |
+| 50% | 58.4% |
+
+**Verdict: real but too weak to be practically useful, NOT shipped.** At a
+genuinely cheap budget (10%) you catch under a quarter of misses; even
+spending on HALF the words in the film only gets 58%. This makes sense in
+hindsight rather than being a surprising failure: self-censorship
+*by definition* produces a fluent, grammatically-confident substitution
+(confirmed directly by the prefix-forcing probe above, which showed the
+model committing smoothly to the clean alternative even given perfect
+context) - it isn't hesitating, so it doesn't reliably show up as a
+confidence outlier the way a genuine mis-hearing or garbled-audio guess
+would. Confidence-based targeting might still have some value against a
+DIFFERENT failure mode (acoustic ambiguity rather than self-censorship
+specifically) - not tested here since that wasn't this investigation's
+question - but as a lever against self-censorship specifically, it isn't
+one.
+
 **Retranscribing to benefit**: this only helps on a FUTURE transcription -
 an existing cached `<name>.json` next to an already-processed file was
 generated under the old VAD settings and won't improve until re-run with
