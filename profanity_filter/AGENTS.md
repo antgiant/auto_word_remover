@@ -91,6 +91,122 @@ cue tokens are extracted (strip surrounding punctuation) before comparing them
 already-covered check and produced a duplicate hit at the wrong (interpolated)
 time. Any future tokenization change to either side must keep them consistent.
 
+### PGS OCR + bitmap censoring (Blu-ray bitmap subtitles, `pgs_ocr.py`)
+
+A Blu-ray rip's subtitle tracks (`S_HDMV/PGS`, codec `hdmv_pgs_subtitle`) are
+bitmap images, not text - `choose_subs()` skips them on purpose since
+there's nothing to censor or backfill from directly. `pgs_ocr.py` closes
+that gap in two stages, and the output stays image-based end to end: the
+"(Cleaned)" subtitle track clean.py adds is the ORIGINAL bitmap with
+flagged words redacted directly in the image, not a text conversion (an
+earlier version of this feature converted to a censored SubRip text track
+instead - abandoned the same day once the user pointed out that left every
+*original* PGS track, still selectable, completely uncensored; the
+image-in, image-out design below replaced it before the first real run).
+
+**Stage 1 - `analyze_pgs_track()`** (runs during clean.py's normal subtitle-
+discovery, same point the old text-track/CC608 fallbacks live): parses the
+raw `.sup` segment stream mkvextract produces for a PGS track (Presentation
+Composition / Window Definition / Palette Definition / Object Definition
+segments), decodes each subtitle image's RLE-compressed indexed bitmap
+(`_decode_rle`), and OCRs every cue ONCE with Tesseract via
+`pytesseract.image_to_data` - getting both the plain cue text (written to a
+cached `.srt`, used only for `srt_backfill`) AND per-word bounding boxes
+(cached to a `.words.json`) in the same pass, so stage 2 never re-runs OCR.
+Cached next to the source as `<name>.<lang>.pgsocr.{sup,srt,words.json}`
+(reused on rerun unless `--retranscribe`/`cfg.retranscribe`) since OCR-ing a
+full film is slow.
+
+**Rendering trick**: rather than a full YCbCr->RGB palette conversion, each
+pixel's grayscale value for OCR is just `255 - alpha` from its palette entry
+- text (opaque, high alpha) comes out dark, background (transparent, alpha
+0) comes out white, regardless of the subtitle's actual on-screen color.
+Sidesteps color entirely, which is fine since redaction never needs to
+preserve it either (a masked pixel becomes fully transparent, not a
+same-color box).
+
+**Cue timing** is derived exactly, not estimated: a Presentation Composition
+Segment with zero composition objects is PGS's standard "clear the screen"
+marker, so a cue's end is the next display set's own PTS - covers both a
+genuine clear and the next subtitle's appearance - instead of a fixed guess
+like "+4s" (which `_pgs_cue_starts`/`subtitle_dialogue_spans` still use,
+since that code only needs rough dialogue *timing*, not the text itself).
+
+**Stage 2 - `censor_pgs_track()`** (runs once `find_spans()` has the final
+audio-removal spans, same point `censor_srt()` runs for a text track):
+re-scans each cue's cached OCR'd words against the SAME wordlist matchers
+used for audio (mirrors `censor_srt`'s re-scan-the-cue-text approach rather
+than trying to align to transcript timing word-for-word), and for every
+match in a cue overlapping a flagged span, redacts it DIRECTLY IN THE
+BITMAP:
+
+1. `_encode_rle()` is the RLE encoder side of `_decode_rle` - not
+   byte-optimal, just correct (always uses the escape+run form), since it
+   only has to round-trip through the decoder, not match the original
+   encoder's exact choices.
+2. **Finding what to redact was the hard part** - Tesseract's own per-word
+   box, taken at face value, was confirmed on this project's real test
+   source (Hamilton (2020), a bold italic/stylised font) to undershoot a
+   glyph's TRUE left edge by ~29px on a ~50px-tall word ("whore" mis-boxed
+   well into its own letters) - not a small-margin problem a fixed or
+   proportional pad can paper over. Two things fixed it together:
+   - Words are grouped by OCR line (`ocr_cue`'s `"line"` field) and sorted
+     left-to-right, so a flagged word's redaction bounds are capped by its
+     same-line NEIGHBORS' centers, not by its own (unreliable) box edges or
+     an edge-to-edge midpoint (a midpoint was tried first and still cut off
+     real ink - see the git history for that dead end).
+   - Within that cap, `_ink_columns()` reads the REAL per-object index
+     bitmap (not OCR geometry at all) and the redaction box is grown
+     pixel-by-pixel outward from the OCR box's own center until it hits an
+     actual all-transparent column/gap - i.e. the true glyph edge - capped
+     only as a last-resort backstop against engulfing an entire connected
+     neighbor when no whitespace exists in the bitmap at all.
+3. `_splice_sup()` rewrites the `.sup`: every segment NOT touched (PCS/WDS/
+   PDS/END, every other object's ODS) is copied through as an exact byte
+   slice; a touched object's ODS segment(s) are replaced with freshly
+   RLE-encoded, redacted data via `_build_ods_segments()` (handles
+   fragmentation for an object too big for one segment - same PTS, same
+   object id/dimensions, just different pixels).
+
+**Wiring in `clean.py`**: `choose_pgs()` finds the PGS track,
+`locate_tesseract()` finds the OCR binary, stage 1 runs during subtitle
+discovery (sets `pgs_source_track`/`pgs_cache`, and `raw_srt`/`chosen_subs`
+for `srt_backfill` exactly like the old design did). Once spans are known,
+`main()` branches on `pgs_source_track is not None` instead of going through
+`censor_srt()`: stage 2 runs, and the resulting `.sup` is passed to
+`remux()` as `clean_srt` (the parameter is generic - mkvmerge autodetects
+`.sup` as `S_HDMV/PGS` on import same as it does `.srt` as SubRip, so
+`remux()` needed no changes to accept either).
+
+**Known limitation**: matching is per-OCR'd-word-token, so a multi-word
+phrase in `irreverence.txt` (default categories are `["profanity"]` only,
+all single words, so this doesn't bite yet) would never match here, unlike
+`censor_srt()` which scans a whole cue's text at once. Worth revisiting if
+`irreverence` phrases are ever enabled for a PGS-only source.
+
+**Setup**: needs Tesseract OCR installed (`winget install --id
+UB-Mannheim.TesseractOCR`) and `pytesseract` + `numpy` in the shared
+`voice_to_text\.venv` (`pip install pytesseract`; numpy/Pillow are already
+there). `locate_tesseract()` checks fixed install locations before PATH,
+since a winget install updates the registry-level user PATH that an
+already-running shell/process won't see until it restarts.
+
+**Validated** 2026-09-23 against a real Blu-ray rip (Hamilton (2020), no
+text subtitle track at all - only PGS): the parser/renderer/OCR chain
+correctly reproduced the film's actual opening dialogue/lyrics from raw
+`.sup` bytes with exact PTS-based timing; `srt_backfill` correctly caught
+"bastard"/"whore" from the real lyric ("How does a bastard, orphan, son of
+a whore..."); a full clean.py run (transcript -> flag -> mute -> PGS
+censor -> mkvmerge remux) on a 1-minute real clip produced a new default
+PGS "(Cleaned)" track with both words visibly and fully blanked (confirmed
+by pixel-diffing rendered before/after cue images, not just eyeballing a
+PNG) with zero bleed into the surrounding words ("How does a [blank]
+orphan", "Son of a [blank] and a Scotsman"). OCR/detection is still
+inherently approximate - a missed transcription/OCR means a missed
+redaction - so this is "much better than nothing," not as authoritative as
+manual review. Only `S_HDMV/PGS` is handled, not `S_VOBSUB` (DVD-era bitmap
+subs use a different encoding `pgs_ocr.py` doesn't parse).
+
 ### Word lists
 
 One entry per line: literal phrase (whole-word, case-insensitive) or

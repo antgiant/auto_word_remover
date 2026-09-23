@@ -67,7 +67,6 @@ End-to-end from a single media file:
                  dialog adds "<original label> (Wordless)" as a non-default
                  track by default. Video and all other tracks are copied
                  bit-for-bit.
-
 Usage:
   clean.py "Movie (2002).mkv"
   clean.py "Movie.mkv" --method bleep --beep-gain-db -8
@@ -213,6 +212,13 @@ class Config:
     subs_pad: float = 0.15            # s of slack when matching cues to bleep spans
     srt_backfill: bool = True          # also cross-check the embedded SRT for missed words
 
+    pgs_ocr: bool = True               # when there's no text subtitle track but there IS a PGS
+    #                                    (Blu-ray bitmap) one, OCR it into a real SRT (see pgs_ocr.py)
+    #                                    and use that for srt_backfill/censoring instead of skipping
+    #                                    subtitles entirely. Needs Tesseract - see locate_tesseract().
+    pgs_ocr_lang: str = ""             # Tesseract language code, "" = derive from the track's own
+    #                                    3-letter language tag (falls back to "eng" if unrecognised)
+
     output_dir: str = "out"
     retranscribe: bool = False
     overwrite: bool = False
@@ -254,6 +260,20 @@ STEM_VENV = HERE / ".venv-stem"
 def locate_stem_tool() -> str | None:
     exe = STEM_VENV / "Scripts" / "audio-separator.exe"
     return str(exe) if exe.is_file() else None
+
+
+def locate_tesseract() -> str | None:
+    """Tesseract OCR binary for pgs_ocr.py (PGS bitmap-subtitle OCR fallback -
+    see Config.pgs_ocr). Checked at fixed install locations first, not just
+    PATH: a winget install updates the registry-level user PATH, which an
+    already-running shell/process won't see until it restarts - shutil.which
+    is still tried last as a fallback for a PATH-based install."""
+    for cand in (HERE / "bin" / "tesseract.exe",
+                Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+                Path.home() / "AppData" / "Local" / "Programs" / "Tesseract-OCR" / "tesseract.exe"):
+        if cand.is_file():
+            return str(cand)
+    return shutil.which("tesseract")
 
 
 def locate_tools() -> dict:
@@ -472,6 +492,21 @@ def choose_subs(tracks: list, want: str):
     if not srt:
         return None, None
     t = _pick(srt, want, "subtitle")
+    return t, t["id"]
+
+
+def choose_pgs(tracks: list, want: str):
+    """The image-based (PGS/Blu-ray) subtitle track to feed pgs_ocr.py, or
+    (None, None) if there isn't one - see Config.pgs_ocr. Only S_HDMV/PGS is
+    handled (not VobSub, a DVD-era format with its own bitmap encoding
+    pgs_ocr.py doesn't parse)."""
+    if str(want).lower() in ("none", "skip", "off", ""):
+        return None, None
+    pgs = [t for t in tracks if t["type"] == "subtitles"
+           and (t["properties"].get("codec_id") or "").upper() == "S_HDMV/PGS"]
+    if not pgs:
+        return None, None
+    t = _pick(pgs, want, "subtitle")
     return t, t["id"]
 
 
@@ -1632,6 +1667,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="do not touch subtitles")
     p.add_argument("--no-srt-backfill", dest="srt_backfill", action="store_false", default=None,
                    help="don't cross-check the embedded SRT for words the transcript missed")
+    p.add_argument("--no-pgs-ocr", dest="pgs_ocr", action="store_false", default=None,
+                   help="don't OCR a PGS (Blu-ray bitmap) subtitle track when there's no text "
+                        "track to use for srt_backfill/censoring")
+    p.add_argument("--pgs-ocr-lang", dest="pgs_ocr_lang",
+                   help="Tesseract language code for PGS OCR (default: eng)")
     p.add_argument("--output-dir", dest="output_dir")
     p.add_argument("--retranscribe", action="store_true", default=None)
     p.add_argument("--overwrite", action="store_true", default=None)
@@ -1656,7 +1696,8 @@ def main(argv: list[str] | None = None) -> int:
                  "beep_gain_db", "center_margin_db", "mute_fill", "stem_model",
                  "dialog_track_default", "clean_codec", "clean_bitrate",
                  "clean_bitrate_surround", "cut_bitrate", "source_track",
-                 "sync_ms", "subs_track", "srt_backfill", "output_dir", "retranscribe", "overwrite"]:
+                 "sync_ms", "subs_track", "srt_backfill", "pgs_ocr", "pgs_ocr_lang",
+                 "output_dir", "retranscribe", "overwrite"]:
         val = getattr(args, name, None)
         if val is not None:
             setattr(cfg, name, val)
@@ -1739,6 +1780,49 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     raw_srt = None
 
+        pgs_source_track = None  # set below when a PGS track is what raw_srt/chosen_subs came from -
+        #                          censor_pgs_track() (later) needs its cached .sup/.words.json, not clean_srt
+        pgs_cache = None  # {"sup_path", "json_path"} from analyze_pgs_track(), for the same reason
+        if subs_enabled and chosen_subs is None and cfg.pgs_ocr:
+            pgs_track, _pgs_tid = choose_pgs(tracks, cfg.subs_track)
+            if pgs_track is not None:
+                tesseract_cmd = locate_tesseract()
+                if tesseract_cmd is None:
+                    print("  [warn] a PGS (Blu-ray bitmap) subtitle track exists but Tesseract "
+                          "OCR isn't installed - skipping the OCR fallback "
+                          "(winget install --id UB-Mannheim.TesseractOCR)", file=sys.stderr)
+                else:
+                    if str(HERE) not in sys.path:
+                        sys.path.insert(0, str(HERE))
+                    import pgs_ocr
+                    lang3 = pgs_track["properties"].get("language") or "und"
+                    ocr_lang = cfg.pgs_ocr_lang or "eng"
+                    cache_base = media.with_name(f"{media.stem}.{lang3}.pgsocr")
+                    print(f"  subtitles: no text track - OCR'ing PGS track id "
+                          f"{pgs_track['id']} [{lang3}] with Tesseract (this can take a "
+                          f"while on a full film; cached for reruns)...")
+                    stats = pgs_ocr.analyze_pgs_track(
+                        mkvextract, media, pgs_track["id"], cache_base,
+                        lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
+                    action = "reusing cached" if stats["cached"] else "OCR'd"
+                    print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
+                          f"image cue(s) to text ({stats['display_sets']} display sets)")
+                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                        raw_srt = stats["srt_path"]
+                        chosen_subs = {"id": None, "type": "subtitles",
+                                      "properties": {"language": lang3,
+                                                     "track_name": LANG_NAMES.get(lang3, lang3) or lang3}}
+                        subs_tid = None
+                        pgs_source_track = pgs_track
+                        pgs_cache = {"sup_path": stats["sup_path"], "json_path": stats["json_path"]}
+                        print("  [note] this subtitle track was OCR'd from bitmap images for srt "
+                              "backfill purposes only - the actual (Cleaned) subtitle track will be "
+                              "the ORIGINAL bitmap with flagged words redacted in the image itself, "
+                              "not a text conversion; expect occasional misreads/missed redactions")
+                    else:
+                        print("  [warn] PGS OCR produced too little usable text - discarding",
+                              file=sys.stderr)
+
         if subs_enabled and chosen_subs is None:
             print("  subtitles: no usable text subtitle track to clean - skipping")
             print("  [warn] no text subtitle available to cross-check the transcript against - "
@@ -1794,7 +1878,23 @@ def main(argv: list[str] | None = None) -> int:
                 clean_audio, _ext = cut_track(ffmpeg, ffprobe, media, audio_pos, spans, cfg, tmp)
 
             clean_srt = None
-            if raw_srt is not None:
+            if pgs_source_track is not None:
+                # The source track is bitmap (PGS), not text - redact flagged
+                # words DIRECTLY IN THE IMAGE (same wordlist match, same span
+                # overlap test as censor_srt below) rather than muxing in a
+                # text conversion. raw_srt/the OCR'd text above was only ever
+                # needed for srt_backfill; the (Cleaned) track that actually
+                # gets muxed in stays image-based. See pgs_ocr.censor_pgs_track.
+                clean_sup = tmp / "clean.sup"
+                pgs_stats = pgs_ocr.censor_pgs_track(
+                    pgs_cache["sup_path"], pgs_cache["json_path"], spans, matchers,
+                    clean_sup, subs_pad=cfg.subs_pad)
+                clean_srt = clean_sup
+                subs_stats = {"words_redacted": pgs_stats["words_redacted"]}
+                print(f"  subtitles (PGS bitmap): {pgs_stats['words_redacted']} word(s) redacted "
+                      f"directly in the image across {pgs_stats['display_sets_touched']} display "
+                      f"set(s)")
+            elif raw_srt is not None:
                 # mute: audio has no audible trace of the word left, so the
                 # subtitle removes it entirely rather than visibly marking
                 # it; bleep: the word is audibly replaced by a tone, so the
@@ -1866,7 +1966,8 @@ def main(argv: list[str] | None = None) -> int:
                   clean_audio, chosen, clean_srt, chosen_subs)
             if args.keep_temp:
                 shutil.copy2(clean_audio, out_dir / f"{media.stem}{cfg.track_name_suffix}{clean_audio.suffix}")
-                shutil.copy2(tmp / "filter.txt", out_dir / f"{media.stem}.filter.txt")
+                if (tmp / "filter.txt").is_file():  # not written by mute_track's stemmed-splice path
+                    shutil.copy2(tmp / "filter.txt", out_dir / f"{media.stem}.filter.txt")
                 if clean_srt:
                     shutil.copy2(clean_srt, out_dir / f"{media.stem}{cfg.track_name_suffix}.srt")
 
