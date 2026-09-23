@@ -114,8 +114,8 @@ class Config:
     beam_size: int = 5
     temperature: float = 0.0
     vad_method: str = "pyannote"           # pyannote|silero
-    vad_onset: float = 0.500
-    vad_offset: float = 0.363
+    vad_onset: float = 0.1                 # see "Reducing the Whisper miss rate" in AGENTS.md
+    vad_offset: float = 0.05
     chunk_size: int = 30
     no_speech_threshold: float = 0.6
     log_prob_threshold: float = -1.0

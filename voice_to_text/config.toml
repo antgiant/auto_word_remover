@@ -35,9 +35,9 @@ overwrite = false
 # ---- decoding / anti-hallucination -------------------------------------
 beam_size = 5
 temperature = 0.0
-vad_method = "pyannote"          # "pyannote" (default) or "silero"
-vad_onset = 0.500
-vad_offset = 0.363
+vad_method = "pyannote"          # "pyannote" (default) or "silero" - silero measurably worse, see AGENTS.md
+vad_onset = 0.1                  # empirically the single biggest lever against missed profanity - see
+vad_offset = 0.05                # "Reducing the Whisper miss rate" in AGENTS.md before changing either
 chunk_size = 30
 no_speech_threshold = 0.6
 log_prob_threshold = -1.0
