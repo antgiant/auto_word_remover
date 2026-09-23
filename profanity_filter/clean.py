@@ -229,6 +229,12 @@ class Config:
     pgs_ocr_lang: str = ""             # Tesseract language code, "" = derive from the track's own
     #                                    3-letter language tag (falls back to "eng" if unrecognised)
 
+    vobsub_ocr: bool = True            # same idea as pgs_ocr, for VobSub (DVD bitmap) tracks - only
+    #                                    tried when there's no text track AND no PGS track either
+    #                                    (see vobsub_ocr.py; main()'s subtitle-discovery order)
+    vobsub_ocr_lang: str = ""          # Tesseract language code, "" = derive from the track's own
+    #                                    3-letter language tag (falls back to "eng" if unrecognised)
+
     output_dir: str = "out"             # scratch dir for temp files + --keep-temp debug artifacts only -
     #                                    the cleaned result itself replaces the source in place (see
     #                                    send_to_recycle_bin); this is NOT where it ends up
@@ -549,9 +555,7 @@ def choose_subs(tracks: list, want: str):
 
 def choose_pgs(tracks: list, want: str):
     """The image-based (PGS/Blu-ray) subtitle track to feed pgs_ocr.py, or
-    (None, None) if there isn't one - see Config.pgs_ocr. Only S_HDMV/PGS is
-    handled (not VobSub, a DVD-era format with its own bitmap encoding
-    pgs_ocr.py doesn't parse)."""
+    (None, None) if there isn't one - see Config.pgs_ocr."""
     if str(want).lower() in ("none", "skip", "off", ""):
         return None, None
     pgs = [t for t in tracks if t["type"] == "subtitles"
@@ -559,6 +563,22 @@ def choose_pgs(tracks: list, want: str):
     if not pgs:
         return None, None
     t = _pick(pgs, want, "subtitle")
+    return t, t["id"]
+
+
+def choose_vobsub(tracks: list, want: str):
+    """The image-based (VobSub/DVD) subtitle track to feed vobsub_ocr.py, or
+    (None, None) if there isn't one - see Config.vobsub_ocr. Checked only
+    after choose_pgs finds nothing (see main()'s subtitle-discovery order) -
+    PGS is the newer, higher-resolution format, so it wins when a source
+    somehow has both."""
+    if str(want).lower() in ("none", "skip", "off", ""):
+        return None, None
+    vobsub = [t for t in tracks if t["type"] == "subtitles"
+             and (t["properties"].get("codec_id") or "").upper() == "S_VOBSUB"]
+    if not vobsub:
+        return None, None
+    t = _pick(vobsub, want, "subtitle")
     return t, t["id"]
 
 
@@ -1768,6 +1788,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "track to use for srt_backfill/censoring")
     p.add_argument("--pgs-ocr-lang", dest="pgs_ocr_lang",
                    help="Tesseract language code for PGS OCR (default: eng)")
+    p.add_argument("--no-vobsub-ocr", dest="vobsub_ocr", action="store_false", default=None,
+                   help="don't OCR a VobSub (DVD bitmap) subtitle track when there's no text or "
+                        "PGS track to use for srt_backfill/censoring")
+    p.add_argument("--vobsub-ocr-lang", dest="vobsub_ocr_lang",
+                   help="Tesseract language code for VobSub OCR (default: eng)")
     p.add_argument("--output-dir", dest="output_dir",
                    help="scratch dir for temp files + --keep-temp debug artifacts (default 'out') - "
                         "the cleaned result itself replaces the source file in place, it is never "
@@ -1805,7 +1830,7 @@ def main(argv: list[str] | None = None) -> int:
                  "dialog_track_default", "clean_codec", "clean_bitrate",
                  "clean_bitrate_surround", "cut_bitrate", "source_track",
                  "sync_ms", "subs_track", "srt_backfill", "pgs_ocr", "pgs_ocr_lang",
-                 "output_dir", "retranscribe", "overwrite"]:
+                 "vobsub_ocr", "vobsub_ocr_lang", "output_dir", "retranscribe", "overwrite"]:
         val = getattr(args, name, None)
         if val is not None:
             setattr(cfg, name, val)
@@ -1957,6 +1982,51 @@ def main(argv: list[str] | None = None) -> int:
                         print("  [warn] PGS OCR produced too little usable text - discarding",
                               file=sys.stderr)
 
+        vobsub_source_track = None  # set below when a VobSub track is what raw_srt/chosen_subs came
+        #                             from - censor_vobsub_track() (later) needs its cached
+        #                             .idx/.sub/.words.json, not clean_srt
+        vobsub_cache = None  # {"idx_path", "sub_path", "json_path"} from analyze_vobsub_track()
+        if subs_enabled and chosen_subs is None and cfg.vobsub_ocr:
+            vobsub_track, _vobsub_tid = choose_vobsub(tracks, cfg.subs_track)
+            if vobsub_track is not None:
+                tesseract_cmd = locate_tesseract()
+                if tesseract_cmd is None:
+                    print("  [warn] a VobSub (DVD bitmap) subtitle track exists but Tesseract "
+                          "OCR isn't installed - skipping the OCR fallback "
+                          "(winget install --id UB-Mannheim.TesseractOCR)", file=sys.stderr)
+                else:
+                    if str(HERE) not in sys.path:
+                        sys.path.insert(0, str(HERE))
+                    import vobsub_ocr
+                    lang3 = vobsub_track["properties"].get("language") or "und"
+                    ocr_lang = cfg.vobsub_ocr_lang or "eng"
+                    cache_base = media.with_name(f"{media.stem}.{lang3}.vobsubocr")
+                    print(f"  subtitles: no text/PGS track - OCR'ing VobSub track id "
+                          f"{vobsub_track['id']} [{lang3}] with Tesseract (this can take a "
+                          f"while on a full film; cached for reruns)...")
+                    stats = vobsub_ocr.analyze_vobsub_track(
+                        mkvextract, media, vobsub_track["id"], cache_base,
+                        lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
+                    action = "reusing cached" if stats["cached"] else "OCR'd"
+                    print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
+                          f"image cue(s) to text ({stats['entries']} entries)")
+                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                        raw_srt = stats["srt_path"]
+                        chosen_subs = {"id": None, "type": "subtitles",
+                                      "properties": {"language": lang3,
+                                                     "track_name": LANG_NAMES.get(lang3, lang3) or lang3}}
+                        subs_tid = None
+                        vobsub_source_track = vobsub_track
+                        vobsub_cache = {"idx_path": stats["idx_path"], "sub_path": stats["sub_path"],
+                                       "json_path": stats["json_path"]}
+                        print("  [note] this subtitle track was OCR'd from bitmap images for srt "
+                              "backfill purposes only - the actual (Cleaned) subtitle track will be "
+                              "the ORIGINAL bitmap with flagged words redacted in the image itself, "
+                              "not a text conversion; expect occasional misreads/missed redactions")
+                    else:
+                        print("  [warn] VobSub OCR produced too little usable text - discarding",
+                              file=sys.stderr)
+
         if subs_enabled and chosen_subs is None:
             print("  subtitles: no usable text subtitle track to clean - skipping")
             print("  [warn] no text subtitle available to cross-check the transcript against - "
@@ -2050,6 +2120,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  subtitles (PGS bitmap): {pgs_stats['words_redacted']} word(s) redacted "
                       f"directly in the image across {pgs_stats['display_sets_touched']} display "
                       f"set(s)")
+            elif vobsub_source_track is not None:
+                # Same idea as the PGS branch above, for a VobSub (DVD
+                # bitmap) source - see vobsub_ocr.censor_vobsub_track.
+                clean_idx = tmp / "clean.idx"
+                vobsub_stats = vobsub_ocr.censor_vobsub_track(
+                    vobsub_cache["idx_path"], vobsub_cache["sub_path"], vobsub_cache["json_path"],
+                    spans, matchers, clean_idx, subs_pad=cfg.subs_pad)
+                clean_srt = clean_idx
+                subs_stats = {"words_redacted": vobsub_stats["words_redacted"]}
+                print(f"  subtitles (VobSub bitmap): {vobsub_stats['words_redacted']} word(s) "
+                      f"redacted directly in the image across {vobsub_stats['entries_touched']} "
+                      f"entries")
             elif raw_srt is not None:
                 # mute: audio has no audible trace of the word left, so the
                 # subtitle removes it entirely rather than visibly marking

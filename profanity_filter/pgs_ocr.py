@@ -567,6 +567,68 @@ def _ink_columns(idx_bytes: bytes, obj_w: int, obj_h: int, palette: dict, y0: in
     return (alpha_lut[band] > 0).any(axis=0)
 
 
+def grow_word_box(w: dict, line_words: list, i: int, cue_min_x: float, cue_min_y: float,
+                   placement_x: int, placement_y: int, obj_w: int, obj_h: int,
+                   ink_columns_fn, mask_pad_px: int = 6):
+    """(left, top, width, height) LOCAL (object-relative) box to redact for
+    word `w` (index `i` within `line_words`, already sorted left-to-right)
+    - or None if the caps collapse to nothing. Format-agnostic: shared by
+    pgs_ocr.censor_pgs_track and vobsub_ocr's equivalent, since the growing
+    algorithm doesn't care which bitmap format the ink came from - only
+    `ink_columns_fn(y0, y1) -> bool[obj_w]` (True per column with any
+    non-transparent pixel in that row band) does.
+
+    Two things fixed together after Tesseract's own per-word box was found
+    to undershoot a real glyph's true edge by ~29px on a ~50px-tall word
+    (this project's original PGS test source, a stylised italic font - not
+    a small-margin problem a fixed/proportional pad can paper over):
+    - Growth is CAPPED by the same-line neighbors' CENTERS (not their box
+      edges, and not an edge-to-edge midpoint - both were tried first and
+      still cut off real ink; a line-edge word with no neighbor on that
+      side falls back to a proportional pad instead).
+    - Within that cap, the box grows pixel-by-pixel outward from the OCR
+      box's own center through the REAL bitmap until it hits an actual
+      transparent gap - real pixel data, not trusted OCR geometry."""
+    ly = int(round(cue_min_y + w["top"] - placement_y))
+    vpad = max(mask_pad_px, round(0.12 * w["height"]))
+    fallback_pad = max(mask_pad_px, round(0.3 * w["height"]))
+    if i > 0:
+        prev = line_words[i - 1]
+        left_bound = prev["left"] + prev["width"] / 2
+    else:
+        left_bound = w["left"] - fallback_pad
+    if i + 1 < len(line_words):
+        nxt = line_words[i + 1]
+        right_bound = nxt["left"] + nxt["width"] / 2
+    else:
+        right_bound = w["left"] + w["width"] + fallback_pad
+
+    left_cap = max(0, int(round(cue_min_x + left_bound - placement_x)))
+    right_cap = min(obj_w - 1, int(round(cue_min_x + right_bound - placement_x)) - 1)
+    y0 = max(0, ly - vpad)
+    y1 = min(obj_h, ly + int(round(w["height"])) + vpad)
+    if right_cap <= left_cap:
+        return None
+
+    ink = ink_columns_fn(y0, y1)
+    center = max(left_cap, min(right_cap,
+                 int(round(cue_min_x + w["left"] + w["width"] / 2 - placement_x))))
+    if not ink[center]:
+        # OCR's box missed the glyph entirely at its own center (rare, but
+        # seen on other fonts) - search a small radius for the nearest ink
+        # pixel instead of silently redacting nothing.
+        radius = max(4, int(round(w["width"] / 2)))
+        found = next((c for d in range(1, radius + 1) for c in (center - d, center + d)
+                     if left_cap <= c <= right_cap and ink[c]), None)
+        center = found if found is not None else center
+    l = r = center
+    while l - 1 >= left_cap and ink[l - 1]:
+        l -= 1
+    while r + 1 <= right_cap and ink[r + 1]:
+        r += 1
+    return (max(0, l - 1), y0, max(1, r - l + 1) + 2, y1 - y0)
+
+
 def censor_pgs_track(sup_path: Path, json_path: Path, spans, matchers: dict,
                       out_sup_path: Path, subs_pad: float = 0.15,
                       mask_pad_px: int = 6) -> dict:
@@ -607,13 +669,8 @@ def censor_pgs_track(sup_path: Path, json_path: Path, spans, matchers: dict,
         if cue is None:
             continue
 
-        # Group by line, left-to-right - a flagged word's redaction bounds
-        # come from the GAP to its same-line neighbors, not its own box
-        # edges (see ocr_cue's docstring: on this source's stylised italic
-        # font, Tesseract's box was confirmed to undershoot a glyph's true
-        # left edge by ~29px on a ~50px-tall word - a fixed/proportional pad
-        # on the box itself can't reliably cover an error that size, but the
-        # gap to the previous/next word's own box is unaffected by it).
+        # Group by line, left-to-right - grow_word_box() needs same-line
+        # neighbors in this order to cap its growth (see its docstring).
         by_line: dict[int, list[dict]] = {}
         for w in row["words"]:
             by_line.setdefault(w["line"], []).append(w)
@@ -625,67 +682,20 @@ def censor_pgs_track(sup_path: Path, json_path: Path, spans, matchers: dict,
                 token = w["text"].strip(".,!?;:'\"-()[]{}*")
                 if not token or not any(rx is not None and rx.search(token) for rx in matchers.values()):
                     continue
-                placement, _lx, ly = _locate_placement(
+                placement, _lx, _ly = _locate_placement(
                     ds_index, placements_by_ds, w["left"], w["top"], w["width"], w["height"],
                     cue.min_x, cue.min_y)
                 if placement is None:
                     continue
 
-                # Growth cap, not a trusted boundary: the box-edge midpoint
-                # looked like a safe cap but wasn't - "whore"'s own box was
-                # found to undershoot its true left edge by ~29px, past the
-                # midpoint to its neighbor's box, so capping there still cut
-                # off real ink. Use the NEIGHBOR'S OWN CENTER instead - the
-                # ink-scan below still stops at the real gap almost always;
-                # this only matters as a last-resort backstop against
-                # engulfing an entire connected neighbor when no whitespace
-                # gap exists in the bitmap at all (a line-edge word, with no
-                # neighbor on that side, falls back to a proportional pad).
-                fallback_pad = max(mask_pad_px, round(0.3 * w["height"]))
-                if i > 0:
-                    prev = line_words[i - 1]
-                    left_bound = prev["left"] + prev["width"] / 2
-                else:
-                    left_bound = w["left"] - fallback_pad
-                if i + 1 < len(line_words):
-                    nxt = line_words[i + 1]
-                    right_bound = nxt["left"] + nxt["width"] / 2
-                else:
-                    right_bound = w["left"] + w["width"] + fallback_pad
-
-                vpad = max(mask_pad_px, round(0.12 * w["height"]))
                 obj_w, obj_h, idx_bytes = display_sets[ds_index].images[placement.obj_id]
-                left_cap = max(0, int(round(cue.min_x + left_bound - placement.x)))
-                right_cap = min(obj_w - 1, int(round(cue.min_x + right_bound - placement.x)) - 1)
-                y0 = max(0, ly - vpad)
-                y1 = min(obj_h, ly + int(round(w["height"])) + vpad)
-                l, r = left_cap, right_cap
-                if right_cap > left_cap:
-                    # Grow outward pixel-by-pixel from the OCR box's own
-                    # center to the true ink edges (real bitmap data, not
-                    # OCR's box numbers - see the "line" grouping comment
-                    # above for why the box numbers alone aren't trustworthy
-                    # here), capped by the neighbor-midpoint bounds so a
-                    # touching/connected glyph can't grow into another word.
-                    ink = _ink_columns(idx_bytes, obj_w, obj_h, display_sets[ds_index].palette, y0, y1)
-                    center = max(left_cap, min(right_cap,
-                                 int(round(cue.min_x + w["left"] + w["width"] / 2 - placement.x))))
-                    if not ink[center]:
-                        # OCR's box missed the glyph entirely at its own
-                        # center (rare, but seen on other fonts) - search a
-                        # small radius for the nearest ink pixel instead of
-                        # silently redacting nothing.
-                        radius = max(4, int(round(w["width"] / 2)))
-                        found = next((c for d in range(1, radius + 1)
-                                     for c in (center - d, center + d)
-                                     if left_cap <= c <= right_cap and ink[c]), None)
-                        center = found if found is not None else center
-                    l = r = center
-                    while l - 1 >= left_cap and ink[l - 1]:
-                        l -= 1
-                    while r + 1 <= right_cap and ink[r + 1]:
-                        r += 1
-                box = (max(0, l - 1), y0, max(1, r - l + 1) + 2, y1 - y0)
+                palette = display_sets[ds_index].palette
+                box = grow_word_box(
+                    w, line_words, i, cue.min_x, cue.min_y, placement.x, placement.y, obj_w, obj_h,
+                    ink_columns_fn=lambda y0, y1: _ink_columns(idx_bytes, obj_w, obj_h, palette, y0, y1),
+                    mask_pad_px=mask_pad_px)
+                if box is None:
+                    continue
                 redactions.setdefault(ds_index, {}).setdefault(placement.obj_id, []).append(box)
                 words_redacted += 1
 

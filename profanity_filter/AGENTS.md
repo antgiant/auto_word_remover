@@ -204,8 +204,100 @@ PNG) with zero bleed into the surrounding words ("How does a [blank]
 orphan", "Son of a [blank] and a Scotsman"). OCR/detection is still
 inherently approximate - a missed transcription/OCR means a missed
 redaction - so this is "much better than nothing," not as authoritative as
-manual review. Only `S_HDMV/PGS` is handled, not `S_VOBSUB` (DVD-era bitmap
-subs use a different encoding `pgs_ocr.py` doesn't parse).
+manual review. `S_VOBSUB` (DVD-era bitmap subs, a different encoding this
+module doesn't parse) has its own equivalent module - see `vobsub_ocr.py`
+below - tried as a further fallback when there's neither a text track nor
+a PGS one.
+
+### VobSub OCR + bitmap censoring (DVD bitmap subtitles, `vobsub_ocr.py`)
+
+The VobSub (DVD-era, `S_VOBSUB`) analogue of `pgs_ocr.py` above, same
+two-stage image-in/image-out design (OCR for backfill + word-box caching,
+then redact-in-place on the real spans) and same reason for existing: no
+text/PGS subtitle to backfill or censor from, but there IS a VobSub track.
+Tried as the third and last fallback in `clean.py`'s subtitle-discovery
+chain (text track -> CC608 -> PGS -> VobSub) - PGS wins if a source
+somehow has both, being the newer, higher-resolution format.
+
+**Reuses pgs_ocr.py's format-agnostic pieces directly** rather than
+duplicating them: `Cue`/`Placement` (a VobSub cue always has exactly one
+placement - no PGS-style multi-window compositing), `ocr_cue` (OCR doesn't
+care which format the pixels came from), `_ink_columns` and
+`grow_word_box` (the redaction-box-growing algorithm, factored out of
+`pgs_ocr.censor_pgs_track` into a shared function specifically so this
+module could reuse it verbatim rather than re-deriving/copying it), and
+`write_srt`/`_srt_ts`.
+
+**Why this format needed real reverse-engineering, not just a spec read**:
+VobSub predates PGS and is considerably fussier - each subtitle ("SPU",
+Sub-Picture Unit) is wrapped in classic MPEG-2 Program Stream framing (a
+14-byte pack header + a private-stream-1 PES header, repeating every 2048
+bytes for an SPU spanning more than one "pack"), and its bitmap is
+RLE-encoded as two independently-encoded INTERLACED fields (even/odd
+scanlines) using a 4-bit (nibble), variable-length run code - quite
+different from PGS's clean byte-aligned RLE. Rather than trust memory of
+the format's byte layout the way PGS's (much simpler, well-documented)
+format allowed, every piece of this was verified against REAL extracted
+bytes from this project's own library before writing the decoder:
+
+- The pack/PES framing byte offsets were found by scanning a real `.sub`
+  file for repeated `00 00 01 BA` pack-start markers (confirmed: exactly
+  every 2048 bytes) and manually walking one real SPU's header byte by
+  byte to confirm SIZE/DCSQT/substream-ID placement.
+- The SPU control-sequence command set (`SET_COLOR`/`SET_CONTR`/
+  `SET_DAREA`/`SET_DSPXA`/`STA_DSP`/`STP_DSP`) and the nibble RLE escalation
+  rule were validated by decoding a real subtitle image and reading back
+  actual text.
+- **The one genuinely surprising find, undocumented anywhere obvious**:
+  `SET_CONTR`'s 4 nibbles give one alpha level per pixel value 0-3, but
+  empirically pixel value V's alpha sits at nibble position `3 - V`, NOT
+  position V. Confirmed by rendering a real subtitle both ways: the
+  "as-documented" (position == pixel value) mapping produced a solid black
+  rectangle (implying zero transparent pixels anywhere in a whole line of
+  text - impossible); reversing it produced correct, readable text.
+- The whole chain (real subtitle -> decode -> render -> OCR) was
+  cross-checked against a movie that has BOTH a VobSub track and a real
+  text subtitle track for the same dialogue (Crocodile Dundee (1986)) -
+  removing any need to trust memory of what a movie's lines "should" say:
+  `parse_vobsub`+`ocr_cue` on the VobSub track reproduced "Sue, don't
+  misunderstand me, please." (and the next several lines) character-for-
+  character against that movie's own SRT at the same timestamps, including
+  cue END time (from the SPU's own `STP_DSP` delay, not a guess).
+- The RLE ENCODER (`encode_bitmap`/`_encode_field`) and the pack/PES
+  re-wrapping (`_wrap_spu_in_packs`) were validated with a full ROUND TRIP
+  through the real tools, not just this module's own decoder: a rebuilt-
+  but-unchanged SPU came back pixel-identical after
+  `mkvmerge`-import-then-`mkvextract`-re-extract; a real pixel redaction
+  (a blanked column range) survived that same round trip intact, confirmed
+  by diffing before/after arrays, not eyeballing a render. One real bug
+  surfaced by this: `mkvmerge` warned "Unsupported MPEG mpeg_version" on an
+  all-zeroed dummy pack header (the SCR/mux_rate bytes, which don't matter
+  for re-import since `.idx` timestamps are authoritative, still needed to
+  look like a real MPEG-2 header for mkvmerge's own sanity check to pass) -
+  fixed by reusing a real captured pack header's bytes as the template
+  instead of zeros.
+
+**Encoding simplicity over compactness**: `_emit_run_nibbles` always uses
+the unambiguous 4-nibble (16-bit) form for every run, chunking anything
+over 255 pixels into multiple codes - not maximally compact, but this
+guarantees the decoder's 1/2/3-nibble escalation rules (each is a real,
+easy-to-get-subtly-wrong threshold) can never misread output this module
+itself produced, at the cost of a slightly larger `.sub`.
+
+**Rewriting the .idx/.sub pair**: unlike `pgs_ocr._splice_sup` (which
+copies untouched PGS segments as exact byte slices within one file),
+`vobsub_ocr._write_vobsub` rewrites the WHOLE `.idx`+`.sub` pair fresh -
+still copying an untouched entry's SPU bytes byte-identical from the
+source (entries are laid out contiguously by `filepos`, so `[filepos[i],
+filepos[i+1])` is exactly that entry's original byte range), but every
+`filepos` value in the new `.idx` is recomputed from scratch rather than
+trying to preserve the original pack-count per entry so offsets elsewhere
+stay valid. Simpler and just as safe, since an `.idx`'s filepos values are
+meaningless outside its own paired `.sub` anyway.
+
+**Setup**: same as `pgs_ocr.py` - needs Tesseract OCR + `pytesseract` in
+the shared venv; nothing extra. `Config.vobsub_ocr` (default on) toggles
+it; `--no-vobsub-ocr`/`--vobsub-ocr-lang` on the CLI.
 
 ### Word lists
 
