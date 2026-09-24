@@ -327,6 +327,19 @@ piling up duplicates - the "(Cleaned)" one already ends in
 needed this added explicitly or it would have accumulated one new copy per
 rerun.
 
+**Quota-exceeded detection** (`OpenSubtitlesQuotaExceeded`, a subclass of
+`OpenSubtitlesError`): `_request()` raises this specific type instead of the
+generic error when an HTTP call fails with code 406/429 or the response body
+mentions "quota" - a best-effort heuristic, not yet validated against a real
+quota-exceeded response. `fetch_subtitle()` catches it separately and prints
+a line containing the literal marker `OPENSUBTITLES_QUOTA_EXCEEDED` (to
+stderr) so an external batch driver can grep a run's captured output for it
+and stop attempting further downloads for the rest of that run rather than
+burning time on calls doomed to fail the same way. See the personal
+`_batch_movies_full.py` driver (in the `Profanity_Filter` shell, not this
+repo - personal/hardcoded, same reasoning as `_batch_pe3.py`) for the
+daily-run + quota-trickle consumer of this.
+
 **Setup**: get a free API key at
 [opensubtitles.com/en/consumers](https://www.opensubtitles.com/en/consumers)
 ("API Consumers" under account settings), then either

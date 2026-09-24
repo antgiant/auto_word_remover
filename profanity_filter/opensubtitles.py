@@ -54,6 +54,21 @@ class OpenSubtitlesError(RuntimeError):
     pass
 
 
+class OpenSubtitlesQuotaExceeded(OpenSubtitlesError):
+    """The API rejected a call because the daily download quota is used up
+    (as opposed to a network error, bad key, or a genuine no-match search) -
+    a caller can use this to stop attempting further downloads for the rest
+    of a batch run rather than burning time/requests on calls doomed to fail
+    the same way, and queue the rest for a retry once the quota resets.
+
+    Detection is a best-effort heuristic (HTTP 406/429, or "quota" anywhere
+    in the response body) - not yet validated against a real quota-exceeded
+    response from the live API, since deliberately exhausting the quota to
+    check the exact wording wasn't done. Tighten this if a real response is
+    ever seen that doesn't match."""
+    pass
+
+
 def api_key() -> str | None:
     key = os.environ.get("OPENSUBTITLES_API_KEY", "").strip()
     if key:
@@ -86,7 +101,10 @@ def _request(method: str, path: str, key: str, token: str | None = None,
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]
-        raise OpenSubtitlesError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
+        msg = f"{method} {path} -> HTTP {exc.code}: {detail}"
+        if exc.code in (406, 429) or "quota" in detail.lower():
+            raise OpenSubtitlesQuotaExceeded(msg) from exc
+        raise OpenSubtitlesError(msg) from exc
     except urllib.error.URLError as exc:
         raise OpenSubtitlesError(f"{method} {path} -> {exc.reason}") from exc
     try:
@@ -238,6 +256,10 @@ def fetch_subtitle(media: Path, cfg, out_dir: Path | None = None,
         print(f"  OpenSubtitles: fetched {meta.get('release') or meta.get('file_id')!r} "
               f"({meta.get('download_count', '?')} downloads) -> {raw_path.name}")
         return raw_path, meta
+    except OpenSubtitlesQuotaExceeded as exc:
+        print(f"  [warn] OpenSubtitles: OPENSUBTITLES_QUOTA_EXCEEDED - daily download quota "
+              f"used up ({exc}) - continuing without it", file=sys.stderr)
+        return None
     except OpenSubtitlesError as exc:
         print(f"  [warn] OpenSubtitles fetch failed ({exc}) - continuing without it", file=sys.stderr)
         return None
