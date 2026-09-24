@@ -1,4 +1,17 @@
-# auto_word_remover
+# Auto Word Remover
+
+<img src="logo.png" alt="Auto Word Remover logo" width="160">
+
+
+Yes, yet another tool to remove unwanted language from video files. What makes this one different is how it performs the removal. It makes a significant effort to mute the unwanted words while leaving the background audio intact. Additionally, it creates a new audio track and subtitle track without the undesirable language and makes them default. The video itself is never touched not are the original audio files. This allows it to be fast and non-destructive.
+
+Some technical notes. 
+- Everything is run locally, no data leaves your device. 
+- All removal is 100% automated. it will occasionally mute to much and very rarely to little.
+- If the video has no subtitles I am seeing a roughly 25% miss rate. If subtitles are available (including through optional open subtitles integration) it will use the subtitles to significantly reduce that error rate.
+- The wordlists contain all the removed words. Edit them to your hearts content.
+- Videos will nearly always be output in mkv format as this format allows for very easily bundling the audio, video, and subtitles together with almost no processing.
+- It does also support traditional bleeping as well as fully cutting, and it does support audio only formats. So it can be used to process audiobooks
 
 Three small, local-first tools that work together on one machine with one GPU:
 
