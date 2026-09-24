@@ -12,6 +12,7 @@ Some technical notes.
 - The wordlists contain all the removed words. Edit them to your hearts content.
 - Videos will nearly always be output in mkv format as this format allows for very easily bundling the audio, video, and subtitles together with almost no processing.
 - It does also support traditional bleeping as well as fully cutting, and it does support audio only formats. So it can be used to process audiobooks
+- Currently only tested on Windows
 
 Three small, local-first tools that work together on one machine with one GPU:
 
