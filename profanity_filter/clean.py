@@ -6,13 +6,20 @@ End-to-end from a single media file:
 
   1. transcript  reuse "<name>.json" next to the input, else run Voice_to_Text
   2. flag        flag_language.py (this folder) finds every hit + timestamp
-  3. backfill    a text subtitle track - embedded, OCR'd from a PGS/VobSub
-                 bitmap track, or (last resort) fetched from OpenSubtitles -
-                 is cross-checked for words the transcript missed entirely;
-                 found ones are timed via the transcript's own word timings
-                 where possible (see flag_language.backfill_from_srt). An
-                 OpenSubtitles source's own timestamps are never trusted -
-                 see flag_language.resync_units_to_transcript / AGENTS.md
+  3. backfill    a text subtitle track is cross-checked for words the
+                 transcript missed entirely; found ones are timed via the
+                 transcript's own word timings where possible (see
+                 flag_language.backfill_from_srt). Discovery order, first
+                 usable one wins: an embedded text/CC608 track, then a
+                 sidecar subtitle FILE next to the input (e.g. "Movie.srt"),
+                 then OCR'd from an embedded PGS/VobSub bitmap track, then
+                 (last resort) fetched from OpenSubtitles. A sidecar file is
+                 treated exactly like an OpenSubtitles download, not like an
+                 embedded track: it did not necessarily come from THIS
+                 exact cut of the file, so its own timestamps are never
+                 trusted either - both are realigned to the transcript's own
+                 word timings via flag_language.resync_units_to_transcript
+                 before use. See AGENTS.md.
   4. remove      ffmpeg pulls ONE audio track out and removes each flagged span:
        method "mute"  (default) - silence. If the track has more than two
                  channels, the center channel's real content is checked first
@@ -175,12 +182,31 @@ OPENSUBS_TRACK_SUFFIX = " (OpenSubtitles)"  # the extra uncensored track remux()
 #                                             Config field since, unlike track_name_suffix, it's not
 #                                             meant to be user-tunable, just recognised on rerun
 #                                             (is_own_output_track) so it's replaced, not duplicated
+SIDECAR_TRACK_SUFFIX = " (Sidecar)"  # same idea as OPENSUBS_TRACK_SUFFIX, for a sidecar subtitle
+#                                       file next to the input - see find_sidecar_subtitle/main()
+
+SIDECAR_SUB_EXTS = (".srt", ".vtt", ".ass", ".ssa")  # ffmpeg converts .ass/.ssa to plain SRT text
+#                                                        before resyncing; .srt/.vtt parse as-is
+#                                                        (flag_language.parse_srt's timestamp regex
+#                                                        already accepts either decimal separator).
+#                                                        Listed in the order preferred when two
+#                                                        otherwise-tied sidecar candidates are found.
 
 LANG_NAMES = {
     "eng": "English", "spa": "Spanish", "fre": "French", "fra": "French",
     "ger": "German", "deu": "German", "ita": "Italian", "jpn": "Japanese",
     "por": "Portuguese", "rus": "Russian", "chi": "Chinese", "zho": "Chinese",
     "kor": "Korean", "dut": "Dutch", "nld": "Dutch", "und": "",
+}
+
+# 2-letter -> 3-letter, for matching a sidecar subtitle's "<stem>.<lang>.srt"
+# tag (commonly 2-letter) against a track's 3-letter language property -
+# same pairs as opensubtitles.py's LANG_2TO3 (kept separate: this module
+# doesn't otherwise depend on opensubtitles.py, and the OCR/sidecar/audio
+# paths all key on the 3-letter form already).
+LANG_2TO3 = {
+    "en": "eng", "es": "spa", "fr": "fre", "de": "ger", "it": "ita",
+    "ja": "jpn", "pt": "por", "ru": "rus", "zh": "chi", "ko": "kor", "nl": "dut",
 }
 
 try:
@@ -231,7 +257,20 @@ class Config:
     subs_pad: float = 0.15            # s of slack when matching cues to bleep spans
     srt_backfill: bool = True          # also cross-check the embedded SRT for missed words
 
-    pgs_ocr: bool = True               # when there's no text subtitle track but there IS a PGS
+    sidecar_subs: bool = True          # when there's no usable embedded text/CC608 track, look for
+    #                                    an external subtitle FILE sitting next to the input (e.g.
+    #                                    "Movie.srt", "Movie.en.srt") before falling back to OCR'ing
+    #                                    an embedded bitmap track. Unlike an embedded track, a
+    #                                    sidecar isn't assumed to already match this exact file's
+    #                                    cut - it's treated exactly like an OpenSubtitles download
+    #                                    (resynced against the transcript's own word timings via
+    #                                    flag_language.resync_units_to_transcript, added as its own
+    #                                    extra "(Sidecar)" track - see find_sidecar_subtitle/main()).
+    sidecar_lang: str = ""             # 2- or 3-letter language to prefer when more than one sidecar
+    #                                    file exists ("" = derive from the chosen audio track's own
+    #                                    language)
+
+    pgs_ocr: bool = True               # when there's no text/sidecar subtitle but there IS a PGS
     #                                    (Blu-ray bitmap) one, OCR it into a real SRT (see pgs_ocr.py)
     #                                    and use that for srt_backfill/censoring instead of skipping
     #                                    subtitles entirely. Needs Tesseract - see locate_tesseract().
@@ -239,14 +278,14 @@ class Config:
     #                                    3-letter language tag (falls back to "eng" if unrecognised)
 
     vobsub_ocr: bool = True            # same idea as pgs_ocr, for VobSub (DVD bitmap) tracks - only
-    #                                    tried when there's no text track AND no PGS track either
-    #                                    (see vobsub_ocr.py; main()'s subtitle-discovery order)
+    #                                    tried when there's no text/sidecar track AND no PGS track
+    #                                    either (see vobsub_ocr.py; main()'s subtitle-discovery order)
     vobsub_ocr_lang: str = ""          # Tesseract language code, "" = derive from the track's own
     #                                    3-letter language tag (falls back to "eng" if unrecognised)
 
     opensubtitles: bool = True         # last resort in the subtitle-discovery chain, tried only when
-    #                                    there's no usable text/CC608/PGS/VobSub subtitle at all (the
-    #                                    common case for a TV recording). Needs an API key - see
+    #                                    there's no usable text/CC608/sidecar/PGS/VobSub subtitle at
+    #                                    all (the common case for a TV recording). Needs an API key -
     #                                    opensubtitles.py's docstring / README "OpenSubtitles setup".
     #                                    The fetched file's own timestamps are NEVER trusted - see
     #                                    flag_language.resync_units_to_transcript(). On success, adds
@@ -633,6 +672,62 @@ def find_cc608_track(ffprobe: str, media: Path, want_lang: str | None) -> dict |
             "_cc608_pos": i}
 
 
+def find_sidecar_subtitle(media: Path, want_lang: str) -> tuple[Path, str] | None:
+    """An external subtitle FILE sitting next to `media` (same stem) - e.g.
+    "Movie.srt" or "Movie.en.srt" - the sidecar rung of the subtitle-
+    discovery chain (see Config.sidecar_subs / main()'s discovery order):
+    tried after an embedded text/CC608 track and before falling back to
+    OCR'ing an embedded bitmap (PGS/VobSub) track.
+
+    Only two naming patterns are recognised: "<stem><ext>" (no language
+    tag) and "<stem>.<lang><ext>" for a bare 2- or 3-letter language code
+    (e.g. "Movie.en.srt", "Movie.eng.srt"). `ext` must be one of
+    SIDECAR_SUB_EXTS. Returns (path, 3-letter language - "und" if
+    untagged) for whichever candidate ranks best, or None if there's no
+    sidecar at all. Ranking: a language tag matching `want_lang` first,
+    then an untagged file, then any other language; ties beyond that
+    resolve by extension preference (SIDECAR_SUB_EXTS order) then name.
+
+    Note that finding a sidecar here says nothing about whether it's
+    trustworthy for THIS file's exact cut/timing - see the resync step in
+    main() and SIDECAR_TRACK_SUFFIX."""
+    stem = media.stem
+    try:
+        entries = list(media.parent.iterdir())
+    except OSError:
+        return None
+
+    candidates: list[tuple[Path, str]] = []  # (path, 3-letter lang or "und")
+    for p in entries:
+        if p == media or not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        if suf not in SIDECAR_SUB_EXTS:
+            continue
+        name_no_ext = p.name[:-len(suf)]
+        if name_no_ext == stem:
+            candidates.append((p, "und"))
+        elif name_no_ext.startswith(stem + "."):
+            tag = name_no_ext[len(stem) + 1:].lower()
+            if re.fullmatch(r"[a-z]{2,3}", tag):
+                lang3 = tag if len(tag) == 3 else LANG_2TO3.get(tag, tag)
+                candidates.append((p, lang3))
+    if not candidates:
+        return None
+
+    want3 = (LANG_2TO3.get(want_lang.lower(), want_lang.lower()) if len(want_lang) == 2
+             else want_lang.lower()) if want_lang else ""
+    ext_rank = {ext: i for i, ext in enumerate(SIDECAR_SUB_EXTS)}
+
+    def score(c: tuple[Path, str]):
+        p, lang3 = c
+        lang_rank = 0 if (want3 and lang3 == want3) else (1 if lang3 == "und" else 2)
+        return (lang_rank, ext_rank.get(p.suffix.lower(), 9), p.name)
+
+    candidates.sort(key=score)
+    return candidates[0]
+
+
 _MIN_USABLE_SRT_CHARS = 200  # below this, treat an extraction as an empty/placeholder track
 
 
@@ -673,6 +768,52 @@ def extract_subs_srt(ffmpeg: str, mkvextract: str, media: Path, tracks: list,
              "-map", f"0:s:{subs_pos}", str(out_srt)])
 
 
+def stage_sidecar_srt(ffmpeg: str, sidecar: Path, tmp: Path) -> Path:
+    """Normalise a sidecar subtitle file to plain "-->"-cue SRT text so
+    flag_language.resync_units_to_transcript (which parses with parse_srt)
+    can read it. .srt/.vtt already parse as-is (parse_srt's timestamp regex
+    accepts either decimal separator) - copied into `tmp` anyway so callers
+    always get a fresh, disposable path. .ass/.ssa use a completely
+    different cue syntax, so those go through ffmpeg's built-in conversion
+    first, same idea as extract_subs_srt's embedded-track conversion."""
+    out = tmp / f"sidecar_raw{sidecar.suffix.lower()}.srt"
+    if sidecar.suffix.lower() in (".srt", ".vtt"):
+        shutil.copy2(sidecar, out)
+    else:
+        run([ffmpeg, "-hide_banner", "-y", "-i", str(sidecar), str(out)])
+    return out
+
+
+def resync_external_srt(raw_srt_path: Path, js: Path, lang3: str, track_suffix: str,
+                        synced_path: Path, log_label: str) -> tuple[Path, str] | None:
+    """Realign an externally-sourced subtitle - an OpenSubtitles download or
+    a sidecar file next to the input (see Config.sidecar_subs) - against the
+    transcript's own word timings via flag_language.resync_units_to_
+    transcript(), since neither source is guaranteed to already match THIS
+    file's exact cut/timing the way an embedded track is. Writes the
+    resynced cues to `synced_path` and returns (synced_path, track_name) if
+    there's enough usable text left afterwards, else None (a warning is
+    printed either way, distinguishing "nothing lined up" from "too little
+    text").
+    """
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import flag_language
+    cues = flag_language.resync_units_to_transcript(raw_srt_path, flag_language.load_word_timeline(js))
+    if not cues:
+        print(f"  [warn] {log_label}: nothing in the subtitle lined up with this recording's "
+              f"transcript - discarding", file=sys.stderr)
+        return None
+    flag_language.write_srt_cues(cues, synced_path)
+    if srt_text_len(synced_path) < _MIN_USABLE_SRT_CHARS:
+        print(f"  [warn] {log_label}: resync produced too little usable text - discarding",
+              file=sys.stderr)
+        return None
+    track_name = f"{LANG_NAMES.get(lang3, lang3) or lang3}{track_suffix}".strip()
+    print(f"  {log_label}: resynced {len(cues)} cue(s) to this recording's own timeline")
+    return synced_path, track_name
+
+
 def clean_label(track: dict, suffix: str) -> str:
     p = track["properties"]
     name = p.get("track_name") or ""
@@ -693,7 +834,7 @@ def is_own_output_track(t: dict, cfg: Config) -> bool:
     "Re-running on an already-cleaned file" in AGENTS.md."""
     name = t.get("properties", {}).get("track_name") or ""
     return (name.endswith(cfg.track_name_suffix) or name.endswith(cfg.dialog_track_suffix)
-            or name.endswith(OPENSUBS_TRACK_SUFFIX))
+            or name.endswith(OPENSUBS_TRACK_SUFFIX) or name.endswith(SIDECAR_TRACK_SUFFIX))
 
 
 def _span_expr(spans) -> str:
@@ -1685,12 +1826,13 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
 
     `extra_srt` is an extra, always-non-default subtitle track added as-is
     (no censoring) alongside `clean_srt`/`chosen_subs` - `(path, {"language":
-    ..., "track_name": ...})`. Used only for OpenSubtitles: unlike every
+    ..., "track_name": ...})`. Used only for a resynced external source -
+    OpenSubtitles or a sidecar file (see resync_external_srt): unlike every
     other subtitle source in main() (an embedded/OCR'd track whose original
-    already passes through the container untouched), an OpenSubtitles-
-    sourced subtitle doesn't exist anywhere in the source file at all, so
-    its "original" (uncensored) counterpart has to be muxed in as a new
-    track too, not just its "(Cleaned)" one."""
+    already passes through the container untouched), neither of those exists
+    as a track in the source file at all, so their "original" (uncensored,
+    resynced) counterpart has to be muxed in as a new track too, not just
+    its "(Cleaned)" one."""
     suffix = cfg.track_name_suffix if audio_suffix is None else audio_suffix
     a_lang = chosen_audio["properties"].get("language") or "und"
     a_name = clean_label(chosen_audio, suffix)
@@ -1840,19 +1982,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="do not touch subtitles")
     p.add_argument("--no-srt-backfill", dest="srt_backfill", action="store_false", default=None,
                    help="don't cross-check the embedded SRT for words the transcript missed")
+    p.add_argument("--no-sidecar-subs", dest="sidecar_subs", action="store_false", default=None,
+                   help="don't look for a sidecar subtitle file (e.g. \"Movie.srt\") next to the "
+                        "input when there's no usable embedded text/CC608 track to use for "
+                        "srt_backfill/censoring")
+    p.add_argument("--sidecar-lang", dest="sidecar_lang",
+                   help="2- or 3-letter language to prefer when more than one sidecar file exists "
+                        "(default: derive from the chosen audio track's own language)")
     p.add_argument("--no-pgs-ocr", dest="pgs_ocr", action="store_false", default=None,
-                   help="don't OCR a PGS (Blu-ray bitmap) subtitle track when there's no text "
-                        "track to use for srt_backfill/censoring")
+                   help="don't OCR a PGS (Blu-ray bitmap) subtitle track when there's no text/"
+                        "sidecar track to use for srt_backfill/censoring")
     p.add_argument("--pgs-ocr-lang", dest="pgs_ocr_lang",
                    help="Tesseract language code for PGS OCR (default: eng)")
     p.add_argument("--no-vobsub-ocr", dest="vobsub_ocr", action="store_false", default=None,
-                   help="don't OCR a VobSub (DVD bitmap) subtitle track when there's no text or "
-                        "PGS track to use for srt_backfill/censoring")
+                   help="don't OCR a VobSub (DVD bitmap) subtitle track when there's no text/"
+                        "sidecar or PGS track to use for srt_backfill/censoring")
     p.add_argument("--vobsub-ocr-lang", dest="vobsub_ocr_lang",
                    help="Tesseract language code for VobSub OCR (default: eng)")
     p.add_argument("--no-opensubtitles", dest="opensubtitles", action="store_false", default=None,
-                   help="don't fall back to OpenSubtitles when there's no local text/PGS/VobSub "
-                        "subtitle to backfill/censor from (needs an API key - see opensubtitles.py)")
+                   help="don't fall back to OpenSubtitles when there's no local text/sidecar/PGS/"
+                        "VobSub subtitle to backfill/censor from (needs an API key - see "
+                        "opensubtitles.py)")
     p.add_argument("--opensubtitles-lang", dest="opensubtitles_lang",
                    help='2-letter language to search/download (default "en")')
     p.add_argument("--opensubtitles-query", dest="opensubtitles_query",
@@ -1895,9 +2045,10 @@ def main(argv: list[str] | None = None) -> int:
                  "beep_gain_db", "center_margin_db", "mute_fill", "stem_model",
                  "dialog_track_default", "clean_codec", "clean_bitrate",
                  "clean_bitrate_surround", "cut_bitrate", "source_track",
-                 "sync_ms", "subs_track", "srt_backfill", "pgs_ocr", "pgs_ocr_lang",
-                 "vobsub_ocr", "vobsub_ocr_lang", "opensubtitles", "opensubtitles_lang",
-                 "opensubtitles_query", "opensubtitles_id", "output_dir", "retranscribe", "overwrite"]:
+                 "sync_ms", "subs_track", "srt_backfill", "sidecar_subs", "sidecar_lang",
+                 "pgs_ocr", "pgs_ocr_lang", "vobsub_ocr", "vobsub_ocr_lang", "opensubtitles",
+                 "opensubtitles_lang", "opensubtitles_query", "opensubtitles_id", "output_dir",
+                 "retranscribe", "overwrite"]:
         val = getattr(args, name, None)
         if val is not None:
             setattr(cfg, name, val)
@@ -1985,10 +2136,10 @@ def main(argv: list[str] | None = None) -> int:
         build_path = tmp / f"build{out_ext}"
 
         raw_srt = None
-        opensubs_extra_srt = None   # set below only when OpenSubtitles supplied the subtitle
-        #                             source - the resynced-but-UNCENSORED copy, muxed in as its
-        #                             own extra non-default track alongside the usual (Cleaned)
-        #                             one (see remux()'s extra_srt param)
+        resynced_extra_srt = None   # set below only when a sidecar file or OpenSubtitles supplied
+        #                             the subtitle source - the resynced-but-UNCENSORED copy, muxed
+        #                             in as its own extra non-default track alongside the usual
+        #                             (Cleaned) one (see remux()'s extra_srt param)
         if chosen_subs is not None:
             raw_srt = tmp / "orig.srt"
             extract_subs_srt(ffmpeg, mkvextract, media, tracks, chosen_subs, subs_tid, raw_srt)
@@ -2010,6 +2161,26 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     raw_srt = None
 
+        if subs_enabled and chosen_subs is None and cfg.sidecar_subs:
+            want_lang = cfg.sidecar_lang or cp.get("language") or ""
+            found = find_sidecar_subtitle(media, want_lang)
+            if found is not None:
+                sidecar_path, lang3 = found
+                print(f"  subtitles: found sidecar file {sidecar_path.name} [{lang3}] - treating "
+                      f"it like an OpenSubtitles download (its timestamps aren't assumed to match "
+                      f"this exact file, so it's resynced to the transcript instead of used as-is)")
+                raw_for_resync = stage_sidecar_srt(ffmpeg, sidecar_path, tmp)
+                synced_path = media.with_name(f"{media.stem}.{lang3}.sidecar.srt")
+                result = resync_external_srt(raw_for_resync, js, lang3, SIDECAR_TRACK_SUFFIX,
+                                             synced_path, f"sidecar ({sidecar_path.name})")
+                if result is not None:
+                    synced_path, sc_name = result
+                    raw_srt = synced_path
+                    chosen_subs = {"id": None, "type": "subtitles",
+                                  "properties": {"language": lang3, "track_name": sc_name}}
+                    subs_tid = None
+                    resynced_extra_srt = (synced_path, {"language": lang3, "track_name": sc_name})
+
         pgs_source_track = None  # set below when a PGS track is what raw_srt/chosen_subs came from -
         #                          censor_pgs_track() (later) needs its cached .sup/.words.json, not clean_srt
         pgs_cache = None  # {"sup_path", "json_path"} from analyze_pgs_track(), for the same reason
@@ -2028,7 +2199,7 @@ def main(argv: list[str] | None = None) -> int:
                     lang3 = pgs_track["properties"].get("language") or "und"
                     ocr_lang = cfg.pgs_ocr_lang or "eng"
                     cache_base = media.with_name(f"{media.stem}.{lang3}.pgsocr")
-                    print(f"  subtitles: no text track - OCR'ing PGS track id "
+                    print(f"  subtitles: no text/sidecar track - OCR'ing PGS track id "
                           f"{pgs_track['id']} [{lang3}] with Tesseract (this can take a "
                           f"while on a full film; cached for reruns)...")
                     stats = pgs_ocr.analyze_pgs_track(
@@ -2072,7 +2243,7 @@ def main(argv: list[str] | None = None) -> int:
                     lang3 = vobsub_track["properties"].get("language") or "und"
                     ocr_lang = cfg.vobsub_ocr_lang or "eng"
                     cache_base = media.with_name(f"{media.stem}.{lang3}.vobsubocr")
-                    print(f"  subtitles: no text/PGS track - OCR'ing VobSub track id "
+                    print(f"  subtitles: no text/sidecar/PGS track - OCR'ing VobSub track id "
                           f"{vobsub_track['id']} [{lang3}] with Tesseract (this can take a "
                           f"while on a full film; cached for reruns)...")
                     stats = vobsub_ocr.analyze_vobsub_track(
@@ -2101,35 +2272,26 @@ def main(argv: list[str] | None = None) -> int:
         if subs_enabled and chosen_subs is None and cfg.opensubtitles:
             if str(HERE) not in sys.path:
                 sys.path.insert(0, str(HERE))
-            import flag_language
             import opensubtitles
             lang2 = (cfg.opensubtitles_lang or "").lower() or opensubtitles.LANG_3TO2.get(
                 (cp.get("language") or "").lower(), "en")
-            print(f"  subtitles: no local text/PGS/VobSub track - trying OpenSubtitles [{lang2}]...")
+            print(f"  subtitles: no local text/sidecar/PGS/VobSub track - trying OpenSubtitles "
+                  f"[{lang2}]...")
             fetched = opensubtitles.fetch_subtitle(media, cfg, force=cfg.retranscribe)
             if fetched is not None:
                 raw_os_srt, os_meta = fetched
-                cues = flag_language.resync_units_to_transcript(
-                    raw_os_srt, flag_language.load_word_timeline(js))
-                if not cues:
-                    print("  [warn] OpenSubtitles: nothing in the downloaded subtitle lined up "
-                          "with this recording's transcript - discarding", file=sys.stderr)
-                else:
-                    synced_path = media.with_name(f"{media.stem}.{lang2}.opensubtitles.srt")
-                    flag_language.write_srt_cues(cues, synced_path)
-                    if srt_text_len(synced_path) < _MIN_USABLE_SRT_CHARS:
-                        print("  [warn] OpenSubtitles resync produced too little usable text - "
-                              "discarding", file=sys.stderr)
-                    else:
-                        lang3 = opensubtitles.LANG_2TO3.get(lang2, "und")
-                        os_name = f"{LANG_NAMES.get(lang3, lang3) or lang3}{OPENSUBS_TRACK_SUFFIX}".strip()
-                        print(f"  OpenSubtitles: resynced {len(cues)} cue(s) to this recording's "
-                              f"own timeline ({os_meta.get('release') or os_meta.get('file_id')})")
-                        raw_srt = synced_path
-                        chosen_subs = {"id": None, "type": "subtitles",
-                                      "properties": {"language": lang3, "track_name": os_name}}
-                        subs_tid = None
-                        opensubs_extra_srt = (synced_path, {"language": lang3, "track_name": os_name})
+                lang3 = opensubtitles.LANG_2TO3.get(lang2, "und")
+                synced_path = media.with_name(f"{media.stem}.{lang2}.opensubtitles.srt")
+                label = f"OpenSubtitles ({os_meta.get('release') or os_meta.get('file_id')})"
+                result = resync_external_srt(raw_os_srt, js, lang3, OPENSUBS_TRACK_SUFFIX,
+                                             synced_path, label)
+                if result is not None:
+                    synced_path, os_name = result
+                    raw_srt = synced_path
+                    chosen_subs = {"id": None, "type": "subtitles",
+                                  "properties": {"language": lang3, "track_name": os_name}}
+                    subs_tid = None
+                    resynced_extra_srt = (synced_path, {"language": lang3, "track_name": os_name})
 
         if subs_enabled and chosen_subs is None:
             print("  subtitles: no usable text subtitle track to clean - skipping")
@@ -2308,7 +2470,7 @@ def main(argv: list[str] | None = None) -> int:
             remux(mkvmerge, media, tracks, cfg, build_path,
                   clean_audio, chosen, clean_srt, chosen_subs,
                   exclude_audio_ids=stale_audio_ids, exclude_subs_ids=stale_subs_ids,
-                  extra_srt=opensubs_extra_srt)
+                  extra_srt=resynced_extra_srt)
             if args.keep_temp:
                 shutil.copy2(clean_audio, out_dir / f"{media.stem}{cfg.track_name_suffix}{clean_audio.suffix}")
                 if (tmp / "filter.txt").is_file():  # not written by mute_track's stemmed-splice path

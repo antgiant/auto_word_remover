@@ -132,11 +132,11 @@ cut down how often that slow path actually triggers.
 ### 5. OpenSubtitles setup (optional)
 
 Only needed for the OpenSubtitles fallback - the last resort in the
-subtitle-discovery chain, tried when there's no usable local subtitle track
-at all (the common case for a TV recording, which almost never carries an
-embedded subtitle). Skip this if you're fine without it; it degrades
-gracefully (a warning, the run continues without OpenSubtitles) when no key
-is configured.
+subtitle-discovery chain, tried when there's no usable embedded, sidecar, or
+OCR'able subtitle at all (the common case for a TV recording, which almost
+never carries an embedded subtitle or has a matching `.srt` sitting next to
+it). Skip this if you're fine without it; it degrades gracefully (a warning,
+the run continues without OpenSubtitles) when no key is configured.
 
 1. Get a free API key at
    [opensubtitles.com/en/consumers](https://www.opensubtitles.com/en/consumers)
@@ -207,12 +207,17 @@ needs, any Python 3.10+ — see the version note above).
    short interjections. Missed words are timed via the transcript's own word
    timings where they line up, interpolated where the word was dropped
    outright. On a test film this roughly doubled the hits found (25 -> 46).
-   Disable with `--no-srt-backfill`. If there's no usable local subtitle at
-   all, `opensubtitles.py` is tried as a last resort (see "OpenSubtitles
-   setup") — its timestamps are never trusted, since they can't be assumed
-   to share a clock with your file (especially a TV recording, with its own
-   commercial breaks/station cuts); real timing is rebuilt from a text
-   comparison against the transcript instead. See AGENTS.md.
+   Disable with `--no-srt-backfill`. If there's no usable embedded text
+   track, a **sidecar subtitle file** next to the input (e.g. `Movie.srt`,
+   `Movie.en.srt`) is tried next; if there's no usable local subtitle at
+   all (embedded or sidecar), it falls back to OCR'ing an embedded PGS/
+   VobSub bitmap track, then finally `opensubtitles.py` as a last resort
+   (see "OpenSubtitles setup"). A sidecar file's timestamps are treated
+   exactly the same as an OpenSubtitles download's — never trusted as-is,
+   since a sidecar found lying next to your file isn't guaranteed to be
+   for *this exact cut* any more than a downloaded one is; real timing is
+   rebuilt from a text comparison against the transcript instead. See
+   AGENTS.md.
 3. **Remove** — one `ffmpeg` pass over a single audio track:
    - `--method mute` **(default)** — silence. If the track has more than two
      channels, the center channel's actual content is measured first: when
@@ -258,22 +263,23 @@ needs, any Python 3.10+ — see the version note above).
    no remux, no alt track (the duration changed, so keeping the original
    alongside doesn't make sense).
 4. **Subtitles** (`mute`/`bleep` only) — the embedded SubRip track is pulled
-   with `mkvextract` (or comes from the PGS/VobSub OCR or OpenSubtitles
-   fallback if there's no text track — see AGENTS.md); every cue that
-   overlaps a removed span gets its profane words replaced with `***`.
-   `--method dialog` leaves subtitles completely alone.
+   with `mkvextract` (or comes from a sidecar file, the PGS/VobSub OCR, or
+   the OpenSubtitles fallback if there's no text track — see AGENTS.md);
+   every cue that overlaps a removed span gets its profane words replaced
+   with `***`. `--method dialog` leaves subtitles completely alone.
 5. **Remux** — `mkvmerge` copies the original bit-for-bit and adds the
    cleaned audio (**and** cleaned subtitle, for `mute`/`bleep`) back in.
    `mute`/`bleep` add it as a new **default** track called
    `<original label> (Cleaned)`, demoting the original. `dialog` adds
    `<original label> (Wordless)` as a **non-default** track by default
    (`--dialog-default` to flip that). Video and every other track are
-   untouched either way. When the subtitle came from OpenSubtitles
-   specifically, there's no "original" already sitting in the container to
-   demote — so instead TWO new tracks are added: an uncensored
-   `"<lang> (OpenSubtitles)"` track (non-default, matching the original
-   audio) and the censored `"<lang> (OpenSubtitles) (Cleaned)"` track
-   (default, matching the cleaned audio).
+   untouched either way. When the subtitle came from a sidecar file or
+   OpenSubtitles specifically, there's no "original" already sitting in the
+   container to demote — so instead TWO new tracks are added: an uncensored
+   `"<lang> (Sidecar)"`/`"<lang> (OpenSubtitles)"` track (non-default,
+   matching the original audio) and the censored `"<lang> (Sidecar)
+   (Cleaned)"`/`"<lang> (OpenSubtitles) (Cleaned)"` track (default, matching
+   the cleaned audio).
 6. **Replace** — all of the above is built in a temp dir first, never
    touching the source. Only once it succeeds: the pre-clean original is
    moved to the **Recycle Bin** and the newly built file takes its place at
@@ -299,7 +305,9 @@ needs, any Python 3.10+ — see the version note above).
 | `--cut-bitrate` | `cut` only: bitrate for a lossy source codec (default 96k) |
 | `--source-track default\|0\|1\|eng` | which audio track to clean |
 | `--subs-track default\|0\|eng\|none` | `mute`/`bleep` only: which SubRip track to clean (`--no-subs` to skip) |
-| `--no-opensubtitles` | don't fall back to OpenSubtitles when there's no local text/PGS/VobSub subtitle (see "OpenSubtitles setup") |
+| `--no-sidecar-subs` | don't look for a sidecar subtitle file (e.g. `Movie.srt`) next to the input when there's no usable embedded text track |
+| `--sidecar-lang en` | 2- or 3-letter language to prefer when more than one sidecar file exists (default: derive from the audio track's own language) |
+| `--no-opensubtitles` | don't fall back to OpenSubtitles when there's no local text/sidecar/PGS/VobSub subtitle (see "OpenSubtitles setup") |
 | `--opensubtitles-query "title"` | override the search title auto-guessed from the filename |
 | `--opensubtitles-id 12345` | exact OpenSubtitles file_id to download - bypasses search entirely |
 | `--opensubtitles-lang en` | 2-letter language to search/download (default `en`) |

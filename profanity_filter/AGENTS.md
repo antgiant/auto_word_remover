@@ -210,15 +210,44 @@ module doesn't parse) has its own equivalent module - see `vobsub_ocr.py`
 below - tried as a further fallback when there's neither a text track nor
 a PGS one.
 
+### Sidecar subtitle files (`find_sidecar_subtitle()`, an external file next to the input)
+
+Second in the subtitle-discovery chain (text track -> CC608 -> **sidecar
+file** -> PGS OCR -> VobSub OCR -> OpenSubtitles), tried when there's no
+usable embedded text/CC608 track. `find_sidecar_subtitle()` looks for
+`<stem><ext>` or `<stem>.<lang><ext>` next to the input (`ext` one of
+`.srt`/`.vtt`/`.ass`/`.ssa`), ranked by language match against
+`Config.sidecar_lang` (falling back to the chosen audio track's own
+language) first, an untagged file second, extension preference
+(`SIDECAR_SUB_EXTS` order) as the final tiebreak.
+
+**Treated exactly like an OpenSubtitles download, not like an embedded
+track** - this was a deliberate design choice, not an oversight: a sidecar
+file sitting next to a recording is no more guaranteed to be a subtitle
+*for this exact cut* than one downloaded from OpenSubtitles is (a sidecar
+saved from a different rip/release of the same title is a completely
+plausible real-world case). So rather than trusting its timestamps the way
+an embedded/CC608 track's are trusted, a sidecar is resynced against the
+transcript's own word timings with the exact same machinery OpenSubtitles
+uses - `stage_sidecar_srt()` normalises `.ass`/`.ssa` to plain SRT text via
+ffmpeg first (`.srt`/`.vtt` parse as-is, since `flag_language.parse_srt`'s
+timestamp regex already accepts both decimal separators), then both
+sources share `resync_external_srt()` (`flag_language.
+resync_units_to_transcript()` + `write_srt_cues()` + the same
+`_MIN_USABLE_SRT_CHARS` check) and the same two-tracks-muxed-in treatment
+below - `SIDECAR_TRACK_SUFFIX` (" (Sidecar)") stands in for
+`OPENSUBS_TRACK_SUFFIX` and is recognised by `is_own_output_track()` the
+same way.
+
 ### OpenSubtitles fallback (`opensubtitles.py`, real-world subtitle sourcing for TV recordings)
 
-Last in the subtitle-discovery chain (text track -> CC608 -> PGS OCR ->
-VobSub OCR -> **OpenSubtitles**), tried only when `chosen_subs` is still
-`None` after everything above - the common case for a TV recording, which
-almost never carries an embedded subtitle track of any kind. Needs an API
-key (see "Setup" below); degrades gracefully (a warning, pipeline continues
-without it) on a missing key, failed search, exhausted quota, or network
-error, same as every other optional dependency in this project.
+Last in the subtitle-discovery chain (text track -> CC608 -> sidecar file ->
+PGS OCR -> VobSub OCR -> **OpenSubtitles**), tried only when `chosen_subs` is
+still `None` after everything above - the common case for a TV recording,
+which almost never carries an embedded subtitle track of any kind. Needs an
+API key (see "Setup" below); degrades gracefully (a warning, pipeline
+continues without it) on a missing key, failed search, exhausted quota, or
+network error, same as every other optional dependency in this project.
 
 **Why this needed a fundamentally different algorithm from `backfill_from_srt`
 above**: that function trusts an SRT's own timestamps to within `window`
@@ -279,20 +308,22 @@ unmodified `backfill_from_srt()` for word detection exactly like an
 embedded track - by this point its timing is trustworthy, so no special
 casing was needed there at all.
 
-**Muxing in two tracks, not one**: every other subtitle source above
+**Muxing in two tracks, not one**: every embedded/OCR'd subtitle source
 already has its "original" passing through the container untouched (the
 embedded track itself, or the source PGS/VobSub bitmap) - only the
-"(Cleaned)" derivative is new. An OpenSubtitles-sourced subtitle doesn't
-exist anywhere in the source file at all, so BOTH an uncensored
-`"<lang> (OpenSubtitles)"` (non-default) and a censored `"<lang>
-(OpenSubtitles) (Cleaned)"` (default) track have to be muxed in fresh.
-`remux()`'s new `extra_srt` parameter handles the first; the second reuses
-the pipeline's normal `clean_srt`/`chosen_subs` path unchanged (OpenSubtitles
-sets those exactly like a PGS/VobSub OCR result does). `OPENSUBS_TRACK_SUFFIX`
-(" (OpenSubtitles)") is recognised by `is_own_output_track()` alongside
-`track_name_suffix`/`dialog_track_suffix` so a rerun replaces both stale
-tracks instead of piling up duplicates - the "(Cleaned)" one already ends
-in `track_name_suffix` so that half was free, but the plain uncensored one
+"(Cleaned)" derivative is new. Neither an OpenSubtitles-sourced subtitle nor
+a sidecar file exists as a track in the source file at all, so BOTH an
+uncensored `"<lang> (OpenSubtitles)"`/`"<lang> (Sidecar)"` (non-default) and
+a censored `"<lang> (OpenSubtitles) (Cleaned)"`/`"<lang> (Sidecar)
+(Cleaned)"` (default) track have to be muxed in fresh. `remux()`'s
+`extra_srt` parameter handles the first for either source; the second
+reuses the pipeline's normal `clean_srt`/`chosen_subs` path unchanged
+(both set those exactly like a PGS/VobSub OCR result does - see
+`resync_external_srt()`). `OPENSUBS_TRACK_SUFFIX`/`SIDECAR_TRACK_SUFFIX`
+are recognised by `is_own_output_track()` alongside `track_name_suffix`/
+`dialog_track_suffix` so a rerun replaces both stale tracks instead of
+piling up duplicates - the "(Cleaned)" one already ends in
+`track_name_suffix` so that half was free, but the plain uncensored one
 needed this added explicitly or it would have accumulated one new copy per
 rerun.
 
@@ -335,9 +366,10 @@ The VobSub (DVD-era, `S_VOBSUB`) analogue of `pgs_ocr.py` above, same
 two-stage image-in/image-out design (OCR for backfill + word-box caching,
 then redact-in-place on the real spans) and same reason for existing: no
 text/PGS subtitle to backfill or censor from, but there IS a VobSub track.
-Tried as the third and last fallback in `clean.py`'s subtitle-discovery
-chain (text track -> CC608 -> PGS -> VobSub) - PGS wins if a source
-somehow has both, being the newer, higher-resolution format.
+Tried in `clean.py`'s subtitle-discovery chain after sidecar/PGS have both
+come up empty (text track -> CC608 -> sidecar -> PGS -> **VobSub**) - PGS
+wins if a source somehow has both, being the newer, higher-resolution
+format.
 
 **Reuses pgs_ocr.py's format-agnostic pieces directly** rather than
 duplicating them: `Cue`/`Placement` (a VobSub cue always has exactly one

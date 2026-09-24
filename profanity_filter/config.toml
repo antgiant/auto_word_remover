@@ -99,9 +99,21 @@ subs_track = "default"       # "default" | index | language | "none" to leave su
 subs_mask = "***"            # used only when method="bleep" - method="mute" always removes the word
 subs_pad = 0.15            # seconds of slack when matching cues to bleep spans
 
-# last resort in the subtitle-discovery chain (text track -> CC608 -> PGS OCR
-# -> VobSub OCR -> OpenSubtitles), tried only when there's no usable local
-# subtitle at all - the common case for a TV recording. Needs an API key -
+# an external subtitle FILE next to the input (e.g. "Movie.srt", "Movie.en.srt")
+# - tried between an embedded text/CC608 track and OCR'ing an embedded PGS/
+# VobSub bitmap track (see the discovery-order comment below). Treated exactly
+# like OpenSubtitles, not like an embedded track: it isn't assumed to already
+# match this exact file's cut, so it's resynced against the transcript's own
+# word timings the same way, and adds the same two tracks - an uncensored
+# "(Sidecar)" (non-default) and a censored "(Sidecar) (Cleaned)" (default).
+sidecar_subs = true
+sidecar_lang = ""            # 2- or 3-letter language to prefer when more than one sidecar file
+#                                exists ("" = derive from the chosen audio track's own language)
+
+# last resort in the subtitle-discovery chain (text track -> CC608 -> sidecar
+# file -> PGS OCR -> VobSub OCR -> OpenSubtitles), tried only when there's no
+# usable local subtitle at all - the common case for a TV recording. Needs an
+# API key -
 # see opensubtitles.py's docstring / README "OpenSubtitles setup". The
 # fetched file's own timestamps are never trusted (a TV recording has
 # commercial breaks/station cuts a retail release doesn't, on top of plain
