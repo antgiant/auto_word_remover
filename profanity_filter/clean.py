@@ -599,7 +599,7 @@ def choose_audio(tracks: list, want: str):
     return t, audio.index(t)
 
 
-def choose_subs(tracks: list, want: str):
+def choose_subs(tracks: list, want: str, prefer_lang: str = ""):
     """The text subtitle track to clean, or (None, None) to skip. Accepts
     Matroska SubRip tracks (extracted via mkvextract) and MP4 "Timed Text"/
     tx3g/mov_text tracks (extracted via ffmpeg's built-in mov_text->srt
@@ -612,7 +612,21 @@ def choose_subs(tracks: list, want: str):
                 or (t.get("codec") or "").lower() == "timed text")]
     if not srt:
         return None, None
-    t = _pick(srt, want, "subtitle")
+    if want == "default":
+        # Don't just trust the container's default-track flag (or, failing
+        # that, whichever track happens to sit first) - a disc/rip's default
+        # subtitle flag reflects the AUTHORING STUDIO's own pick (routinely a
+        # French/dub-market default even on an English-audio release), not
+        # the language actually being cleaned. Mirrors choose_audio()'s same
+        # non-trust of the raw default flag. Prefer a track whose language
+        # matches the audio track already chosen for cleaning; only fall
+        # back to the raw default-flag/first-track pick when nothing matches.
+        lang = (prefer_lang or "").lower()
+        same_lang = [t for t in srt if (t["properties"].get("language", "") or "").lower() == lang] if lang else []
+        pool = same_lang or srt
+        t = next((x for x in pool if x["properties"].get("default_track")), pool[0])
+    else:
+        t = _pick(srt, want, "subtitle")
     return t, t["id"]
 
 
@@ -2127,7 +2141,7 @@ def main(argv: list[str] | None = None) -> int:
     subs_enabled = cfg.method not in ("cut", "dialog") and str(cfg.subs_track).lower() not in ("none", "skip", "off", "")
     chosen_subs, subs_tid = (None, None)
     if subs_enabled:
-        chosen_subs, subs_tid = choose_subs(tracks, cfg.subs_track)
+        chosen_subs, subs_tid = choose_subs(tracks, cfg.subs_track, prefer_lang=cp.get("language", ""))
 
     stem_tool = locate_stem_tool()
     subs_stats = None
