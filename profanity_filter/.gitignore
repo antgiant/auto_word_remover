@@ -12,3 +12,6 @@ __pycache__/
 # stemmer venv (audio-separator + CUDA torch/onnxruntime, several GB) - see
 # README.md "Stemmer setup" to recreate
 /.venv-stem/
+
+# OpenSubtitles API key (see opensubtitles.py) - never commit this
+/opensubtitles.key

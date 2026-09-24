@@ -9,6 +9,7 @@ logic in this toolkit (the detection logic used to live in voice_to_text).
 | Path | What |
 |---|---|
 | `flag_language.py` | transcript scanner — finds every profanity / irreverence hit + timestamp in any common transcript format. Standalone CLI **and** importable API. |
+| `opensubtitles.py` | last-resort subtitle source — search + download from OpenSubtitles when there's no usable local subtitle at all (see "OpenSubtitles fallback" below). Standalone, pure stdlib. |
 | `wordlists/` | `profanity.txt`, `irreverence.txt` — plain-text match lists, re-read every run |
 | `clean.py` | end-to-end: media in → transcript → flag → mute (or bleep) one audio track → mkvmerge remux → cleaned `.mkv` |
 | `clean.ps1` | launcher (runs `clean.py` with the sibling voice_to_text project's venv, UTF-8 console) |
@@ -208,6 +209,125 @@ manual review. `S_VOBSUB` (DVD-era bitmap subs, a different encoding this
 module doesn't parse) has its own equivalent module - see `vobsub_ocr.py`
 below - tried as a further fallback when there's neither a text track nor
 a PGS one.
+
+### OpenSubtitles fallback (`opensubtitles.py`, real-world subtitle sourcing for TV recordings)
+
+Last in the subtitle-discovery chain (text track -> CC608 -> PGS OCR ->
+VobSub OCR -> **OpenSubtitles**), tried only when `chosen_subs` is still
+`None` after everything above - the common case for a TV recording, which
+almost never carries an embedded subtitle track of any kind. Needs an API
+key (see "Setup" below); degrades gracefully (a warning, pipeline continues
+without it) on a missing key, failed search, exhausted quota, or network
+error, same as every other optional dependency in this project.
+
+**Why this needed a fundamentally different algorithm from `backfill_from_srt`
+above**: that function trusts an SRT's own timestamps to within `window`
+(default 2.5s) of the transcript - true for an embedded/OCR'd track, which
+was extracted from the exact same file. An OpenSubtitles download was
+authored against a *different* release entirely - for TV-recorded content
+specifically, one with commercial breaks and station edit cuts the
+recording has and the subtitle's source didn't (or vice versa), on top of
+whatever plain frame-rate drift already exists between any two releases.
+Windowed matching against that isn't "off by a bit," it's arbitrarily wrong
+in different places throughout the file. **The file itself is also not
+clean input**: subtitles pulled from public sites routinely carry injected
+ad/attribution cues ("Support us and become VIP...", "Sync and corrected by
+...", a bare URL) mixed in with the real dialogue lines.
+
+**`flag_language.resync_units_to_transcript()`** solves this by not trusting
+the subtitle's timing *at all* - real timing is rebuilt from a whole-file
+TEXT alignment against the ASR transcript instead of any assumption about a
+shared clock:
+
+1. `strip_ad_units()` drops cues matching a small pattern set (known
+   subtitle-site domains, "support us", "sync ... by", "subtitles by",
+   etc.) before anything else runs, so junk text can't false-anchor or
+   pollute the alignment.
+2. Every remaining cue's tokens are concatenated into one flat stream
+   (remembering each token's owning cue), and diffed - ONE
+   `difflib.SequenceMatcher` pass, `autojunk=False` - against the
+   transcript's own flat word-token stream. This is the same technique
+   `_locate_srt_word`/`backfill_from_srt` use per-cue in a small time
+   window, just run once over the WHOLE file with no time window at all.
+   Because both sequences are in speaking order, the LCS-style match
+   naturally respects that order even where the same phrase recurs
+   elsewhere in the file - a commercial break or a station's cut scene
+   just becomes an unmatched stretch on one side, not a broken alignment.
+3. Matching blocks of `>= min_anchor_run` (default 2) consecutive tokens
+   become trusted anchors - a run of 1 is rejected since a single common
+   word ("the") anchoring on coincidence is a real risk; requiring an
+   actual short shared phrase cuts that sharply.
+4. Each cue's new `(start, end)` is the min/max transcript-word time among
+   its own tokens that landed inside an anchor. A cue with no anchored
+   token at all is dropped UNLESS it's a single cue sandwiched directly
+   between two anchored ones, in which case it's interpolated between
+   them (very likely a real line the alignment just missed, or a lone ad
+   cue splitting real dialogue) - a longer unmatched run is left dropped,
+   since that reads as a genuine structural difference (an extra/missing
+   scene, a commercial break) rather than a few individually-missed words,
+   and guessing across it risks inventing wrong-context subtitle text.
+5. A final monotonicity pass drops any cue a bad anchor placed out of
+   order rather than let it corrupt the track.
+
+The result is a real `.srt` with trustworthy timing (`write_srt_cues()`),
+cached next to the source as `<name>.<lang>.opensubtitles.srt` (the RAW,
+un-resynced download is cached separately as `<name>.<lang>.
+opensubtitles.raw.srt` + a `.meta.json` of what search matched - both
+reused on rerun like every other cache in this project, `force=cfg.
+retranscribe`). Once resynced, it's fed through the **existing**,
+unmodified `backfill_from_srt()` for word detection exactly like an
+embedded track - by this point its timing is trustworthy, so no special
+casing was needed there at all.
+
+**Muxing in two tracks, not one**: every other subtitle source above
+already has its "original" passing through the container untouched (the
+embedded track itself, or the source PGS/VobSub bitmap) - only the
+"(Cleaned)" derivative is new. An OpenSubtitles-sourced subtitle doesn't
+exist anywhere in the source file at all, so BOTH an uncensored
+`"<lang> (OpenSubtitles)"` (non-default) and a censored `"<lang>
+(OpenSubtitles) (Cleaned)"` (default) track have to be muxed in fresh.
+`remux()`'s new `extra_srt` parameter handles the first; the second reuses
+the pipeline's normal `clean_srt`/`chosen_subs` path unchanged (OpenSubtitles
+sets those exactly like a PGS/VobSub OCR result does). `OPENSUBS_TRACK_SUFFIX`
+(" (OpenSubtitles)") is recognised by `is_own_output_track()` alongside
+`track_name_suffix`/`dialog_track_suffix` so a rerun replaces both stale
+tracks instead of piling up duplicates - the "(Cleaned)" one already ends
+in `track_name_suffix` so that half was free, but the plain uncensored one
+needed this added explicitly or it would have accumulated one new copy per
+rerun.
+
+**Setup**: get a free API key at
+[opensubtitles.com/en/consumers](https://www.opensubtitles.com/en/consumers)
+("API Consumers" under account settings), then either
+- set the `OPENSUBTITLES_API_KEY` environment variable, or
+- drop it as the only line in a new `opensubtitles.key` file next to
+  `opensubtitles.py` (gitignored - never committed).
+
+Optional `OPENSUBTITLES_USERNAME`/`OPENSUBTITLES_PASSWORD` env vars log in
+for a higher daily download quota; without them, downloads use the
+anonymous quota tied to the API key alone (`opensubtitles.login()` - never
+fatal if missing/wrong, just stays anonymous).
+
+**Search matching is a filename heuristic** (`opensubtitles.guess_query()`
+- strips common quality/edit tags, picks off `SxxExx` or a `(YYYY)`, uses
+what's left as the title) and picks the top result by download count - good
+enough to be useful, not guaranteed right. `--opensubtitles-query` overrides
+the guessed title; `--opensubtitles-id` bypasses search entirely with a
+file_id you found yourself on the site. Always check the printed match
+line (`OpenSubtitles: fetched '<release>' (...) -> ...`) before trusting a
+batch run's output.
+
+**Known rough edges (POC, same status as the rest of this project's
+subtitle sourcing)**: the whole-file `difflib` pass is real work on a
+movie-length token stream (tens of thousands of tokens each side) - slow
+but tractable for a tool that already budgets minutes for transcription/
+stemming, not yet benchmarked against a very long source. Title-guessing
+from a DVR-style filename is unvalidated against a real batch of TV
+recordings; `--opensubtitles-query`/`--opensubtitles-id` exist specifically
+because it will sometimes guess wrong. Not yet run end-to-end against a
+real commercial-broken TV recording - validated so far only by code review
+against the documented algorithm and by exercising `resync_units_to_
+transcript()`/`is_ad_cue()` on synthetic inputs.
 
 ### VobSub OCR + bitmap censoring (DVD bitmap subtitles, `vobsub_ocr.py`)
 

@@ -526,6 +526,154 @@ def backfill_from_srt(srt_path: str | Path, matchers: dict[str, re.Pattern | Non
     return extra
 
 
+# ---------------------------------------------------------------------------
+# External subtitle resync (e.g. OpenSubtitles): the file's own timestamps
+# can't be trusted at all - a TV recording routinely carries commercial
+# breaks and station edit cuts a retail/streaming release doesn't, on top of
+# plain drift, and the subtitle file itself often carries injected ad/
+# attribution cues. resync_units_to_transcript() throws away every timestamp
+# in the source subtitle and rebuilds real ones from a whole-file TEXT
+# alignment against the ASR word timeline instead - order-preserving (an
+# LCS-style match via difflib, same technique backfill_from_srt above uses
+# per-cue, just run once over the whole file instead of in a small time
+# window), so commercial insertions/station cuts just show up as unmatched
+# stretches on either side rather than breaking the alignment or requiring
+# any assumption about a shared clock.
+# ---------------------------------------------------------------------------
+_AD_LINE_RE = re.compile(
+    r"opensubtitles|addic7ed|subscene|podnapisi\.net|yifysubtitles|undertexter|"
+    r"www\.[a-z0-9-]+\.(?:com|org|net|tv|info)|https?://|"
+    r"support us and become|advertise your product|"
+    r"sync(?:hroni[sz]ation)?(?:ed)?\s*(?:and|&)?\s*correct(?:ed|ions?)?\s*by|"
+    r"subtitles?\s*(?:by|downloaded from)|ripped\s*(?:and|&)?\s*(?:corrected\s*)?by|"
+    r"encoded\s*by",
+    re.IGNORECASE)
+
+
+def is_ad_cue(text: str) -> bool:
+    """True for a subtitle cue that's injected ad/attribution spam rather
+    than real dialogue - common in files pulled from public subtitle sites."""
+    return bool(_AD_LINE_RE.search(text))
+
+
+def strip_ad_units(units: list[Unit]) -> list[Unit]:
+    return [u for u in units if not is_ad_cue(u.text)]
+
+
+def resync_units_to_transcript(srt_path: str | Path, word_timeline: list[dict],
+                               min_anchor_run: int = 2) -> list[tuple[float, float, str]]:
+    """Realign an externally-sourced subtitle file whose own timestamps can't
+    be trusted (see the section banner above) against `word_timeline` (the
+    ASR's own word-accurate times - see load_word_timeline). Returns
+    [(start, end, text), ...] with real, trustworthy timing, sorted and
+    monotonic.
+
+    A cue with no reliable match anywhere (ad text, or a scene this
+    recording simply doesn't have) is dropped rather than guessed at, except
+    a single cue sandwiched directly between two confidently-matched
+    neighbours, which is interpolated between them - very likely a genuine
+    line the alignment just missed (or a lone ad cue splitting real
+    dialogue), unlike a longer unmatched run, which reads much more like a
+    whole stretch this recording's cut doesn't have (or a commercial break)
+    than a string of individually-dropped words, and is left alone.
+
+    `min_anchor_run` is how many consecutive tokens must match before a
+    block of the whole-file alignment is trusted as an anchor - 1 would let
+    a single common word (e.g. "the") anchor a cue on pure coincidence; 2+
+    requires an actual short phrase in common, cutting that risk sharply.
+    """
+    units = strip_ad_units(parse_srt(Path(srt_path)))
+    if not units or not word_timeline:
+        return []
+
+    srt_tokens: list[str] = []
+    cue_range: list[tuple[int, int]] = []
+    for u in units:
+        lo = len(srt_tokens)
+        srt_tokens.extend(t for t, _cs, _ce in _tokenize(u.text) if t)
+        cue_range.append((lo, len(srt_tokens)))
+
+    ref_tokens = [_norm_tok(w["word"]) for w in word_timeline]
+    # A whole-file difflib pass on movie-length sequences (tens of thousands
+    # of tokens) is real work but tractable for an offline batch tool that
+    # already budgets minutes for transcription/stemming - autojunk=False
+    # for the same reason backfill_from_srt above uses it: junk heuristics
+    # are tuned for source-code diffing, not natural-language token streams.
+    sm = difflib.SequenceMatcher(None, srt_tokens, ref_tokens, autojunk=False)
+
+    tok_map: dict[int, int] = {}
+    for blk in sm.get_matching_blocks():
+        if blk.size >= min_anchor_run:
+            for k in range(blk.size):
+                tok_map[blk.a + k] = blk.b + k
+
+    placed: list[tuple[float, float] | None] = []
+    for lo, hi in cue_range:
+        idxs = [tok_map[i] for i in range(lo, hi) if i in tok_map]
+        if not idxs:
+            placed.append(None)
+            continue
+        j0, j1 = min(idxs), max(idxs)
+        st = word_timeline[j0].get("start")
+        en = word_timeline[j1].get("end") or word_timeline[j1].get("start")
+        placed.append((st, en) if st is not None and en is not None else None)
+
+    n = len(units)
+    for i in range(n):
+        if placed[i] is not None:
+            continue
+        p, q = i - 1, i + 1
+        if p < 0 or q >= n or placed[p] is None or placed[q] is None:
+            continue
+        po, qo = units[p].start, units[q].start
+        if po is None or qo is None or qo <= po or units[i].start is None:
+            continue
+        frac = min(1.0, max(0.0, (units[i].start - po) / (qo - po)))
+        prev_new_end, next_new_start = placed[p][1], placed[q][0]
+        if next_new_start > prev_new_end:
+            st = prev_new_end + frac * (next_new_start - prev_new_end)
+            placed[i] = (st, min(next_new_start, st + 2.0))
+
+    out: list[tuple[float, float, str]] = []
+    last_end = -1.0
+    for u, p in zip(units, placed):
+        if p is None:
+            continue
+        st, en = p
+        if en <= st:
+            en = st + 0.35
+        if st < last_end:      # a bad anchor put this cue out of order - drop
+            continue           # it rather than let it corrupt the track/spans
+        out.append((st, en, u.text))
+        last_end = en
+    return out
+
+
+_SRT_TS_FMT = "{:02d}:{:02d}:{:02d},{:03d}"
+
+
+def _srt_ts(t: float) -> str:
+    t = max(0.0, t)
+    h, rem = divmod(t, 3600)
+    m, s = divmod(rem, 60)
+    ms = round((s - int(s)) * 1000)
+    s = int(s)
+    if ms == 1000:
+        ms = 0
+        s += 1
+    return _SRT_TS_FMT.format(int(h), int(m), s, ms)
+
+
+def write_srt_cues(cues: list[tuple[float, float, str]], path: str | Path) -> Path:
+    """Serialize [(start, end, text), ...] as a real .srt file - used for the
+    resynced OpenSubtitles output (see resync_units_to_transcript)."""
+    path = Path(path)
+    parts = [f"{i}\n{_srt_ts(st)} --> {_srt_ts(en)}\n{text}\n"
+             for i, (st, en, text) in enumerate(cues, 1)]
+    path.write_text("\n".join(parts), encoding="utf-8")
+    return path
+
+
 def count_categories(hits: list[dict]) -> dict[str, int]:
     out: dict[str, int] = {}
     for h in hits:

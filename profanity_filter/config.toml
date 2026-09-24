@@ -99,6 +99,23 @@ subs_track = "default"       # "default" | index | language | "none" to leave su
 subs_mask = "***"            # used only when method="bleep" - method="mute" always removes the word
 subs_pad = 0.15            # seconds of slack when matching cues to bleep spans
 
+# last resort in the subtitle-discovery chain (text track -> CC608 -> PGS OCR
+# -> VobSub OCR -> OpenSubtitles), tried only when there's no usable local
+# subtitle at all - the common case for a TV recording. Needs an API key -
+# see opensubtitles.py's docstring / README "OpenSubtitles setup". The
+# fetched file's own timestamps are never trusted (a TV recording has
+# commercial breaks/station cuts a retail release doesn't, on top of plain
+# drift) - real timing is rebuilt from a whole-file text alignment against
+# the transcript instead (flag_language.resync_units_to_transcript). On
+# success this adds TWO new subtitle tracks - unlike every other source
+# above, an OpenSubtitles subtitle doesn't already exist anywhere in the
+# source file, so both an uncensored "(OpenSubtitles)" (non-default) and a
+# censored "(OpenSubtitles) (Cleaned)" (default) track are muxed in.
+opensubtitles = true
+opensubtitles_lang = "en"    # 2-letter language to search/download
+opensubtitles_query = ""     # override the title auto-guessed from the filename
+opensubtitles_id = ""        # exact OpenSubtitles file_id to download - bypasses search
+
 # cross-check the embedded SRT for profanity the transcript missed entirely
 # (dropped or mis-heard words); located via the transcript's own word timings
 # where possible, interpolated between neighbours otherwise. See

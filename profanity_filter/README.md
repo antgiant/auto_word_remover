@@ -129,12 +129,47 @@ so a 5.1 track means 6 separate passes over the full runtime. See
 [WhisperX validation](#whisperx-validation-experimental) below for a way to
 cut down how often that slow path actually triggers.
 
+### 5. OpenSubtitles setup (optional)
+
+Only needed for the OpenSubtitles fallback - the last resort in the
+subtitle-discovery chain, tried when there's no usable local subtitle track
+at all (the common case for a TV recording, which almost never carries an
+embedded subtitle). Skip this if you're fine without it; it degrades
+gracefully (a warning, the run continues without OpenSubtitles) when no key
+is configured.
+
+1. Get a free API key at
+   [opensubtitles.com/en/consumers](https://www.opensubtitles.com/en/consumers)
+   ("API Consumers" under account settings).
+2. Put it somewhere `opensubtitles.py` will find it - either:
+   - an `OPENSUBTITLES_API_KEY` environment variable, or
+   - a new file named `opensubtitles.key` right next to `opensubtitles.py`,
+     containing nothing but the key on one line (gitignored - never
+     committed).
+3. *(optional, raises the daily download quota above the small anonymous
+   one)* set `OPENSUBTITLES_USERNAME` / `OPENSUBTITLES_PASSWORD` env vars
+   too.
+
+**Important for TV recordings specifically**: this fallback does not trust
+the downloaded subtitle's own timestamps at all - a subtitle authored for a
+theatrical/streaming release doesn't share a clock with a TV recording of
+the same content (commercial breaks, station edits, plain drift), and the
+file itself often carries injected ad/attribution lines. It's realigned to
+your actual recording via a whole-file text comparison against the
+transcript instead - see AGENTS.md ("OpenSubtitles fallback") for how. On a
+match, it adds two new subtitle tracks (unlike every other source, which
+already has an "original" passing through untouched): an uncensored
+`"<lang> (OpenSubtitles)"` track matching the original audio, and a
+censored `"<lang> (OpenSubtitles) (Cleaned)"` track (still the default
+subtitle) matching the cleaned one.
+
 ### Install checklist
 
 - [ ] `voice_to_text` set up as a sibling folder (its own venv, its own README)
 - [ ] `ffmpeg` / `ffprobe` on PATH
 - [ ] `bin\mkvtoolnix\mkvmerge.exe` present (or MKVToolNix installed system-wide)
 - [ ] *(optional)* `.venv-stem\` set up per step 4, GPU verified if you have one
+- [ ] *(optional)* an OpenSubtitles API key per step 5, for the TV-recording subtitle fallback
 
 ---
 
@@ -172,7 +207,12 @@ needs, any Python 3.10+ — see the version note above).
    short interjections. Missed words are timed via the transcript's own word
    timings where they line up, interpolated where the word was dropped
    outright. On a test film this roughly doubled the hits found (25 -> 46).
-   Disable with `--no-srt-backfill`.
+   Disable with `--no-srt-backfill`. If there's no usable local subtitle at
+   all, `opensubtitles.py` is tried as a last resort (see "OpenSubtitles
+   setup") — its timestamps are never trusted, since they can't be assumed
+   to share a clock with your file (especially a TV recording, with its own
+   commercial breaks/station cuts); real timing is rebuilt from a text
+   comparison against the transcript instead. See AGENTS.md.
 3. **Remove** — one `ffmpeg` pass over a single audio track:
    - `--method mute` **(default)** — silence. If the track has more than two
      channels, the center channel's actual content is measured first: when
@@ -218,16 +258,22 @@ needs, any Python 3.10+ — see the version note above).
    no remux, no alt track (the duration changed, so keeping the original
    alongside doesn't make sense).
 4. **Subtitles** (`mute`/`bleep` only) — the embedded SubRip track is pulled
-   with `mkvextract`; every cue that overlaps a removed span gets its profane
-   words replaced with `***`. `--method dialog` leaves subtitles completely
-   alone.
+   with `mkvextract` (or comes from the PGS/VobSub OCR or OpenSubtitles
+   fallback if there's no text track — see AGENTS.md); every cue that
+   overlaps a removed span gets its profane words replaced with `***`.
+   `--method dialog` leaves subtitles completely alone.
 5. **Remux** — `mkvmerge` copies the original bit-for-bit and adds the
    cleaned audio (**and** cleaned subtitle, for `mute`/`bleep`) back in.
    `mute`/`bleep` add it as a new **default** track called
    `<original label> (Cleaned)`, demoting the original. `dialog` adds
    `<original label> (Wordless)` as a **non-default** track by default
    (`--dialog-default` to flip that). Video and every other track are
-   untouched either way.
+   untouched either way. When the subtitle came from OpenSubtitles
+   specifically, there's no "original" already sitting in the container to
+   demote — so instead TWO new tracks are added: an uncensored
+   `"<lang> (OpenSubtitles)"` track (non-default, matching the original
+   audio) and the censored `"<lang> (OpenSubtitles) (Cleaned)"` track
+   (default, matching the cleaned audio).
 6. **Replace** — all of the above is built in a temp dir first, never
    touching the source. Only once it succeeds: the pre-clean original is
    moved to the **Recycle Bin** and the newly built file takes its place at
@@ -253,6 +299,10 @@ needs, any Python 3.10+ — see the version note above).
 | `--cut-bitrate` | `cut` only: bitrate for a lossy source codec (default 96k) |
 | `--source-track default\|0\|1\|eng` | which audio track to clean |
 | `--subs-track default\|0\|eng\|none` | `mute`/`bleep` only: which SubRip track to clean (`--no-subs` to skip) |
+| `--no-opensubtitles` | don't fall back to OpenSubtitles when there's no local text/PGS/VobSub subtitle (see "OpenSubtitles setup") |
+| `--opensubtitles-query "title"` | override the search title auto-guessed from the filename |
+| `--opensubtitles-id 12345` | exact OpenSubtitles file_id to download - bypasses search entirely |
+| `--opensubtitles-lang en` | 2-letter language to search/download (default `en`) |
 | `--sync-ms N` | `mute`/`bleep`/`dialog` only: delay the clean track by N ms if lip-sync drifts |
 | `--extra-spans file.json` | hand-reviewed `[{start,end,label,category}]` spans to remove in addition to the wordlists (e.g. content no regex can safely catch) — always included, regardless of `--categories` |
 | `--keep-temp` | also drop the cleaned track + ffmpeg filter graph in `out\` |
@@ -342,6 +392,8 @@ $py = "..\voice_to_text\.venv\Scripts\python.exe"
 ```
 clean.py             the pipeline: transcript -> flag -> remove -> remux
 flag_language.py     standalone detection (no media/ffmpeg needed)
+opensubtitles.py     last-resort subtitle source (search + download), for
+                     when there's no usable local subtitle at all
 _whisperx_check.py   experimental: validate a center-mute with real ASR
 config.toml          defaults for clean.py (copy + --config to override)
 wordlists\           profanity.txt / irreverence.txt - edit freely

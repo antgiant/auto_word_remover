@@ -6,10 +6,13 @@ End-to-end from a single media file:
 
   1. transcript  reuse "<name>.json" next to the input, else run Voice_to_Text
   2. flag        flag_language.py (this folder) finds every hit + timestamp
-  3. backfill    the embedded SubRip track (if any) is cross-checked for words
-                 the transcript missed entirely; found ones are timed via the
-                 transcript's own word timings where possible (see
-                 flag_language.backfill_from_srt)
+  3. backfill    a text subtitle track - embedded, OCR'd from a PGS/VobSub
+                 bitmap track, or (last resort) fetched from OpenSubtitles -
+                 is cross-checked for words the transcript missed entirely;
+                 found ones are timed via the transcript's own word timings
+                 where possible (see flag_language.backfill_from_srt). An
+                 OpenSubtitles source's own timestamps are never trusted -
+                 see flag_language.resync_units_to_transcript / AGENTS.md
   4. remove      ffmpeg pulls ONE audio track out and removes each flagged span:
        method "mute"  (default) - silence. If the track has more than two
                  channels, the center channel's real content is checked first
@@ -167,6 +170,12 @@ CHANNEL_LAYOUTS = {
     "7.1(wide-side)": ["FL", "FR", "FC", "LFE", "FLC", "FRC", "SL", "SR"],
 }
 
+OPENSUBS_TRACK_SUFFIX = " (OpenSubtitles)"  # the extra uncensored track remux() adds for an
+#                                             OpenSubtitles-sourced subtitle (see main()) - not a
+#                                             Config field since, unlike track_name_suffix, it's not
+#                                             meant to be user-tunable, just recognised on rerun
+#                                             (is_own_output_track) so it's replaced, not duplicated
+
 LANG_NAMES = {
     "eng": "English", "spa": "Spanish", "fre": "French", "fra": "French",
     "ger": "German", "deu": "German", "ita": "Italian", "jpn": "Japanese",
@@ -234,6 +243,21 @@ class Config:
     #                                    (see vobsub_ocr.py; main()'s subtitle-discovery order)
     vobsub_ocr_lang: str = ""          # Tesseract language code, "" = derive from the track's own
     #                                    3-letter language tag (falls back to "eng" if unrecognised)
+
+    opensubtitles: bool = True         # last resort in the subtitle-discovery chain, tried only when
+    #                                    there's no usable text/CC608/PGS/VobSub subtitle at all (the
+    #                                    common case for a TV recording). Needs an API key - see
+    #                                    opensubtitles.py's docstring / README "OpenSubtitles setup".
+    #                                    The fetched file's own timestamps are NEVER trusted - see
+    #                                    flag_language.resync_units_to_transcript(). On success, adds
+    #                                    TWO new subtitle tracks (unlike every other source above,
+    #                                    which already has an "original" passing through untouched):
+    #                                    "<lang> (OpenSubtitles)" (uncensored, non-default) and
+    #                                    "<lang> (OpenSubtitles) (Cleaned)" (censored, default).
+    opensubtitles_lang: str = "en"     # 2-letter language to search/download ("" = derive from the
+    #                                    chosen audio track's own language)
+    opensubtitles_query: str = ""      # override the title auto-guessed from the filename
+    opensubtitles_id: str = ""         # exact OpenSubtitles file_id to download - bypasses search
 
     output_dir: str = "out"             # scratch dir for temp files + --keep-temp debug artifacts only -
     #                                    the cleaned result itself replaces the source in place (see
@@ -668,7 +692,8 @@ def is_own_output_track(t: dict, cfg: Config) -> bool:
     track) and to replace, rather than pile up alongside, a stale one - see
     "Re-running on an already-cleaned file" in AGENTS.md."""
     name = t.get("properties", {}).get("track_name") or ""
-    return name.endswith(cfg.track_name_suffix) or name.endswith(cfg.dialog_track_suffix)
+    return (name.endswith(cfg.track_name_suffix) or name.endswith(cfg.dialog_track_suffix)
+            or name.endswith(OPENSUBS_TRACK_SUFFIX))
 
 
 def _span_expr(spans) -> str:
@@ -1646,7 +1671,8 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
           clean_audio: Path, chosen_audio: dict,
           clean_srt: Path | None, chosen_subs: dict | None,
           audio_suffix: str | None = None, audio_default: bool = True,
-          exclude_audio_ids=(), exclude_subs_ids=()) -> None:
+          exclude_audio_ids=(), exclude_subs_ids=(),
+          extra_srt: tuple[Path, dict] | None = None) -> None:
     """`tracks` must already have any stale own-output track (see
     is_own_output_track) filtered OUT - it drives both the default-flag
     loop below and --track-order, so a stale track left in would still get
@@ -1655,7 +1681,16 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
     where those ids still exist) are what actually drop them from `media`'s
     import via mkvmerge's `!id,id` negation syntax - a rerun's fresh
     (Cleaned)/(Wordless) track REPLACES the stale one instead of piling up
-    alongside it."""
+    alongside it.
+
+    `extra_srt` is an extra, always-non-default subtitle track added as-is
+    (no censoring) alongside `clean_srt`/`chosen_subs` - `(path, {"language":
+    ..., "track_name": ...})`. Used only for OpenSubtitles: unlike every
+    other subtitle source in main() (an embedded/OCR'd track whose original
+    already passes through the container untouched), an OpenSubtitles-
+    sourced subtitle doesn't exist anywhere in the source file at all, so
+    its "original" (uncensored) counterpart has to be muxed in as a new
+    track too, not just its "(Cleaned)" one."""
     suffix = cfg.track_name_suffix if audio_suffix is None else audio_suffix
     a_lang = chosen_audio["properties"].get("language") or "und"
     a_name = clean_label(chosen_audio, suffix)
@@ -1682,9 +1717,17 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
         args += ["--subtitle-tracks", "!" + ",".join(str(i) for i in exclude_subs_ids)]
     args += [str(media)]
 
+    # Every new file appended to `args` below becomes the next mkvmerge input
+    # index after `media` (input 0) - tracked explicitly rather than
+    # hard-coded (1, 2, ...) since extra_srt makes the new-input count
+    # variable now.
+    next_input = 1
+
     args += ["--language", f"0:{a_lang}", "--track-name", f"0:{a_name}",
              "--default-track-flag", f"0:{1 if audio_default else 0}",
              "--sync", f"0:{cfg.sync_ms}", str(clean_audio)]
+    audio_ref = f"{next_input}:0"
+    next_input += 1
     print(f'  new audio track: "{a_name}"  [{a_lang}]  {"default" if audio_default else "alt (non-default)"}')
 
     subs_ref = None
@@ -1693,13 +1736,27 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
         s_name = clean_label(chosen_subs, cfg.track_name_suffix)
         args += ["--language", f"0:{s_lang}", "--track-name", f"0:{s_name}",
                  "--default-track-flag", "0:1", str(clean_srt)]
-        subs_ref = "2:0"
+        subs_ref = f"{next_input}:0"
+        next_input += 1
         print(f'  new subtitle track: "{s_name}"  [{s_lang}]  default')
 
+    extra_subs_ref = None
+    if extra_srt is not None:
+        e_path, e_meta = extra_srt
+        e_lang = e_meta.get("language") or "und"
+        e_name = e_meta.get("track_name") or "extra"
+        args += ["--language", f"0:{e_lang}", "--track-name", f"0:{e_name}",
+                 "--default-track-flag", "0:0", str(e_path)]
+        extra_subs_ref = f"{next_input}:0"
+        next_input += 1
+        print(f'  new subtitle track: "{e_name}"  [{e_lang}]  alt (non-default)')
+
     order = [f"0:{t['id']}" for t in tracks if t["type"] == "video"]
-    order += ["1:0"] + [f"0:{t['id']}" for t in tracks if t["type"] == "audio"]
+    order += [audio_ref] + [f"0:{t['id']}" for t in tracks if t["type"] == "audio"]
     if subs_ref:
         order.append(subs_ref)
+    if extra_subs_ref:
+        order.append(extra_subs_ref)
     order += [f"0:{t['id']}" for t in tracks if t["type"] == "subtitles"]
     order += [f"0:{t['id']}" for t in tracks
              if t["type"] not in ("video", "audio", "subtitles")]
@@ -1793,6 +1850,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "PGS track to use for srt_backfill/censoring")
     p.add_argument("--vobsub-ocr-lang", dest="vobsub_ocr_lang",
                    help="Tesseract language code for VobSub OCR (default: eng)")
+    p.add_argument("--no-opensubtitles", dest="opensubtitles", action="store_false", default=None,
+                   help="don't fall back to OpenSubtitles when there's no local text/PGS/VobSub "
+                        "subtitle to backfill/censor from (needs an API key - see opensubtitles.py)")
+    p.add_argument("--opensubtitles-lang", dest="opensubtitles_lang",
+                   help='2-letter language to search/download (default "en")')
+    p.add_argument("--opensubtitles-query", dest="opensubtitles_query",
+                   help="override the OpenSubtitles search title auto-guessed from the filename")
+    p.add_argument("--opensubtitles-id", dest="opensubtitles_id",
+                   help="exact OpenSubtitles file_id to download - bypasses search entirely")
     p.add_argument("--output-dir", dest="output_dir",
                    help="scratch dir for temp files + --keep-temp debug artifacts (default 'out') - "
                         "the cleaned result itself replaces the source file in place, it is never "
@@ -1830,7 +1896,8 @@ def main(argv: list[str] | None = None) -> int:
                  "dialog_track_default", "clean_codec", "clean_bitrate",
                  "clean_bitrate_surround", "cut_bitrate", "source_track",
                  "sync_ms", "subs_track", "srt_backfill", "pgs_ocr", "pgs_ocr_lang",
-                 "vobsub_ocr", "vobsub_ocr_lang", "output_dir", "retranscribe", "overwrite"]:
+                 "vobsub_ocr", "vobsub_ocr_lang", "opensubtitles", "opensubtitles_lang",
+                 "opensubtitles_query", "opensubtitles_id", "output_dir", "retranscribe", "overwrite"]:
         val = getattr(args, name, None)
         if val is not None:
             setattr(cfg, name, val)
@@ -1918,6 +1985,10 @@ def main(argv: list[str] | None = None) -> int:
         build_path = tmp / f"build{out_ext}"
 
         raw_srt = None
+        opensubs_extra_srt = None   # set below only when OpenSubtitles supplied the subtitle
+        #                             source - the resynced-but-UNCENSORED copy, muxed in as its
+        #                             own extra non-default track alongside the usual (Cleaned)
+        #                             one (see remux()'s extra_srt param)
         if chosen_subs is not None:
             raw_srt = tmp / "orig.srt"
             extract_subs_srt(ffmpeg, mkvextract, media, tracks, chosen_subs, subs_tid, raw_srt)
@@ -2026,6 +2097,39 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         print("  [warn] VobSub OCR produced too little usable text - discarding",
                               file=sys.stderr)
+
+        if subs_enabled and chosen_subs is None and cfg.opensubtitles:
+            if str(HERE) not in sys.path:
+                sys.path.insert(0, str(HERE))
+            import flag_language
+            import opensubtitles
+            lang2 = (cfg.opensubtitles_lang or "").lower() or opensubtitles.LANG_3TO2.get(
+                (cp.get("language") or "").lower(), "en")
+            print(f"  subtitles: no local text/PGS/VobSub track - trying OpenSubtitles [{lang2}]...")
+            fetched = opensubtitles.fetch_subtitle(media, cfg, force=cfg.retranscribe)
+            if fetched is not None:
+                raw_os_srt, os_meta = fetched
+                cues = flag_language.resync_units_to_transcript(
+                    raw_os_srt, flag_language.load_word_timeline(js))
+                if not cues:
+                    print("  [warn] OpenSubtitles: nothing in the downloaded subtitle lined up "
+                          "with this recording's transcript - discarding", file=sys.stderr)
+                else:
+                    synced_path = media.with_name(f"{media.stem}.{lang2}.opensubtitles.srt")
+                    flag_language.write_srt_cues(cues, synced_path)
+                    if srt_text_len(synced_path) < _MIN_USABLE_SRT_CHARS:
+                        print("  [warn] OpenSubtitles resync produced too little usable text - "
+                              "discarding", file=sys.stderr)
+                    else:
+                        lang3 = opensubtitles.LANG_2TO3.get(lang2, "und")
+                        os_name = f"{LANG_NAMES.get(lang3, lang3) or lang3}{OPENSUBS_TRACK_SUFFIX}".strip()
+                        print(f"  OpenSubtitles: resynced {len(cues)} cue(s) to this recording's "
+                              f"own timeline ({os_meta.get('release') or os_meta.get('file_id')})")
+                        raw_srt = synced_path
+                        chosen_subs = {"id": None, "type": "subtitles",
+                                      "properties": {"language": lang3, "track_name": os_name}}
+                        subs_tid = None
+                        opensubs_extra_srt = (synced_path, {"language": lang3, "track_name": os_name})
 
         if subs_enabled and chosen_subs is None:
             print("  subtitles: no usable text subtitle track to clean - skipping")
@@ -2203,7 +2307,8 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             remux(mkvmerge, media, tracks, cfg, build_path,
                   clean_audio, chosen, clean_srt, chosen_subs,
-                  exclude_audio_ids=stale_audio_ids, exclude_subs_ids=stale_subs_ids)
+                  exclude_audio_ids=stale_audio_ids, exclude_subs_ids=stale_subs_ids,
+                  extra_srt=opensubs_extra_srt)
             if args.keep_temp:
                 shutil.copy2(clean_audio, out_dir / f"{media.stem}{cfg.track_name_suffix}{clean_audio.suffix}")
                 if (tmp / "filter.txt").is_file():  # not written by mute_track's stemmed-splice path
