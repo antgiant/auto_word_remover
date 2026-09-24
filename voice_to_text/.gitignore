@@ -4,6 +4,7 @@ __pycache__/
 
 # dedicated venv - recreate per README.md
 /.venv/
+/.venv-nemo/
 
 # whisper + wav2vec2 weights - re-downloaded/placed per README.md
 /models/
