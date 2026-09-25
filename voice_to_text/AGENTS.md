@@ -4,6 +4,13 @@ Local, GPU-accelerated speech-to-text. Read this before changing anything
 here. `README.md` has the full user-facing docs; this file is the operator's
 cheat-sheet.
 
+## Keeping the README current
+
+When you add or materially change a user-facing feature here, update the
+root [`README.md`](../README.md) (and this project's own `README.md` if
+relevant) to reflect it — the root README is the marketing/feature summary
+for the whole toolkit and goes stale fast otherwise.
+
 ## Layout
 
 | Path | What |

@@ -4,6 +4,13 @@ Detects profanity / "God's name in vain" in media and produces a cleaned copy
 with those spans removed from the audio. Owns **all** profanity/irreverence
 logic in this toolkit (the detection logic used to live in voice_to_text).
 
+## Keeping the README current
+
+When you add or materially change a user-facing feature here, update the
+root [`README.md`](../README.md) (and this project's own `README.md` if
+relevant) to reflect it — the root README is the marketing/feature summary
+for the whole toolkit and goes stale fast otherwise.
+
 ## Layout
 
 | Path | What |
