@@ -2085,6 +2085,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "fresh detection pass would flag the exact same set of words - by default "
                         "a rerun on an already-cleaned file skips the rebuild in that case ('mute'/"
                         "'bleep' only; 'cut'/'dialog' always rerun, no word-set to compare)")
+    p.add_argument("--record-clean", action="store_true",
+                   help="when a fresh (non-already-cleaned) file has nothing flagged, still write "
+                        "a <name>.bleeps.json with hits:0/spans:[] instead of writing nothing - "
+                        "lets a caller that only checks for that file's existence (e.g. a batch "
+                        "driver deciding what's already been checked) tell 'checked, genuinely "
+                        "clean' apart from 'never checked' without separate bookkeeping of its "
+                        "own. Off by default so a plain interactive run's silence keeps meaning "
+                        "'nothing happened here'")
     p.add_argument("--config", default=str(HERE / "config.toml"))
     return p
 
@@ -2402,6 +2410,18 @@ def main(argv: list[str] | None = None) -> int:
                 if already_cleaned:
                     print("  nothing flagged on this pass - leaving the existing (Cleaned) track "
                           "as-is (nothing to rebuild it from)")
+                elif args.record_clean:
+                    report = final_dest.parent / f"{final_dest.stem}.bleeps.json"
+                    report.write_text(json.dumps({
+                        "source": str(media),
+                        "output": None,
+                        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "hits": len(all_hits),
+                        "hits_from_srt_backfill": sum(
+                            1 for h in all_hits if h.get("source") == "srt-backfill"),
+                        "spans": [],
+                    }, indent=2), encoding="utf-8")
+                    print(f"  nothing flagged - wrote empty {report.name} (--record-clean)")
                 else:
                     print("  nothing flagged - no output written")
                 return 0
