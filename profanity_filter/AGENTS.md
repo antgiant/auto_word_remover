@@ -639,6 +639,43 @@ rerun happens; would need `ensure_transcript` to extract the chosen original
 track itself rather than handing the whole container to `transcribe.py` to
 close properly.
 
+### Coexisting with a "(No Narration)"/"(Wordless)" alt track
+
+A file can carry a narration-free alt track from a prior `--method dialog`
+run (this project's own, or a personal batch driver's project-specific
+suffix override - e.g. `no_narration_batch.py`'s `" (No Narration)"`, see
+that project's memory for the batch itself). A later plain `mute`/`bleep`/
+`cut` run over the same file (e.g. the daily movie sweep) must not treat
+that track as the thing to detect profanity in or promote to default -
+`is_no_narration_track()` recognizes it by a case-insensitive name-substring
+match ("no narration" / "wordless", via `NO_NARRATION_NAME_MARKERS`) rather
+than `cfg.dialog_track_suffix`, so it's recognized regardless of which
+config produced it (this repo's own default config vs. a caller's
+project-specific override):
+
+- **`choose_audio(tracks, "default")`** excludes a no-narration track from
+  the candidate pool entirely before picking a source to clean, even if
+  IT'S the one flagged default in the container (it always is, once
+  created - see `no_narration_batch.py`) - falls back to a real narrated
+  track.
+- **`remux()`** leaves an existing no-narration track's default flag alone
+  and adds the new `(Cleaned)` track as a non-default alt right after it in
+  `--track-order` (`keep_no_narration_primary` in `remux()`), rather than
+  clearing every original audio track's default flag and making the new one
+  the primary track the way a normal run does. Only skipped when the call
+  itself is adding another no-narration-style track (`audio_suffix`/
+  `cfg.track_name_suffix` itself matches `NO_NARRATION_NAME_MARKERS` - e.g.
+  a `--method dialog` run), so the no-narration batch's own runs are
+  unaffected.
+
+Net effect: run the daily movie sweep (or any plain `clean.py <file>`) over
+a file the no-narration batch already touched, and the No Narration track
+stays the primary/default audio, the freshly bleep-censored narrated track
+lands right after it as the next alt, and the raw uncensored narrated track
+(if kept) sits after that - matching listening-order intent (silent-by-
+default background ambience, censored-narrated as the next thing to reach
+for, raw original last).
+
 ### "cut" (audio-only inputs only, e.g. audiobooks)
 
 Cutting removes time, so it fundamentally can't work the way `mute`/`bleep` do:

@@ -583,11 +583,17 @@ def choose_audio(tracks: list, want: str):
         # is often an arbitrary/compatibility stereo track sitting next to a
         # real 5.1+ track of the same language that never gets touched. Prefer
         # the highest-channel-count track among whatever language the default
-        # pick would have used.
-        default_t = next((t for t in audio if t["properties"].get("default_track")), audio[0])
+        # pick would have used. Also never treat a "(No Narration)"/"(Wordless)"
+        # alt track as the thing to detect profanity in or default to - even
+        # if IT'S the one flagged default in the container (see
+        # no_narration_batch.py) - prefer a real narrated track when one
+        # exists alongside it.
+        narrated = [t for t in audio if not is_no_narration_track(t)]
+        pool = narrated or audio
+        default_t = next((t for t in pool if t["properties"].get("default_track")), pool[0])
         lang = (default_t["properties"].get("language") or "").lower()
-        same_lang = [t for t in audio
-                     if (t["properties"].get("language") or "").lower() == lang] if lang else audio
+        same_lang = [t for t in pool
+                     if (t["properties"].get("language") or "").lower() == lang] if lang else pool
         t = max(same_lang, key=lambda x: x["properties"].get("audio_channels") or 0)
         if (t["properties"].get("audio_channels") or 0) > (default_t["properties"].get("audio_channels") or 0):
             print(f"  [note] source_track=default: using the "
@@ -837,6 +843,24 @@ def clean_label(track: dict, suffix: str) -> str:
     if LANG_NAMES.get(lang):
         return LANG_NAMES[lang] + suffix
     return suffix.strip()
+
+
+NO_NARRATION_NAME_MARKERS = ("no narration", "wordless")  # matched case-insensitively against a
+#                                                              track's name to recognize the "dialog"
+#                                                              method's own narration-free alt track,
+#                                                              under either the default "(Wordless)"
+#                                                              suffix or a project-specific override
+#                                                              (e.g. "(No Narration)" - see
+#                                                              no_narration_batch.py). Name substring
+#                                                              rather than cfg.dialog_track_suffix so
+#                                                              it's recognized regardless of which
+#                                                              config produced it.
+
+
+def is_no_narration_track(t: dict) -> bool:
+    name = (t.get("properties", {}) or {}).get("track_name") or ""
+    nl = name.lower()
+    return any(m in nl for m in NO_NARRATION_NAME_MARKERS)
 
 
 def is_own_output_track(t: dict, cfg: Config) -> bool:
@@ -1851,6 +1875,20 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
     a_lang = chosen_audio["properties"].get("language") or "und"
     a_name = clean_label(chosen_audio, suffix)
 
+    # If the file already carries a "(No Narration)"/"(Wordless)" alt track
+    # and this call isn't itself adding another one (i.e. this is a normal
+    # profanity-cleaning run landing on a file the no-narration batch already
+    # touched), that track stays primary - the new cleaned track is added as
+    # a non-default alt right after it, not as the new default. See
+    # is_no_narration_track/choose_audio.
+    existing_no_narr = [t for t in tracks if t["type"] == "audio" and is_no_narration_track(t)]
+    adding_no_narration_track = any(m in suffix.lower() for m in NO_NARRATION_NAME_MARKERS)
+    keep_no_narration_primary = bool(audio_default and existing_no_narr and not adding_no_narration_track)
+    if keep_no_narration_primary:
+        print(f'  [note] existing No Narration/Wordless track (id {existing_no_narr[0]["id"]}) '
+              f'kept primary - new "{a_name}" track added as alt, not default')
+        audio_default = False
+
     args = [mkvmerge, "-o", str(out_mkv)]
     if audio_default:                                   # clear default on the track(s) it replaces
         for t in tracks:
@@ -1908,7 +1946,14 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
         print(f'  new subtitle track: "{e_name}"  [{e_lang}]  alt (non-default)')
 
     order = [f"0:{t['id']}" for t in tracks if t["type"] == "video"]
-    order += [audio_ref] + [f"0:{t['id']}" for t in tracks if t["type"] == "audio"]
+    orig_audio = [t for t in tracks if t["type"] == "audio"]
+    if keep_no_narration_primary:
+        no_narr_ids = {t["id"] for t in existing_no_narr}
+        order += [f"0:{t['id']}" for t in orig_audio if t["id"] in no_narr_ids]
+        order += [audio_ref]
+        order += [f"0:{t['id']}" for t in orig_audio if t["id"] not in no_narr_ids]
+    else:
+        order += [audio_ref] + [f"0:{t['id']}" for t in orig_audio]
     if subs_ref:
         order.append(subs_ref)
     if extra_subs_ref:
