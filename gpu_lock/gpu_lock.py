@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import ctypes.wintypes
 import json
 import os
 import subprocess
@@ -47,6 +48,7 @@ POLL_INTERVAL_S = 2.0
 STATUS_EVERY_S = 20.0
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STILL_ACTIVE = 259
 
 
 def _pid_alive(pid: int) -> bool:
@@ -55,8 +57,17 @@ def _pid_alive(pid: int) -> bool:
     handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return False
+    # A successful OpenProcess() alone does NOT mean the process is still
+    # running - Windows can keep the process object (and its PID) openable
+    # for a while after it has exited, e.g. right after a forceful
+    # TerminateProcess/Stop-Process -Force leaves a dangling handle
+    # elsewhere. Confirmed reproducible: OpenProcess() returned a valid
+    # handle for a PID Get-Process could no longer find at all. The actual
+    # liveness signal is the exit code.
+    exit_code = ctypes.wintypes.DWORD()
+    ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
     ctypes.windll.kernel32.CloseHandle(handle)
-    return True
+    return bool(ok) and exit_code.value == STILL_ACTIVE
 
 
 def _read_lock() -> dict | None:
