@@ -654,22 +654,24 @@ def choose_audio(tracks: list, want: str):
     audio = [t for t in tracks if t["type"] == "audio"]
     if not audio:
         raise SystemExit("[error] input has no audio tracks")
+    # Never treat a "(No Narration)"/"(Wordless)" alt track as the thing to
+    # detect profanity in or default to - even if IT'S the one flagged
+    # default in the container, or explicitly requested by index/language
+    # (see no_narration_batch.py) - prefer a real narrated track when one
+    # exists alongside it. Applies to every selection mode, not just
+    # "default": a no-narration track is never a valid cleaning source.
+    narrated = [t for t in audio if not is_no_narration_track(t)]
+    candidates = narrated or audio   # only a file that's ENTIRELY no-narration tracks falls back
     if want == "default":
         # Don't just trust the container's default-track flag - a rip's default
         # is often an arbitrary/compatibility stereo track sitting next to a
         # real 5.1+ track of the same language that never gets touched. Prefer
         # the highest-channel-count track among whatever language the default
-        # pick would have used. Also never treat a "(No Narration)"/"(Wordless)"
-        # alt track as the thing to detect profanity in or default to - even
-        # if IT'S the one flagged default in the container (see
-        # no_narration_batch.py) - prefer a real narrated track when one
-        # exists alongside it.
-        narrated = [t for t in audio if not is_no_narration_track(t)]
-        pool = narrated or audio
-        default_t = next((t for t in pool if t["properties"].get("default_track")), pool[0])
+        # pick would have used.
+        default_t = next((t for t in candidates if t["properties"].get("default_track")), candidates[0])
         lang = (default_t["properties"].get("language") or "").lower()
-        same_lang = [t for t in pool
-                     if (t["properties"].get("language") or "").lower() == lang] if lang else pool
+        same_lang = [t for t in candidates
+                     if (t["properties"].get("language") or "").lower() == lang] if lang else candidates
         t = max(same_lang, key=lambda x: x["properties"].get("audio_channels") or 0)
         if (t["properties"].get("audio_channels") or 0) > (default_t["properties"].get("audio_channels") or 0):
             print(f"  [note] source_track=default: using the "
@@ -677,7 +679,7 @@ def choose_audio(tracks: list, want: str):
                   f"{default_t['properties'].get('audio_channels')}ch one flagged default (id {default_t['id']}) "
                   f"- preferring higher channel count")
     else:
-        t = _pick(audio, want, "audio")
+        t = _pick(candidates, want, "audio")
     return t, audio.index(t)
 
 
@@ -941,13 +943,26 @@ def is_no_narration_track(t: dict) -> bool:
 
 def is_own_output_track(t: dict, cfg: Config) -> bool:
     """True for an audio/subtitle track this tool itself added on a PREVIOUS
-    run - its track_name ends with the "(Cleaned)"/"(Wordless)" suffix
-    clean_label() gives new tracks. Used by main() to always re-detect from
-    the true original source on a rerun (never re-clean an already-cleaned
-    track) and to replace, rather than pile up alongside, a stale one - see
-    "Re-running on an already-cleaned file" in AGENTS.md."""
+    run of THIS SAME method - its track_name ends with the suffix
+    clean_label() gives new tracks for cfg.method ("(Cleaned)" for mute/
+    bleed/cut, "(No Narration)"/"(Wordless)" for dialog). Used by main() to
+    always re-detect from the true original source on a rerun (never
+    re-clean an already-cleaned track) and to replace, rather than pile up
+    alongside, a stale one - see "Re-running on an already-cleaned file" in
+    AGENTS.md.
+
+    Only the audio suffix that matches cfg.method is checked - a mute/bleed
+    run must never treat an existing "(No Narration)" track (built by a
+    SEPARATE dialog run, e.g. the no-narration sweep) as its own stale output:
+    that used to make stale_ids/exclude_audio_ids drop the no-narration track
+    from the rebuilt file entirely. It's a different track type, produced by
+    a different method - left alone here, and never chosen as cleaning
+    source either (see choose_audio's is_no_narration_track exclusion). The
+    subtitle suffixes stay method-independent - opensubtitles/sidecar
+    passthrough tracks aren't tied to which audio method is active."""
     name = t.get("properties", {}).get("track_name") or ""
-    return (name.endswith(cfg.track_name_suffix) or name.endswith(cfg.dialog_track_suffix)
+    audio_suffix = cfg.dialog_track_suffix if cfg.method == "dialog" else cfg.track_name_suffix
+    return (name.endswith(audio_suffix)
             or name.endswith(OPENSUBS_TRACK_SUFFIX) or name.endswith(SIDECAR_TRACK_SUFFIX))
 
 
@@ -2091,16 +2106,30 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
     # If the file already carries a "(No Narration)"/"(Wordless)" alt track
     # and this call isn't itself adding another one (i.e. this is a normal
     # profanity-cleaning run landing on a file the no-narration batch already
-    # touched), that track stays primary - the new cleaned track is added as
-    # a non-default alt right after it, not as the new default. See
-    # is_no_narration_track/choose_audio.
+    # touched), its CURRENT disposition decides where the new cleaned track
+    # lands - never chosen as the cleaning source either way (see
+    # is_no_narration_track/choose_audio):
+    #   - already the default (container) track -> stays default/first; the
+    #     new cleaned track is added right after it as a non-default alt.
+    #   - not the default (some other track, usually the original mix, is)
+    #     -> the new cleaned track BECOMES the default/first audio track
+    #     instead, with the no-narration track staying right after it -
+    #     "cleaned, no narration, original, others".
     existing_no_narr = [t for t in tracks if t["type"] == "audio" and is_no_narration_track(t)]
     adding_no_narration_track = any(m in suffix.lower() for m in NO_NARRATION_NAME_MARKERS)
-    keep_no_narration_primary = bool(audio_default and existing_no_narr and not adding_no_narration_track)
+    no_narr_is_default = bool(existing_no_narr and existing_no_narr[0]["properties"].get("default_track"))
+    keep_no_narration_primary = bool(
+        audio_default and existing_no_narr and not adding_no_narration_track and no_narr_is_default)
+    no_narr_becomes_second = bool(
+        audio_default and existing_no_narr and not adding_no_narration_track and not no_narr_is_default)
     if keep_no_narration_primary:
         print(f'  [note] existing No Narration/Wordless track (id {existing_no_narr[0]["id"]}) '
               f'kept primary - new "{a_name}" track added as alt, not default')
         audio_default = False
+    elif no_narr_becomes_second:
+        print(f'  [note] existing No Narration/Wordless track (id {existing_no_narr[0]["id"]}) '
+              f'was not the container default - new "{a_name}" track becomes the new default, '
+              f'No Narration moved to second')
 
     args = [mkvmerge, "-o", str(out_mkv)]
     if audio_default:                                   # clear default on the track(s) it replaces
@@ -2164,6 +2193,11 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
         no_narr_ids = {t["id"] for t in existing_no_narr}
         order += [f"0:{t['id']}" for t in orig_audio if t["id"] in no_narr_ids]
         order += [audio_ref]
+        order += [f"0:{t['id']}" for t in orig_audio if t["id"] not in no_narr_ids]
+    elif no_narr_becomes_second:
+        no_narr_ids = {t["id"] for t in existing_no_narr}
+        order += [audio_ref]
+        order += [f"0:{t['id']}" for t in orig_audio if t["id"] in no_narr_ids]
         order += [f"0:{t['id']}" for t in orig_audio if t["id"] not in no_narr_ids]
     else:
         order += [audio_ref] + [f"0:{t['id']}" for t in orig_audio]
