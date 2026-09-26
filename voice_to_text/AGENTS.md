@@ -112,26 +112,37 @@ then re-validated against the full 67.
 vs. 33/67 (49%) baseline - a real +9 case (+13 point) improvement from a
 pure config change, no added pipeline step, no added compute cost.
 
-**Vocal isolation was NOT wired in as a default**, despite the real
-measured gain, because the cost is wildly disproportionate to the benefit:
-isolating vocals for a whole feature film's audio track costs roughly the
-same as `clean.py`'s own whole-track stemming pass (which was measured
-taking ~80-90 minutes for a real 2+ hour 5.1 film in this same session) -
-turning a ~10 minute transcription step into potentially the better part
-of two hours, for +6 points of recall ON TOP of the free VAD fix, on
-material that `srt_backfill`/PGS-OCR/VobSub-OCR backfill already catches a
-meaningful share of anyway from a real subtitle track when one exists. If
-this ever becomes worth revisiting (e.g. a much cheaper streaming
-vocal-isolation model appears, or the miss rate on VAD-relaxed alone proves
-too high in practice), the shape of it is: run the ORIGINAL audio through
-`profanity_filter`'s `.venv-stem` audio-separator with `--single_stem
-Vocals` (not `Instrumental`) before handing the result to `transcribe_file`,
-matching the pattern already validated in `_run_separator`/
-`build_instrumental_stem` in `clean.py` (including holding `gpu_lock` for
-the duration - a real concurrent job on this machine was crashed once this
-session by an unrelated wildcard cleanup interfering with its temp dir, not
-by lock contention itself, which behaved correctly throughout this testing
-even under heavy simultaneous GPU load from another process).
+**Vocal isolation was NOT wired in as a library-wide default**, despite the
+real measured gain, because the cost is wildly disproportionate to the
+benefit there: isolating vocals for a whole feature film's audio track costs
+roughly the same as `clean.py`'s own whole-track stemming pass (which was
+measured taking ~80-90 minutes for a real 2+ hour 5.1 film in this same
+session) - turning a ~10 minute transcription step into potentially the
+better part of two hours, for +6 points of recall ON TOP of the free VAD fix,
+on material that `srt_backfill`/PGS-OCR/VobSub-OCR backfill already catches a
+meaningful share of anyway from a real subtitle track when one exists.
+
+**2026-09-26: wired in, but scoped to exactly the bucket where it's worth
+the cost** - `profanity_filter/clean.py`'s `Config.stem_retranscribe`
+(default on). Not a library-wide change: it only fires when the ENTIRE
+subtitle-discovery chain (embedded/sidecar/PGS/VobSub/OpenSubtitles) already
+came up with nothing, i.e. exactly the "no usable subtitle" bucket this
+section flagged as the right scope for a future call - a file with zero
+other detection safety net is the one case where paying ~80-90 minutes for
+a second transcription pass is worth it even at low individual-case yield.
+Shape matches what was sketched here: `build_vocals_stem` runs the chosen
+audio track through `profanity_filter`'s `.venv-stem` audio-separator with
+`--single_stem Vocals` (not `Instrumental`), matching the pattern already
+validated in `_run_separator`/`build_instrumental_stem` (including holding
+`gpu_lock` for the duration - a real concurrent job on this machine was
+crashed once this session by an unrelated wildcard cleanup interfering with
+its temp dir, not by lock contention itself, which behaved correctly
+throughout this testing even under heavy simultaneous GPU load from another
+process); `ensure_vocals_transcript` then runs that isolated track through
+this same `transcribe.py` into its own cached `"<name>.vocals.json"` sibling,
+and `_dedupe_vocals_hits` merges in only what it catches that the original
+transcript missed entirely (same-word hit within `stem_retranscribe_min_gain_s`
+seconds counts as already-found, not new).
 
 **A separate, real finding this surfaced, NOT fixable via settings**: on
 several residual misses (e.g. `I, Robot (2004)`, "kiss my ass, metal

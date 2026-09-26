@@ -20,6 +20,18 @@ End-to-end from a single media file:
                  trusted either - both are realigned to the transcript's own
                  word timings via flag_language.resync_units_to_transcript
                  before use. See AGENTS.md.
+
+                 If EVERY method above comes up empty (see
+                 Config.stem_retranscribe), the transcript from step 1 is the
+                 only safety net left, so it's worth paying for a second,
+                 better-odds attempt at it: the chosen audio track's vocals
+                 are isolated with the stemmer (build_vocals_stem, the
+                 "Vocals" stem rather than mute_fill's "Instrumental") and
+                 re-transcribed into "<name>.vocals.json"
+                 (ensure_vocals_transcript); anything that transcript catches
+                 and the original one missed entirely is merged in
+                 (scan_vocals_transcript / _dedupe_vocals_hits). No-ops with
+                 a warning when no stemmer is installed.
   4. remove      ffmpeg pulls ONE audio track out and removes each flagged span:
        method "mute"  (default) - silence. If the track has more than two
                  channels, the center channel's real content is checked first
@@ -298,6 +310,25 @@ class Config:
     opensubtitles_query: str = ""      # override the title auto-guessed from the filename
     opensubtitles_id: str = ""         # exact OpenSubtitles file_id to download - bypasses search
 
+    stem_retranscribe: bool = True     # absolute last resort, tried only when the ENTIRE subtitle-
+    #                                    discovery chain above (embedded/sidecar/PGS/VobSub/
+    #                                    OpenSubtitles) came up with nothing at all - meaning the
+    #                                    transcript is the only detection safety net this file has.
+    #                                    Isolates vocals out of the chosen audio track (the stemmer's
+    #                                    "Vocals" stem, not "Instrumental" - see build_vocals_stem)
+    #                                    and re-transcribes just that, cached as "<name>.vocals.json"
+    #                                    next to the input. Measured (voice_to_text/AGENTS.md,
+    #                                    "Reducing the Whisper miss rate") to recover real misses -
+    #                                    dialogue masked by music/effects that Whisper never decodes
+    #                                    from the original mixed track at all - worth the extra
+    #                                    transcription pass specifically here, where any independent
+    #                                    catch matters most, even though it's too costly to run as a
+    #                                    library-wide default. No-ops (with a warning) when no
+    #                                    stemmer is installed - see locate_stem_tool().
+    stem_retranscribe_min_gain_s: float = 1.0  # a vocals-stem hit within this many seconds of an
+    #                                    already-found hit (same word) is treated as the same
+    #                                    occurrence, not a new catch - see _dedupe_vocals_hits()
+
     output_dir: str = "out"             # scratch dir for temp files + --keep-temp debug artifacts only -
     #                                    the cleaned result itself replaces the source in place (see
     #                                    send_to_recycle_bin); this is NOT where it ends up
@@ -507,8 +538,28 @@ def load_extra_spans(path: Path) -> list[dict]:
     return hits
 
 
+def _dedupe_vocals_hits(primary_hits: list[dict], vocals_hits: list[dict],
+                        window: float) -> list[dict]:
+    """Keep only vocals-stem hits (see scan_vocals_transcript) that don't
+    already have a same-word hit in `primary_hits` within `window` seconds -
+    the point of the vocals-stem rescan is to catch words the ORIGINAL
+    (mixed-audio) transcript - and any srt backfill already merged into
+    `primary_hits` - missed entirely, not to duplicate what's already
+    found."""
+    kept = []
+    for vh in vocals_hits:
+        vt = vh["time"]
+        if vt is None:
+            continue
+        dup = any(ph["time"] is not None and abs(ph["time"] - vt) <= window
+                  and ph["match"].lower() == vh["match"].lower() for ph in primary_hits)
+        if not dup:
+            kept.append(vh)
+    return kept
+
+
 def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = None,
-               extra_hits: list[dict] | None = None):
+               extra_hits: list[dict] | None = None, vocals_hits: list[dict] | None = None):
     if str(HERE) not in sys.path:
         sys.path.insert(0, str(HERE))
     import flag_language
@@ -527,6 +578,15 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
                       f"({n_before} -> {len(hits)})")
         except Exception as exc:
             print(f"  [warn] srt backfill failed ({exc!r})", file=sys.stderr)
+
+    if vocals_hits:
+        new_from_vocals = _dedupe_vocals_hits(hits, vocals_hits, cfg.stem_retranscribe_min_gain_s)
+        if new_from_vocals:
+            hits = hits + new_from_vocals
+            print(f"  vocals-stem rescan: +{len(new_from_vocals)} word(s) the original transcript "
+                  f"missed entirely (isolated-vocals re-transcription)")
+        else:
+            print("  vocals-stem rescan: found nothing the original transcript hadn't already caught")
 
     extra_hits = extra_hits or []
     if extra_hits:
@@ -1317,12 +1377,14 @@ STEM_RETRY_ATTEMPTS = 3    # a movie with many flagged spans makes hundreds of t
 STEM_RETRY_DELAY_S = 5.0  # calls in a row; a rare transient one shouldn't sink the whole run
 
 
-def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config) -> Path:
-    """Run the stemmer on a (fake-)stereo wav, asking for only the
-    Instrumental stem (--single_stem), and return its output path. Holds the
-    shared GPU lock (../gpu_lock, if present) for the duration -
-    audio-separator uses CUDA the same as anything else that might be
-    sharing the GPU, and running it with no coordination can crash outright
+def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config,
+                   stem: str = "Instrumental") -> Path:
+    """Run the stemmer on a (fake-)stereo wav, asking for only the named
+    `stem` (--single_stem - "Instrumental" for mute_fill/dialog removal,
+    "Vocals" for build_vocals_stem's re-transcription use), and return its
+    output path. Holds the shared GPU lock (../gpu_lock, if present) for the
+    duration - audio-separator uses CUDA the same as anything else that might
+    be sharing the GPU, and running it with no coordination can crash outright
     under contention (a real access-violation crash was hit this way), not
     just run slowly.
 
@@ -1346,7 +1408,7 @@ def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config) -> 
             with gpu_ctx:
                 run([stem_tool, str(wav_in), "-m", cfg.stem_model,
                      "--output_dir", str(out_dir), "--output_format", "WAV",
-                     "--single_stem", "Instrumental"])
+                     "--single_stem", stem])
             break
         except subprocess.CalledProcessError:
             if attempt == STEM_RETRY_ATTEMPTS:
@@ -1355,9 +1417,9 @@ def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config) -> 
                   f"{STEM_RETRY_ATTEMPTS}) - retrying in {STEM_RETRY_DELAY_S:.0f}s",
                   file=sys.stderr)
             time.sleep(STEM_RETRY_DELAY_S)
-    matches = sorted(out_dir.glob("*Instrumental*.wav"))
+    matches = sorted(out_dir.glob(f"*{stem}*.wav"))
     if not matches:
-        raise SystemExit(f"[error] stemmer produced no Instrumental output in {out_dir} - "
+        raise SystemExit(f"[error] stemmer produced no {stem} output in {out_dir} - "
                          f"check that model {cfg.stem_model!r} labels its stems Vocals/Instrumental")
     return matches[0]
 
@@ -1427,6 +1489,69 @@ def build_instrumental_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos:
     run([ffmpeg, "-hide_banner", "-y", *inputs,
          "-filter_complex", graph, "-map", "[out]", "-ar", str(sample_rate), str(merged)])
     return merged
+
+
+def build_vocals_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos: int, tmp: Path,
+                      cfg: Config) -> Path:
+    """A vocals-only wav of the chosen audio track, for feeding a SECOND
+    transcription pass (see Config.stem_retranscribe) - not for final output;
+    that's build_instrumental_stem/mute_track's job. Unlike that function,
+    channel count doesn't matter here (transcription downmixes to mono 16kHz
+    internally regardless), so this always just downmixes straight to plain
+    stereo before stemming - one separator call, not one per channel.
+
+    Measured (voice_to_text/AGENTS.md, "Reducing the Whisper miss rate") to
+    recover real dialogue that Whisper never decodes at all from the original
+    mixed track - masked by music/effects loud enough to fail VAD - which is
+    exactly the class of miss worth paying for specifically when a file has
+    no subtitle safety net left at all (Config.stem_retranscribe's only
+    trigger)."""
+    src_wav = tmp / "vocals_src.wav"
+    run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
+         "-map", f"0:a:{audio_pos}", "-ac", "2", str(src_wav)])
+    return _run_separator(stem_tool, src_wav, tmp / "vocals_out", cfg, stem="Vocals")
+
+
+def ensure_vocals_transcript(media: Path, vocals_wav: Path, tmp: Path, cfg: Config) -> Path:
+    """Transcribe `vocals_wav` (see build_vocals_stem) into its own sibling
+    "<name>.vocals.json" - cached like the PGS/VobSub OCR outputs, so a rerun
+    on the same file doesn't re-stem/re-transcribe unless --retranscribe.
+    Mirrors ensure_transcript() but writes to a different name (never
+    overwrites the primary "<name>.json") and via a staged copy, since
+    Voice_to_Text names its output after ITS input's stem, not the original
+    media's."""
+    js = media.with_name(f"{media.stem}.vocals.json")
+    if js.is_file() and not cfg.retranscribe:
+        print(f"  transcript (vocals stem): {js.name} (reusing)")
+        return js
+    py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
+    script = VOICE_TO_TEXT / "transcribe.py"
+    if not py.is_file() or not script.is_file():
+        raise SystemExit(f"[error] no '{js.name}' next to the input and "
+                         f"Voice_to_Text not found at {VOICE_TO_TEXT}")
+    staged = tmp / f"{media.stem}.wav"
+    shutil.copy2(vocals_wav, staged)
+    print(f"  transcript (vocals stem): running Voice_to_Text on the isolated vocal track...")
+    run([str(py), "-X", "utf8", str(script), str(staged),
+         "--formats", "json", "--no-diarize", "--output-dir", str(tmp)], cwd=str(VOICE_TO_TEXT))
+    produced = tmp / f"{media.stem}.json"
+    if not produced.is_file():
+        raise SystemExit("[error] vocals-stem transcription produced no .json")
+    shutil.copy2(produced, js)
+    return js
+
+
+def scan_vocals_transcript(js: Path, matchers: dict) -> list[dict]:
+    """Same wordlist scan ensure_transcript's own .json gets (flag_language.
+    scan_file), tagged "vocals-stem" so callers can tell these hits apart
+    from the primary transcript's own - see _dedupe_vocals_hits()."""
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import flag_language
+    hits, _fmt = flag_language.scan_file(js, matchers)
+    for h in hits:
+        h["source"] = "vocals-stem"
+    return hits
 
 
 # subtitle codec IDs (mkvmerge's -J naming) that carry exact per-cue start/end
@@ -2068,6 +2193,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="override the OpenSubtitles search title auto-guessed from the filename")
     p.add_argument("--opensubtitles-id", dest="opensubtitles_id",
                    help="exact OpenSubtitles file_id to download - bypasses search entirely")
+    p.add_argument("--no-stem-retranscribe", dest="stem_retranscribe", action="store_false",
+                   default=None,
+                   help="don't isolate vocals and re-transcribe as an absolute last resort when "
+                        "the entire subtitle-discovery chain above found nothing at all (needs the "
+                        "stemmer - see README)")
     p.add_argument("--output-dir", dest="output_dir",
                    help="scratch dir for temp files + --keep-temp debug artifacts (default 'out') - "
                         "the cleaned result itself replaces the source file in place, it is never "
@@ -2114,8 +2244,8 @@ def main(argv: list[str] | None = None) -> int:
                  "clean_bitrate_surround", "cut_bitrate", "source_track",
                  "sync_ms", "subs_track", "srt_backfill", "sidecar_subs", "sidecar_lang",
                  "pgs_ocr", "pgs_ocr_lang", "vobsub_ocr", "vobsub_ocr_lang", "opensubtitles",
-                 "opensubtitles_lang", "opensubtitles_query", "opensubtitles_id", "output_dir",
-                 "retranscribe", "overwrite"]:
+                 "opensubtitles_lang", "opensubtitles_query", "opensubtitles_id",
+                 "stem_retranscribe", "output_dir", "retranscribe", "overwrite"]:
         val = getattr(args, name, None)
         if val is not None:
             setattr(cfg, name, val)
@@ -2360,6 +2490,7 @@ def main(argv: list[str] | None = None) -> int:
                     subs_tid = None
                     resynced_extra_srt = (synced_path, {"language": lang3, "track_name": os_name})
 
+        vocals_hits = None
         if subs_enabled and chosen_subs is None:
             print("  subtitles: no usable text subtitle track to clean - skipping")
             print("  [warn] no text subtitle available to cross-check the transcript against - "
@@ -2368,6 +2499,19 @@ def main(argv: list[str] | None = None) -> int:
                   "muting/bleeping still covers everything the transcript did catch). If you can "
                   "find a subtitle for this movie elsewhere, it can be used to backfill "
                   "and re-run the missed spots.")
+
+            if cfg.stem_retranscribe:
+                if stem_tool is None:
+                    print("  [warn] no stemmer installed - can't isolate vocals for a second "
+                          "transcription pass on this file with no other safety net (see README "
+                          "for one-time stemmer setup)", file=sys.stderr)
+                else:
+                    print("  subtitles: every method above came up empty - isolating vocals from "
+                          "the audio and re-transcribing, to give word detection its best possible "
+                          "chance on a file with no other safety net")
+                    vocals_wav = build_vocals_stem(ffmpeg, stem_tool, media, audio_pos, tmp, cfg)
+                    vocals_js = ensure_vocals_transcript(media, vocals_wav, tmp, cfg)
+                    vocals_hits = scan_vocals_transcript(vocals_js, matchers)
 
         if cfg.method == "dialog":
             print("  method: dialog removal - stripping ALL dialogue (not just flagged words) "
@@ -2381,7 +2525,7 @@ def main(argv: list[str] | None = None) -> int:
             clean_srt = None
         else:
             extra_hits = load_extra_spans(args.extra_spans) if args.extra_spans else None
-            spans, all_hits = find_spans(js, cfg, matchers, raw_srt, extra_hits)
+            spans, all_hits = find_spans(js, cfg, matchers, raw_srt, extra_hits, vocals_hits)
             total = sum(e - s for s, e, _ in spans)
             print(f"  flagged: {len(all_hits)} hit(s) -> {len(spans)} span(s) to {cfg.method}, {total:.1f}s")
             for s, e, hs in spans:
@@ -2419,6 +2563,8 @@ def main(argv: list[str] | None = None) -> int:
                         "hits": len(all_hits),
                         "hits_from_srt_backfill": sum(
                             1 for h in all_hits if h.get("source") == "srt-backfill"),
+                        "hits_from_vocals_stem": sum(
+                            1 for h in all_hits if h.get("source") == "vocals-stem"),
                         "spans": [],
                     }, indent=2), encoding="utf-8")
                     print(f"  nothing flagged - wrote empty {report.name} (--record-clean)")
@@ -2506,6 +2652,7 @@ def main(argv: list[str] | None = None) -> int:
                 "pad_end": cfg.pad_end if cfg.method != "dialog" else None,
                 "hits": len(all_hits),
                 "hits_from_srt_backfill": sum(1 for h in all_hits if h.get("source") == "srt-backfill"),
+                "hits_from_vocals_stem": sum(1 for h in all_hits if h.get("source") == "vocals-stem"),
                 "subtitles": subs_stats,
                 "lossless_splice": lossless_splice if cfg.method == "cut" else None,
                 "id3_tags": id3_info if cfg.method == "cut" else None,

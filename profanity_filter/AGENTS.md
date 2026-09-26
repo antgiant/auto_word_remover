@@ -471,6 +471,43 @@ meaningless outside its own paired `.sub` anyway.
 the shared venv; nothing extra. `Config.vobsub_ocr` (default on) toggles
 it; `--no-vobsub-ocr`/`--vobsub-ocr-lang` on the CLI.
 
+### Vocals-stem re-transcription (absolute last resort, no usable subtitle at all)
+
+If embedded/sidecar/PGS/VobSub/OpenSubtitles *all* find nothing, the
+transcript from step 1 is this file's ONLY detection safety net - no
+`srt_backfill` cross-check is possible at all. `Config.stem_retranscribe`
+(default on) pays for a second, better-odds attempt specifically in this
+one case: `build_vocals_stem` runs the chosen audio track through the same
+`.venv-stem` audio-separator `build_instrumental_stem`/`mute_track` use, but
+asking for the **Vocals** stem (`--single_stem Vocals`, not `Instrumental`) -
+downmixed to plain stereo first, since transcription downmixes to mono
+16kHz internally regardless, so preserving the source's real channel layout
+(the whole point of `build_instrumental_stem`'s per-channel round trip)
+buys nothing here. `ensure_vocals_transcript` feeds that isolated track
+through `voice_to_text/transcribe.py` again, caching the result as its own
+`"<name>.vocals.json"` sibling (never overwrites the primary `"<name>.json"`)
+so a rerun doesn't re-stem/re-transcribe unless `--retranscribe`.
+`scan_vocals_transcript` scans it with the same wordlists, and
+`_dedupe_vocals_hits` merges in only what it catches that the original
+transcript (plus any srt-backfill hits already merged) missed *entirely* -
+a same-word hit within `stem_retranscribe_min_gain_s` seconds (default 1.0)
+of an existing hit is treated as the same occurrence, not a new catch, so a
+timing wobble between the two independent transcriptions can't double up a
+span.
+
+Why scoped this narrowly rather than shipped as a transcription-wide
+default: see `voice_to_text/AGENTS.md`'s "Reducing the Whisper miss rate" -
+vocal isolation measurably recovers real misses (dialogue masked by music/
+effects that Whisper's VAD never even hands to the decoder) but costs
+roughly as much as `clean.py`'s own whole-track stemming pass (~80-90
+minutes on a real 2+ hour 5.1 film), which isn't worth paying on every file
+when `srt_backfill`/PGS-OCR/VobSub-OCR already catches a meaningful share of
+this same class of miss for free whenever a real subtitle exists. It's
+worth it specifically here, where nothing else is left. No-ops with a
+warning (never a hard failure) when no stemmer is installed - same
+degrade-gracefully posture as `mute_fill = "stems"`/`--method dialog`.
+`--no-stem-retranscribe` on the CLI.
+
 ### Word lists
 
 One entry per line: literal phrase (whole-word, case-insensitive) or

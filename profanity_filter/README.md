@@ -218,6 +218,15 @@ needs, any Python 3.10+ — see the version note above).
    for *this exact cut* any more than a downloaded one is; real timing is
    rebuilt from a text comparison against the transcript instead. See
    AGENTS.md.
+
+   If *none* of the above find a usable subtitle, the transcript is this
+   file's only remaining safety net, so it's worth a second attempt: the
+   audio is run through the [stemmer](#4-stemmer-setup-optional) to isolate
+   just the vocals, and that isolated track is re-transcribed from scratch
+   (cached as `<name>.vocals.json`) — anything it catches that the original
+   transcript missed entirely is added in. Needs the stemmer installed;
+   skipped with a warning (never a hard failure) if it isn't. Disable with
+   `--no-stem-retranscribe`. See AGENTS.md ("Vocals-stem re-transcription").
 3. **Remove** — one `ffmpeg` pass over a single audio track:
    - `--method mute` **(default)** — silence. If the track has more than two
      channels, the center channel's actual content is measured first: when
@@ -311,6 +320,7 @@ needs, any Python 3.10+ — see the version note above).
 | `--opensubtitles-query "title"` | override the search title auto-guessed from the filename |
 | `--opensubtitles-id 12345` | exact OpenSubtitles file_id to download - bypasses search entirely |
 | `--opensubtitles-lang en` | 2-letter language to search/download (default `en`) |
+| `--no-stem-retranscribe` | don't isolate vocals and re-transcribe as an absolute last resort when no subtitle source was found anywhere (needs the stemmer) |
 | `--sync-ms N` | `mute`/`bleep`/`dialog` only: delay the clean track by N ms if lip-sync drifts |
 | `--extra-spans file.json` | hand-reviewed `[{start,end,label,category}]` spans to remove in addition to the wordlists (e.g. content no regex can safely catch) — always included, regardless of `--categories` |
 | `--keep-temp` | also drop the cleaned track + ffmpeg filter graph in `out\` |
