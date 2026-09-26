@@ -474,26 +474,58 @@ it; `--no-vobsub-ocr`/`--vobsub-ocr-lang` on the CLI.
 ### Vocals-stem re-transcription (absolute last resort, no usable subtitle at all)
 
 If embedded/sidecar/PGS/VobSub/OpenSubtitles *all* find nothing, the
-transcript from step 1 is this file's ONLY detection safety net - no
-`srt_backfill` cross-check is possible at all. `Config.stem_retranscribe`
-(default on) pays for a second, better-odds attempt specifically in this
-one case: `build_vocals_stem` runs the chosen audio track through the same
+transcript is this file's ONLY detection safety net - no `srt_backfill`
+cross-check is possible at all. `Config.stem_retranscribe` (default on)
+pays for a second, better-odds attempt specifically in this one case:
+`build_vocals_stem` runs the chosen audio track through the same
 `.venv-stem` audio-separator `build_instrumental_stem`/`mute_track` use, but
-asking for the **Vocals** stem (`--single_stem Vocals`, not `Instrumental`) -
-downmixed to plain stereo first, since transcription downmixes to mono
-16kHz internally regardless, so preserving the source's real channel layout
-(the whole point of `build_instrumental_stem`'s per-channel round trip)
-buys nothing here. `ensure_vocals_transcript` feeds that isolated track
-through `voice_to_text/transcribe.py` again, caching the result as its own
+asking for the **Vocals** stem, not `Instrumental` - downmixed to plain
+stereo first, since transcription downmixes to mono 16kHz internally
+regardless, so preserving the source's real channel layout (the whole point
+of `build_instrumental_stem`'s per-channel round trip) buys nothing here.
+`ensure_vocals_transcript` feeds that isolated track through
+`voice_to_text/transcribe.py` again, caching the result as its own
 `"<name>.vocals.json"` sibling (never overwrites the primary `"<name>.json"`)
 so a rerun doesn't re-stem/re-transcribe unless `--retranscribe`.
-`scan_vocals_transcript` scans it with the same wordlists, and
-`_dedupe_vocals_hits` merges in only what it catches that the original
-transcript (plus any srt-backfill hits already merged) missed *entirely* -
-a same-word hit within `stem_retranscribe_min_gain_s` seconds (default 1.0)
-of an existing hit is treated as the same occurrence, not a new catch, so a
-timing wobble between the two independent transcriptions can't double up a
-span.
+
+**Never transcribes the same audio twice.** `main()`'s primary transcript
+(step 1) is computed lazily via a memoized `get_transcript()` closure,
+deferred until the subtitle-discovery chain either needs it for a resync
+(sidecar/OpenSubtitles) or runs out of methods entirely. That means whether
+the original mix ever gets transcribed AT ALL is decided *before* any STT
+call, purely from what's detectable without one (a track/file/OCR result
+existing, or an OpenSubtitles fetch succeeding):
+- **No candidate found anywhere** (`js` was never forced) - the common
+  case for a file with no subtitle source. The original mix is skipped
+  entirely; the vocals-stem transcript computed here just *becomes* `js` -
+  one Voice_to_Text call total for this file, not two.
+- **A candidate WAS found** (sidecar file existed, or OpenSubtitles had a
+  match) but its resync came up too thin - this already forced one
+  transcription of the original mix to attempt that resync, so a second,
+  real re-transcription pass on the isolated vocals is unavoidable here
+  (there was no way to know the resync would fail before trying it).
+  `scan_vocals_transcript` scans the new transcript with the same
+  wordlists, and `_dedupe_vocals_hits` merges in only what it catches that
+  the first pass (plus any srt-backfill already merged) missed *entirely* -
+  a same-word hit within `stem_retranscribe_min_gain_s` seconds (default
+  1.0) of an existing hit is treated as the same occurrence, not a new
+  catch, so a timing wobble between the two independent transcriptions
+  can't double up a span.
+
+**Also reuses the SAME separator pass for muting, when possible.** On a
+`<=2` channel source track, `build_vocals_stem(..., also_instrumental=True)`
+asks audio-separator for BOTH stems in one invocation (no `--single_stem` -
+see `_invoke_separator`'s docstring for why that's not double the GPU cost:
+the model derives one stem from the other internally regardless of which
+one was requested). The Instrumental half is exactly what `mute_fill =
+"stems"`'s whole-track path (`build_instrumental_stem`) would otherwise
+separately re-stem later - `mute_track`'s `cached_whole_instrumental`
+splices straight from it instead, skipping its own per-span-vs-whole-track
+cost comparison entirely (the whole-track cost is already sunk, so reusing
+it always wins). Only valid for `<=2` channels: a `>2ch` track needs
+`build_instrumental_stem`'s per-channel round trip to preserve its real
+layout, which a stereo downmix can't stand in for - those tracks still
+re-stem separately for muting, no way around it.
 
 Why scoped this narrowly rather than shipped as a transcription-wide
 default: see `voice_to_text/AGENTS.md`'s "Reducing the Whisper miss rate" -

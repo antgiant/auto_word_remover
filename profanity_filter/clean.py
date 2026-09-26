@@ -5,6 +5,13 @@ Profanity_Filter - remove flagged profanity from a media file's audio.
 End-to-end from a single media file:
 
   1. transcript  reuse "<name>.json" next to the input, else run Voice_to_Text
+                 on the ORIGINAL audio - but only once it's actually known to
+                 be needed (see get_transcript() in main()): deferred until
+                 step 3's discovery chain either finds a subtitle to resync
+                 against or runs out of methods, so a file with no subtitle
+                 anywhere is detected BEFORE ever transcribing the original
+                 mix, and goes straight to the vocals-stem transcript below
+                 instead of transcribing twice.
   2. flag        flag_language.py (this folder) finds every hit + timestamp
   3. backfill    a text subtitle track is cross-checked for words the
                  transcript missed entirely; found ones are timed via the
@@ -28,10 +35,19 @@ End-to-end from a single media file:
                  are isolated with the stemmer (build_vocals_stem, the
                  "Vocals" stem rather than mute_fill's "Instrumental") and
                  re-transcribed into "<name>.vocals.json"
-                 (ensure_vocals_transcript); anything that transcript catches
-                 and the original one missed entirely is merged in
-                 (scan_vocals_transcript / _dedupe_vocals_hits). No-ops with
-                 a warning when no stemmer is installed.
+                 (ensure_vocals_transcript). If step 1 never ran at all (no
+                 candidate was found anywhere, so get_transcript() was never
+                 called), this vocals-stem transcript simply BECOMES step 1's
+                 transcript - one Voice_to_Text call total, not two. Only
+                 when a candidate WAS found but failed to resync does this
+                 run as a genuine second pass, merging in whatever it catches
+                 that the first pass missed entirely (scan_vocals_transcript /
+                 _dedupe_vocals_hits). No-ops with a warning when no stemmer
+                 is installed. On a <=2 channel track, the SAME separator
+                 invocation also returns the whole-track Instrumental stem
+                 for free (build_vocals_stem's also_instrumental) - step 4's
+                 mute_fill="stems" reuses it instead of stemming the track
+                 again (see mute_track's cached_whole_instrumental).
   4. remove      ffmpeg pulls ONE audio track out and removes each flagged span:
        method "mute"  (default) - silence. If the track has more than two
                  channels, the center channel's real content is checked first
@@ -1251,7 +1267,7 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
 
 def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, n_ch: int,
                             sample_rate: int, layout_name: str | None, stem_tool: str, cfg: Config,
-                            tmp: Path) -> Path:
+                            tmp: Path, whole_inst: Path | None = None) -> Path:
     """Same precise seek-and-concat splicing as splice_stemmed_spans (never
     the buggy whole-file volume=0:enable='between(...)' filter) - but for
     movies with a lot of flagged spans, where paying a fresh separator
@@ -1259,11 +1275,18 @@ def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: i
     past a certain point: stem the WHOLE track's vocals out ONCE
     (build_instrumental_stem - a fixed cost regardless of span count) and
     slice the flagged spans out of that instead. See _predict_stem_seconds
-    for the time-cost model mute_track() uses to pick between the two."""
+    for the time-cost model mute_track() uses to pick between the two.
+
+    `whole_inst`, when given, is an ALREADY-STEMMED whole-track Instrumental
+    wav to splice from directly instead of stemming the track again - see
+    mute_track's cached_whole_instrumental (reusing the stem already
+    produced for Config.stem_retranscribe's vocals pass on a <=2ch track, via
+    build_vocals_stem's `also_instrumental`)."""
     total_dur = probe_duration(ffprobe, media)
-    print(f"  stemming the whole track once (~{total_dur / 60:.0f} min, {n_ch}ch)...")
-    whole_inst = build_instrumental_stem(ffmpeg, stem_tool, media, audio_pos, n_ch, sample_rate,
-                                         tmp, cfg, layout_name)
+    if whole_inst is None:
+        print(f"  stemming the whole track once (~{total_dur / 60:.0f} min, {n_ch}ch)...")
+        whole_inst = build_instrumental_stem(ffmpeg, stem_tool, media, audio_pos, n_ch, sample_rate,
+                                             tmp, cfg, layout_name)
 
     seg_dir = tmp / "splice_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
@@ -1318,7 +1341,8 @@ def _predict_stem_seconds(n_ch: int, spans, total_dur: float) -> tuple[float, fl
 
 
 def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cfg: Config,
-              chosen: dict, tmp: Path, stem_tool: str | None = None) -> tuple[Path, bool]:
+              chosen: dict, tmp: Path, stem_tool: str | None = None,
+              cached_whole_instrumental: Path | None = None) -> tuple[Path, bool]:
     """Never leaves dead air and never mutes a channel that doesn't need it:
     every flagged span gets vocals stemmed out of EVERY channel for just that
     short clip (ambient noise/music keeps playing, exactly like the
@@ -1329,12 +1353,28 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
     silence when evaluated across a long file, discovered on a real 5.1
     movie track. Returns (path, False) - the bool is a holdover
     for the report's used_center_channel_trick field, permanently False now
-    that mute never does the center-only trick."""
+    that mute never does the center-only trick.
+
+    `cached_whole_instrumental`: an already-stemmed whole-track Instrumental
+    wav to splice straight from - see main()'s cached_instrumental, produced
+    "for free" alongside a Config.stem_retranscribe vocals pass on a <=2ch
+    track (build_vocals_stem's `also_instrumental`). When set, this always
+    wins over the normal per-span-vs-whole-track cost comparison below: the
+    whole-track cost is already sunk, so splicing from it is now strictly
+    cheaper than either option that cost model was ever choosing between."""
     props = chosen["properties"]
     n_ch = int(props.get("audio_channels") or 2)
     sr = int(props.get("audio_sampling_frequency") or 48000)
 
     if cfg.mute_fill == "stems":
+        if cached_whole_instrumental is not None:
+            print("  fill: reusing the whole-track instrumental stem already produced for the "
+                  "vocals-stem re-transcription pass (Config.stem_retranscribe) - no need to stem "
+                  "the track a second time")
+            spliced = splice_whole_track_stem(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
+                                              None, stem_tool, cfg, tmp,
+                                              whole_inst=cached_whole_instrumental)
+            return _encode_track_from_wav(ffmpeg, spliced, n_ch, cfg, tmp), False
         if stem_tool is not None:
             layout_name = None
             if n_ch > 2:
@@ -1377,14 +1417,20 @@ STEM_RETRY_ATTEMPTS = 3    # a movie with many flagged spans makes hundreds of t
 STEM_RETRY_DELAY_S = 5.0  # calls in a row; a rare transient one shouldn't sink the whole run
 
 
-def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config,
-                   stem: str = "Instrumental") -> Path:
-    """Run the stemmer on a (fake-)stereo wav, asking for only the named
-    `stem` (--single_stem - "Instrumental" for mute_fill/dialog removal,
-    "Vocals" for build_vocals_stem's re-transcription use), and return its
-    output path. Holds the shared GPU lock (../gpu_lock, if present) for the
-    duration - audio-separator uses CUDA the same as anything else that might
-    be sharing the GPU, and running it with no coordination can crash outright
+def _invoke_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config,
+                      single_stem: str | None) -> None:
+    """Run audio-separator on a (fake-)stereo wav, writing into `out_dir`.
+    `single_stem` ("Instrumental"/"Vocals") asks for just that one output;
+    None omits --single_stem entirely so BOTH stems get written from the
+    SAME inference pass - the model estimates one and derives the other by
+    subtraction internally regardless of what's asked for, so this costs no
+    more GPU time than requesting a single stem. See _run_separator /
+    _run_separator_pair for the two shapes callers actually want, and
+    build_vocals_stem's `also_instrumental` for why getting both matters.
+
+    Holds the shared GPU lock (../gpu_lock, if present) for the duration -
+    audio-separator uses CUDA the same as anything else that might be
+    sharing the GPU, and running it with no coordination can crash outright
     under contention (a real access-violation crash was hit this way), not
     just run slowly.
 
@@ -1401,15 +1447,17 @@ def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config,
     except ImportError:
         gpu_lock = None
     out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [stem_tool, str(wav_in), "-m", cfg.stem_model,
+           "--output_dir", str(out_dir), "--output_format", "WAV"]
+    if single_stem is not None:
+        cmd += ["--single_stem", single_stem]
     for attempt in range(1, STEM_RETRY_ATTEMPTS + 1):
         try:
             gpu_ctx = (gpu_lock.hold("Profanity_Filter", f"stemming {wav_in.name}")
                       if gpu_lock else contextlib.nullcontext())
             with gpu_ctx:
-                run([stem_tool, str(wav_in), "-m", cfg.stem_model,
-                     "--output_dir", str(out_dir), "--output_format", "WAV",
-                     "--single_stem", stem])
-            break
+                run(cmd)
+            return
         except subprocess.CalledProcessError:
             if attempt == STEM_RETRY_ATTEMPTS:
                 raise
@@ -1417,11 +1465,33 @@ def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config,
                   f"{STEM_RETRY_ATTEMPTS}) - retrying in {STEM_RETRY_DELAY_S:.0f}s",
                   file=sys.stderr)
             time.sleep(STEM_RETRY_DELAY_S)
+
+
+def _find_stem_output(out_dir: Path, stem: str, cfg: Config) -> Path:
     matches = sorted(out_dir.glob(f"*{stem}*.wav"))
     if not matches:
         raise SystemExit(f"[error] stemmer produced no {stem} output in {out_dir} - "
                          f"check that model {cfg.stem_model!r} labels its stems Vocals/Instrumental")
     return matches[0]
+
+
+def _run_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config,
+                   stem: str = "Instrumental") -> Path:
+    """Run the stemmer on a (fake-)stereo wav, asking for only the named
+    `stem` ("Instrumental" for mute_fill/dialog removal, "Vocals" for
+    build_vocals_stem's re-transcription use), and return its output path."""
+    _invoke_separator(stem_tool, wav_in, out_dir, cfg, single_stem=stem)
+    return _find_stem_output(out_dir, stem, cfg)
+
+
+def _run_separator_pair(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config) -> tuple[Path, Path]:
+    """Like _run_separator, but returns BOTH the Vocals and Instrumental
+    stems from a single invocation - see _invoke_separator's docstring for
+    why that's not twice the GPU cost of asking for one. Used when a caller
+    needs both from the same source audio (build_vocals_stem's
+    `also_instrumental`) instead of paying for two separate separator runs."""
+    _invoke_separator(stem_tool, wav_in, out_dir, cfg, single_stem=None)
+    return _find_stem_output(out_dir, "Vocals", cfg), _find_stem_output(out_dir, "Instrumental", cfg)
 
 
 def _mono_to_fake_stereo(ffmpeg: str, mono_wav: Path, out_wav: Path) -> None:
@@ -1492,13 +1562,28 @@ def build_instrumental_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos:
 
 
 def build_vocals_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos: int, tmp: Path,
-                      cfg: Config) -> Path:
+                      cfg: Config, also_instrumental: bool = False) -> tuple[Path, Path | None]:
     """A vocals-only wav of the chosen audio track, for feeding a SECOND
-    transcription pass (see Config.stem_retranscribe) - not for final output;
-    that's build_instrumental_stem/mute_track's job. Unlike that function,
-    channel count doesn't matter here (transcription downmixes to mono 16kHz
-    internally regardless), so this always just downmixes straight to plain
-    stereo before stemming - one separator call, not one per channel.
+    transcription pass (see Config.stem_retranscribe) - not for final output
+    on its own; that's normally build_instrumental_stem/mute_track's job.
+    Channel count doesn't matter for the vocals half (transcription
+    downmixes to mono 16kHz internally regardless), so this always downmixes
+    straight to plain stereo before stemming - one separator call, not one
+    per channel.
+
+    `also_instrumental=True` gets the whole-track Instrumental stem back too
+    (second element), from the very SAME separator invocation - no extra GPU
+    cost, see _run_separator_pair. Only pass this when the source track
+    itself has <=2 channels: that's the only case where this stereo downmix
+    IS exactly what mute_track's own whole-track stemming
+    (build_instrumental_stem) would otherwise separately produce, so a file
+    that already had to pay for vocal isolation to get a transcript (no
+    subtitle safety net at all) can reuse this SAME pass for muting too
+    instead of stemming the whole track twice - see main()'s
+    cached_instrumental / mute_track's cached_whole_instrumental. For a >2ch
+    track, a stereo downmix can't stand in for a real per-channel surround
+    stem, so leave this False and mute_track will stem it separately as
+    before.
 
     Measured (voice_to_text/AGENTS.md, "Reducing the Whisper miss rate") to
     recover real dialogue that Whisper never decodes at all from the original
@@ -1509,7 +1594,10 @@ def build_vocals_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos: int, 
     src_wav = tmp / "vocals_src.wav"
     run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
          "-map", f"0:a:{audio_pos}", "-ac", "2", str(src_wav)])
-    return _run_separator(stem_tool, src_wav, tmp / "vocals_out", cfg, stem="Vocals")
+    out_dir = tmp / "vocals_out"
+    if also_instrumental:
+        return _run_separator_pair(stem_tool, src_wav, out_dir, cfg)
+    return _run_separator(stem_tool, src_wav, out_dir, cfg, stem="Vocals"), None
 
 
 def ensure_vocals_transcript(media: Path, vocals_wav: Path, tmp: Path, cfg: Config) -> Path:
@@ -2295,7 +2383,20 @@ def main(argv: list[str] | None = None) -> int:
     matchers, js = {}, None
     if cfg.method != "dialog":                    # 'dialog' strips ALL dialogue - no wordlists needed
         matchers = load_matchers(cfg)
-        js = ensure_transcript(media, cfg)
+
+    def get_transcript() -> Path:
+        """Lazily transcribes the ORIGINAL (mixed) audio, memoized - deferred
+        until something below actually needs it (a sidecar/OpenSubtitles
+        resync, or confirming a subtitle was found after all) so a file with
+        no subtitle candidate anywhere never pays for this AND a second,
+        vocals-stem transcription (see Config.stem_retranscribe below): if
+        nothing below ever calls this, `js` staying None is exactly the
+        signal used to skip straight to stemming instead of transcribing
+        twice."""
+        nonlocal js
+        if js is None:
+            js = ensure_transcript(media, cfg)
+        return js
 
     tracks_all = run_json([mkvmerge, "-J", str(media)])["tracks"]
     stale_ids = {t["id"] for t in tracks_all
@@ -2368,7 +2469,7 @@ def main(argv: list[str] | None = None) -> int:
                       f"this exact file, so it's resynced to the transcript instead of used as-is)")
                 raw_for_resync = stage_sidecar_srt(ffmpeg, sidecar_path, tmp)
                 synced_path = media.with_name(f"{media.stem}.{lang3}.sidecar.srt")
-                result = resync_external_srt(raw_for_resync, js, lang3, SIDECAR_TRACK_SUFFIX,
+                result = resync_external_srt(raw_for_resync, get_transcript(), lang3, SIDECAR_TRACK_SUFFIX,
                                              synced_path, f"sidecar ({sidecar_path.name})")
                 if result is not None:
                     synced_path, sc_name = result
@@ -2480,7 +2581,7 @@ def main(argv: list[str] | None = None) -> int:
                 lang3 = opensubtitles.LANG_2TO3.get(lang2, "und")
                 synced_path = media.with_name(f"{media.stem}.{lang2}.opensubtitles.srt")
                 label = f"OpenSubtitles ({os_meta.get('release') or os_meta.get('file_id')})"
-                result = resync_external_srt(raw_os_srt, js, lang3, OPENSUBS_TRACK_SUFFIX,
+                result = resync_external_srt(raw_os_srt, get_transcript(), lang3, OPENSUBS_TRACK_SUFFIX,
                                              synced_path, label)
                 if result is not None:
                     synced_path, os_name = result
@@ -2491,7 +2592,16 @@ def main(argv: list[str] | None = None) -> int:
                     resynced_extra_srt = (synced_path, {"language": lang3, "track_name": os_name})
 
         vocals_hits = None
-        if subs_enabled and chosen_subs is None:
+        cached_instrumental = None   # a whole-track Instrumental stem produced "for free"
+        #   alongside a Config.stem_retranscribe vocals pass below (build_vocals_stem's
+        #   also_instrumental) - handed to mute_track() so mute_fill="stems" doesn't stem the
+        #   SAME track a second time; only possible when the chosen track has <=2 channels
+        #   (see build_vocals_stem's docstring for why a >2ch track can't reuse this)
+        if cfg.method != "dialog" and (not subs_enabled or chosen_subs is not None):
+            get_transcript()   # normal case: nothing below needed a transcript yet (a subtitle
+            #   was already found by embedded/PGS/VobSub, or subs are deliberately disabled) -
+            #   get one now, the plain single-STT-call way
+        elif subs_enabled and chosen_subs is None:
             print("  subtitles: no usable text subtitle track to clean - skipping")
             print("  [warn] no text subtitle available to cross-check the transcript against - "
                   "words the transcript mis-heard or dropped entirely can't be caught "
@@ -2500,18 +2610,41 @@ def main(argv: list[str] | None = None) -> int:
                   "find a subtitle for this movie elsewhere, it can be used to backfill "
                   "and re-run the missed spots.")
 
-            if cfg.stem_retranscribe:
-                if stem_tool is None:
-                    print("  [warn] no stemmer installed - can't isolate vocals for a second "
-                          "transcription pass on this file with no other safety net (see README "
-                          "for one-time stemmer setup)", file=sys.stderr)
-                else:
-                    print("  subtitles: every method above came up empty - isolating vocals from "
-                          "the audio and re-transcribing, to give word detection its best possible "
-                          "chance on a file with no other safety net")
-                    vocals_wav = build_vocals_stem(ffmpeg, stem_tool, media, audio_pos, tmp, cfg)
-                    vocals_js = ensure_vocals_transcript(media, vocals_wav, tmp, cfg)
-                    vocals_hits = scan_vocals_transcript(vocals_js, matchers)
+            n_ch = int(cp.get("audio_channels") or 2)
+            also_instrumental = cfg.method == "mute" and cfg.mute_fill == "stems" and n_ch <= 2
+
+            if not cfg.stem_retranscribe:
+                get_transcript()
+            elif stem_tool is None:
+                print("  [warn] no stemmer installed - can't isolate vocals for a second "
+                      "transcription pass on this file with no other safety net (see README "
+                      "for one-time stemmer setup)", file=sys.stderr)
+                get_transcript()
+            elif js is None:
+                # Nothing above ever needed a transcript - no embedded/sidecar/PGS/VobSub/
+                # OpenSubtitles candidate existed anywhere at all - so THIS is knowable before
+                # ever running Voice_to_Text: skip transcribing the original mix entirely and
+                # transcribe the isolated vocals instead, exactly once, not twice.
+                print("  subtitles: no candidate found anywhere - isolating vocals from the "
+                      "audio and transcribing THAT instead of the original mix, since it's the "
+                      "only detection pass this file is going to get")
+                vocals_wav, cached_instrumental = build_vocals_stem(
+                    ffmpeg, stem_tool, media, audio_pos, tmp, cfg,
+                    also_instrumental=also_instrumental)
+                js = ensure_vocals_transcript(media, vocals_wav, tmp, cfg)
+            else:
+                # A candidate WAS found (sidecar/OpenSubtitles) and already cost one
+                # transcription to try resyncing against - it just didn't line up. Try again on
+                # the isolated vocals and merge in only what THAT catches which the first pass
+                # missed entirely.
+                print("  subtitles: every method above came up empty - isolating vocals from "
+                      "the audio and re-transcribing, to give word detection its best possible "
+                      "chance on a file with no other safety net")
+                vocals_wav, cached_instrumental = build_vocals_stem(
+                    ffmpeg, stem_tool, media, audio_pos, tmp, cfg,
+                    also_instrumental=also_instrumental)
+                vocals_js = ensure_vocals_transcript(media, vocals_wav, tmp, cfg)
+                vocals_hits = scan_vocals_transcript(vocals_js, matchers)
 
         if cfg.method == "dialog":
             print("  method: dialog removal - stripping ALL dialogue (not just flagged words) "
@@ -2586,7 +2719,8 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.method == "bleep":
                 clean_audio = bleep_track(ffmpeg, media, audio_pos, spans, cfg, chosen, tmp)
             elif cfg.method == "mute":
-                clean_audio, used_center = mute_track(ffmpeg, ffprobe, media, audio_pos, spans, cfg, chosen, tmp, stem_tool)
+                clean_audio, used_center = mute_track(ffmpeg, ffprobe, media, audio_pos, spans, cfg,
+                                                      chosen, tmp, stem_tool, cached_instrumental)
             elif src_codec == "mp3":
                 clean_audio, src_dur, new_dur = mp3_splice_cut(ffmpeg, ffprobe, media, audio_pos, spans, tmp)
                 lossless_splice = True
