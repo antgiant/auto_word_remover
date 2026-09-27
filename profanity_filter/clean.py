@@ -505,6 +505,11 @@ def has_video_track(streams: list[dict]) -> bool:
               for s in streams)
 
 
+def has_audio_track(streams: list[dict]) -> bool:
+    """True when the media has at least one real audio stream."""
+    return any(s.get("codec_type") == "audio" for s in streams)
+
+
 # ---------------------------------------------------------------------------
 # steps
 # ---------------------------------------------------------------------------
@@ -653,7 +658,7 @@ def _pick(pool: list, want: str, label: str):
 def choose_audio(tracks: list, want: str):
     audio = [t for t in tracks if t["type"] == "audio"]
     if not audio:
-        raise SystemExit("[error] input has no audio tracks")
+        return None, None
     # Never treat a "(No Narration)"/"(Wordless)" alt track as the thing to
     # detect profanity in or default to - even if IT'S the one flagged
     # default in the container, or explicitly requested by index/language
@@ -2382,7 +2387,12 @@ def main(argv: list[str] | None = None) -> int:
     if not media.is_file():
         raise SystemExit(f"[error] not found: {media}")
 
-    is_video = has_video_track(probe_streams(ffprobe, media))
+    streams = probe_streams(ffprobe, media)
+    if not has_audio_track(streams):
+        print(f"  [warn] {media.name} has no audio track - skipping clean")
+        return 0
+
+    is_video = has_video_track(streams)
     if cfg.method == "cut":
         if is_video:
             raise SystemExit(
@@ -2451,6 +2461,9 @@ def main(argv: list[str] | None = None) -> int:
               f"re-detecting from the original source; a fresh build only replaces them if the "
               f"flagged words differ (--force to always replace)")
     chosen, audio_pos = choose_audio(tracks, cfg.source_track)
+    if chosen is None:
+        print(f"  [warn] {media.name} has no audio track - skipping clean")
+        return 0
     cp = chosen["properties"]
     print(f"  cleaning audio #{audio_pos}: "
           f"{cp.get('language', 'und')} / {cp.get('track_name') or '<no name>'} / "
