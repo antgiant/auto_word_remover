@@ -966,11 +966,28 @@ def is_own_output_track(t: dict, cfg: Config) -> bool:
     a different method - left alone here, and never chosen as cleaning
     source either (see choose_audio's is_no_narration_track exclusion). The
     subtitle suffixes stay method-independent - opensubtitles/sidecar
-    passthrough tracks aren't tied to which audio method is active."""
+    passthrough tracks aren't tied to which audio method is active.
+
+    A suffix is matched either appended to a base name (the common case,
+    e.g. "Surround 7.1 (Cleaned)") or standing alone (clean_label()'s
+    fallback when the source track had no name AND no recognized/
+    determined language to build a base name from - e.g. a plain
+    "(Cleaned)", with no leading space since there was nothing to append
+    to). Checking only name.endswith(suffix) - which includes that leading
+    space - misses the bare-suffix case entirely: found live on a
+    Deepwater Horizon (2016) rerun 2026-09-30, where an "und"-language
+    source subtitle track had produced a subtitle track named exactly
+    "(Cleaned)" that then survived every subsequent rerun's stale-track
+    filtering, got treated as a real independent subtitle to backfill
+    against, and silently blocked the no-usable-subtitle stem_retranscribe
+    fallback from ever running on the file."""
     name = t.get("properties", {}).get("track_name") or ""
     audio_suffix = cfg.dialog_track_suffix if cfg.method == "dialog" else cfg.track_name_suffix
-    return (name.endswith(audio_suffix)
-            or name.endswith(OPENSUBS_TRACK_SUFFIX) or name.endswith(SIDECAR_TRACK_SUFFIX))
+
+    def _matches(suffix: str) -> bool:
+        return name == suffix.strip() or name.endswith(suffix)
+
+    return _matches(audio_suffix) or _matches(OPENSUBS_TRACK_SUFFIX) or _matches(SIDECAR_TRACK_SUFFIX)
 
 
 def _span_expr(spans) -> str:
