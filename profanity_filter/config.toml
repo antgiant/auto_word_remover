@@ -1,12 +1,8 @@
 # Profanity_Filter - defaults  (override any of these on the command line)
 
-# "mute"  (default) - silence the flagged span. If the source track has more
-#          than two channels, the center channel is checked first: when
-#          dialogue really is isolated there (see center_margin_db below),
-#          ONLY the center channel is muted - music/effects on every other
-#          channel keep playing right through, unbroken. Otherwise (stereo,
-#          no recognised center channel, or dialogue isn't center-only) the
-#          muted span is filled per mute_fill below.
+# "mute"  (default) - silence the flagged span. Every span is stemmed
+#          (mute_fill below), on any channel count - no automatic
+#          center-channel-only muting anymore (see AGENTS.md).
 # "bleep" - every channel is muted and a 1 kHz tone laid over it.
 # "cut"   - the flagged span is spliced out entirely, shortening the file.
 #           AUDIO-ONLY INPUTS ONLY (e.g. audiobooks) - refuses any input with
@@ -17,7 +13,9 @@
 #           container/codec as the source, no mkvmerge remux.
 # "dialog" - a different job: strip ALL dialogue (not just flagged words -
 #           the wordlists aren't consulted) into a new "(Wordless)" alt
-#           track. See dialog_track_suffix / dialog_track_default below.
+#           track. Always stems every channel by default - see center_mute
+#           below for the opt-in center-channel-only alternative.
+#           See dialog_track_suffix / dialog_track_default below.
 method = "mute"
 
 # which flag_language categories to act on (from Voice_to_Text/wordlists/)
@@ -29,14 +27,18 @@ pad_start = 0.10
 pad_end = 0.10
 merge_gap = 0.20             # merge two flagged spans closer than this into one
 
-# "mute" only: during exactly the flagged spans (with the rest of the track
-# silenced, so the comparison is unaffected by everything else in the film),
-# how many dB louder must the center channel be than every other channel to
-# be treated as dialogue-only-on-center and muted alone?
-center_margin_db = 6.0
+# "dialog" only: mute just the center channel for the whole file instead of
+# stemming dialogue out of every channel. NEVER auto-detected - only set this
+# per file when you already know the source's dialogue is genuinely
+# center-isolated (e.g. via _whisperx_check.py); fails loudly instead of
+# silently falling back to stemming if the track has no recognised center
+# channel. Leave false (the default) for anything with a real mixed audio
+# track (songs, panned dialogue, effects sharing the center channel) - see
+# AGENTS.md's "Center-channel-only removal" for why this stopped being
+# automatic.
+center_mute = false
 
-# "mute" only, whenever there's no clean center channel to mute alone (stereo/
-# mono, or a >2ch track where dialogue isn't center-only):
+# "mute" only:
 #   "stems"   (default) - a high-quality stemmer (audio-separator) pulls the
 #             ambient noise/music out of the whole track ahead of time, and
 #             THAT plays through the muted span instead of dead air. Falls

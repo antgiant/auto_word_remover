@@ -49,19 +49,16 @@ End-to-end from a single media file:
                  mute_fill="stems" reuses it instead of stemming the track
                  again (see mute_track's cached_whole_instrumental).
   4. remove      ffmpeg pulls ONE audio track out and removes each flagged span:
-       method "mute"  (default) - silence. If the track has more than two
-                 channels, the center channel's real content is checked first
-                 (see detect_center_dominance): when dialogue really does live
-                 on the center channel alone, ONLY that channel is muted -
-                 music/effects on the other channels play through unbroken.
-                 Otherwise, by default (mute_fill = "stems"), the muted span
-                 isn't dead air either: a high-quality stemmer (audio-separator,
-                 see STEM_VENV) pulls the ambient noise/music out of the whole
-                 track ahead of time and that plays through the muted span
-                 instead - so even a plain stereo track keeps its room tone/
-                 score under a bleep. Set mute_fill = "silence" for the old
-                 dead-air behaviour, or if no stemmer is installed (it's the
-                 automatic fallback when STEM_VENV isn't found).
+       method "mute"  (default) - every flagged span is stemmed (mute_fill =
+                 "stems", the default): a high-quality stemmer (audio-separator,
+                 see STEM_VENV) pulls the ambient noise/music out of just that
+                 span (or the whole track once, whichever's cheaper - see
+                 _predict_stem_seconds) and that plays through instead of dead
+                 air, on every channel count including plain stereo. Set
+                 mute_fill = "silence" for the old dead-air behaviour, or if no
+                 stemmer is installed (it's the automatic fallback when
+                 STEM_VENV isn't found). No automatic center-channel-only
+                 muting - see "dialog" below for where that moved and why.
        method "bleep" - every channel is muted and a 1 kHz tone laid over it.
        method "cut"   - the flagged span is spliced out entirely, shortening
                  the file. AUDIO-ONLY INPUTS ONLY (e.g. audiobooks) - cutting
@@ -83,15 +80,22 @@ End-to-end from a single media file:
                  the track (not just flagged words - the wordlists/transcript
                  aren't even consulted) into a new "(Wordless)" track, added
                  as a non-default alt track alongside the original (see
-                 dialog_track_default to make it default instead). Same
-                 center-channel-first logic as "mute": if dialogue is clearly
-                 isolated on the center channel across the WHOLE file, only
-                 that channel is muted and every other channel is untouched
-                 (channel count trivially preserved). Otherwise the stemmer
-                 strips the dialogue out of every channel and the result -
-                 same channel count as the source wherever the stemmer can
-                 manage it - becomes the whole output track. See
-                 dialog_remove_track / build_instrumental_stem.
+                 dialog_track_default to make it default instead). Always
+                 stems dialogue out of every channel by default - same
+                 channel count as the source wherever the stemmer can manage
+                 it, becomes the whole output track. Center-channel-ONLY
+                 muting (mute just the center channel for the whole runtime,
+                 every other channel untouched) is available but never
+                 inferred - it requires an explicit --center-mute per file
+                 (same opt-in posture as --method bleep), and fails loudly if
+                 the chosen track doesn't have a recognised center channel to
+                 mute. Auto-detecting this used to be the default (compare
+                 center-channel RMS against every other channel during the
+                 file's dialogue moments); removed after it broke on a real
+                 mixed-content film (some dialogue center-isolated, some not)
+                 where no single whole-file aggregate reading could be right
+                 - see dialog_remove_track / build_instrumental_stem and
+                 AGENTS.md's "Center-channel-only removal" section.
   5. subs        (mute/bleep only) every cue that overlaps a removed span has
                  its profane words censored: "mute" removes them entirely
                  (the audio has no audible trace left either), "bleep"
@@ -122,10 +126,9 @@ Usage:
   clean.py "Movie.mkv" --dry-run
   clean.py "Movie.mkv" --force  # rebuild even if a rerun finds the same words already covered
 
-The stemmer (mute_fill="stems", and --method dialog whenever it can't just
-mute a center channel) needs a one-time setup - see README.md - and both
-features degrade automatically (to plain silence / a clear error) when it
-isn't installed.
+The stemmer (mute_fill="stems", and --method dialog by default) needs a
+one-time setup - see README.md - and both features degrade automatically
+(to plain silence / a clear error) when it isn't installed.
 """
 from __future__ import annotations
 
@@ -133,7 +136,6 @@ import argparse
 import contextlib
 import dataclasses
 import json
-import math
 import re
 import shutil
 import subprocess
@@ -251,7 +253,7 @@ except ModuleNotFoundError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 @dataclasses.dataclass
 class Config:
-    method: str = "mute"               # "mute" (silence, center-channel-aware) | "bleep" | "cut"
+    method: str = "mute"               # "mute" (stems each flagged span) | "bleep" | "cut" | "dialog"
     categories: list = dataclasses.field(default_factory=lambda: ["profanity"])
     pad_start: float = 0.10
     pad_end: float = 0.10
@@ -261,16 +263,16 @@ class Config:
     clean_codec: str = "ac3"           # ac3 | eac3 | aac | flac (lossless)
     clean_bitrate: str = "224k"        # lossy codecs only, for a <=2ch source
     clean_bitrate_surround: str = "448k"  # lossy codecs only, for a >2ch source (unless --clean-bitrate given)
-    center_margin_db: float = 6.0      # "mute": center must be this many dB louder than
-    #                                    every other channel, during the flagged spans, to
-    #                                    be treated as dialogue-only-on-center
+    center_mute: bool = False          # "dialog" only: mute just the center channel for the
+    #                                    whole runtime instead of stemming dialogue out of every
+    #                                    channel - never inferred, opt-in per file only (same as
+    #                                    --method bleep); fails loudly if the chosen track has no
+    #                                    recognised center channel
     source_track: str = "default"      # "default" | index | 3-letter language
     track_name_suffix: str = " (Cleaned)"
     sync_ms: int = 0                   # mkvmerge --sync for the clean track
 
-    mute_fill: str = "stems"           # "mute" only, whenever there's no clean center channel to
-    #                                    mute alone (stereo/mono, or a >2ch track where dialogue
-    #                                    isn't center-only): "stems" (default) plays the stemmed-out
+    mute_fill: str = "stems"           # "mute" only: "stems" (default) plays the stemmed-out
     #                                    ambient noise/music through the muted span instead of dead
     #                                    air; "silence" is the old behaviour.
     stem_model: str = "UVR-MDX-NET-Inst_HQ_3.onnx"  # audio-separator model, Vocals/Instrumental stems
@@ -1014,109 +1016,6 @@ def build_mute_filter(spans, audio_pos: int, n_channels: int,
     return "\n".join(lines)
 
 
-_ASTATS_CHANNEL_RE = re.compile(r"Channel:\s*(\d+)")
-_ASTATS_RMS_RE = re.compile(r"RMS level dB:\s*(-?[\d.]+|-inf)")
-
-
-def _parse_astats_rms(stderr_text: str) -> dict[int, float]:
-    """{0-based channel index: RMS level dB} from ffmpeg astats stderr text
-    (stops at the "Overall" section)."""
-    levels: dict[int, float] = {}
-    cur: int | None = None
-    for line in stderr_text.splitlines():
-        m = _ASTATS_CHANNEL_RE.search(line)
-        if m:
-            cur = int(m.group(1)) - 1
-            continue
-        if "Overall" in line:
-            cur = None
-            continue
-        if cur is not None:
-            r = _ASTATS_RMS_RE.search(line)
-            if r:
-                levels[cur] = float("-inf") if r.group(1) == "-inf" else float(r.group(1))
-    return levels
-
-
-# ffmpeg's `enable` option runs its value through the AVExpr boolean parser,
-# which hard-fails ("Error when evaluating the expression") once a chained
-# between(...)+between(...)+... expression passes a fixed term count -
-# bisected empirically against a real ffmpeg build: 99 terms parse fine, 100
-# fails every time, so this really is a hard-coded limit in ffmpeg itself,
-# not a length/performance thing. A span list past this size (one span per
-# subtitle cue across a whole episode routinely runs into the hundreds) is
-# processed in batches and the per-batch RMS levels combined - see
-# _combine_batch_rms. Kept comfortably under the observed 99-term ceiling.
-_ASTATS_BATCH_LIMIT = 80
-
-
-def _combine_batch_rms(per_batch: list[dict[int, float]], whole_file_duration: float,
-                       span_duration: float) -> dict[int, float]:
-    """Combine per-channel RMS-dB readings from several `detect_center_dominance`
-    batches into the single figure one pass over ALL spans together would
-    have produced, correcting for each batch's own dilution.
-
-    Each batch's astats RMS is computed by ffmpeg over the WHOLE file
-    duration with everything outside that batch's spans zeroed (`volume=0:
-    enable=`doesn't drop samples, it silences them in place) - so a batch's
-    reported dB is `10*log10(sum_of_squares_in_its_spans / whole_file_samples)`,
-    diluted by however much of the file its spans don't cover. Converting
-    back to linear power, undoing that per-batch dilution (multiply by
-    whole_file_duration), summing across batches, then dividing by the TRUE
-    total span duration (not the whole file) reconstructs the correct
-    mean-square over just the dialogue time - physically the same number a
-    single ffmpeg pass over every span at once would report, if ffmpeg's
-    expression parser could actually take that many terms."""
-    if span_duration <= 0:
-        return {}
-    power_sum: dict[int, float] = {}
-    for levels in per_batch:
-        for ch, db in levels.items():
-            p = 0.0 if db == float("-inf") else 10.0 ** (db / 10.0)
-            power_sum[ch] = power_sum.get(ch, 0.0) + p * whole_file_duration
-    return {ch: (10.0 * math.log10(p / span_duration) if p > 0 else float("-inf"))
-            for ch, p in power_sum.items()}
-
-
-def detect_center_dominance(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans,
-                            center_idx: int, cfg: Config) -> tuple[bool, dict[int, float]]:
-    """During exactly `spans` (every channel silenced everywhere else, so the
-    comparison is unaffected by the rest of the film), is the center
-    channel's RMS level clearly the loudest? That means dialogue in this
-    track really does live on the center channel alone.
-
-    `spans` can be arbitrarily long - see _ASTATS_BATCH_LIMIT/_combine_batch_rms.
-    For mute_track this is the flagged-word spans being muted; for
-    dialog_remove_track it's normally the whole episode's dialogue moments
-    derived from its subtitles (see subtitle_dialogue_spans) rather than the
-    whole file - testing across the whole file dilutes the comparison with
-    every narration-free stretch and can hide a center channel that's
-    genuinely dominant specifically while someone is talking."""
-    span_duration = sum(e - s for s, e, *_ in spans)
-    if span_duration <= 0:
-        return False, {}
-    whole_file_duration = probe_duration(ffprobe, media)
-    per_batch: list[dict[int, float]] = []
-    for i in range(0, len(spans), _ASTATS_BATCH_LIMIT):
-        batch = spans[i:i + _ASTATS_BATCH_LIMIT]
-        expr = _span_expr(batch)
-        proc = subprocess.run(
-            [ffmpeg, "-hide_banner", "-i", str(media), "-map", f"0:a:{audio_pos}",
-             "-af", f"volume=0:enable='not({expr})',astats=metadata=0", "-f", "null", "-"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace")
-        per_batch.append(_parse_astats_rms(proc.stderr))
-    levels = _combine_batch_rms(per_batch, whole_file_duration, span_duration)
-    if center_idx not in levels:
-        return False, levels
-    center = levels[center_idx]
-    others = [v for i, v in levels.items() if i != center_idx]
-    if not others:
-        return False, levels
-    loudest_other = max(others)
-    dominant = center - loudest_other >= cfg.center_margin_db or (center > -90 and loudest_other <= -90)
-    return dominant, levels
-
-
 def _encode_track(ffmpeg: str, media: Path, graph: str, n_channels: int, cfg: Config, tmp: Path,
                   extra_inputs: list[Path] | None = None) -> Path:
     (tmp / "filter.txt").write_text(graph, encoding="utf-8")  # kept for --keep-temp / debugging
@@ -1160,26 +1059,6 @@ def bleep_track(ffmpeg: str, media: Path, audio_pos: int, spans, cfg: Config,
     sr = int(props.get("audio_sampling_frequency") or 48000)
     graph = build_bleep_filter(spans, cfg, n_ch, sr, audio_pos)
     return _encode_track(ffmpeg, media, graph, n_ch, cfg, tmp)
-
-
-def _center_channel_dominance(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans,
-                              n_ch: int, cfg: Config):
-    """For a >2ch track: is there a named layout with a center (FC) channel,
-    and - during `spans` - is it clearly the loudest? Returns (center_idx,
-    layout_name, dominant, levels, raw_layout); center_idx/layout_name/
-    dominant are all None when the probed layout isn't a recognised one with
-    a center channel at all (raw_layout is ffprobe's string in that case, for
-    logging - may be empty)."""
-    raw = subprocess.run(
-        [ffprobe, "-v", "error", "-select_streams", f"a:{audio_pos}",
-         "-show_entries", "stream=channel_layout", "-of", "csv=p=0", str(media)],
-        capture_output=True, text=True, check=True).stdout.strip()
-    names = CHANNEL_LAYOUTS.get(raw)
-    if not (names and len(names) == n_ch and "FC" in names):
-        return None, None, None, {}, raw
-    center_idx = names.index("FC")
-    dominant, levels = detect_center_dominance(ffmpeg, ffprobe, media, audio_pos, spans, center_idx, cfg)
-    return center_idx, raw, dominant, levels, raw
 
 
 def stem_clip_all_channels(ffmpeg: str, stem_tool: str, clip_wav: Path, n_ch: int,
@@ -1704,15 +1583,14 @@ def subtitle_dialogue_spans(mkvextract: str, ffprobe: str, media: Path, track: d
                             merge_gap: float = 1.5, max_cue_dur: float = 4.0) -> list[tuple]:
     """[(start, end, None), ...] for every dialogue moment in subtitle
     `track` of `media`, nearby cues merged into one span (gap <= `merge_gap`)
-    - used to test center-channel dominance only where someone is actually
-    talking (see detect_center_dominance) instead of being diluted by long
-    narration-free/music-only stretches, which a nature documentary can have
-    a lot of. A text track (SRT/ASS/...) gives exact cue end times via
-    flag_language.parse_srt; an image-based one (PGS/VobSub) only carries a
-    presentation start per cue, so its end is estimated as either
-    `max_cue_dur` later or the next cue's start, whichever comes first.
-    Can run into the hundreds of spans for a full episode - that's fine,
-    detect_center_dominance batches internally (see _ASTATS_BATCH_LIMIT)."""
+    - used by _whisperx_check.py to pick real dialogue windows to validate
+    an explicit --center-mute run against (clean.py itself no longer uses
+    this for any automatic center-channel decision - see
+    dialog_remove_track). A text track (SRT/ASS/...) gives exact cue end
+    times via flag_language.parse_srt; an image-based one (PGS/VobSub) only
+    carries a presentation start per cue, so its end is estimated as either
+    `max_cue_dur` later or the next cue's start, whichever comes first. Can
+    run into the hundreds of spans for a full episode."""
     codec = (track["properties"].get("codec_id") or "").upper()
     if codec in _TEXT_SUB_CODECS:
         srt_path = tmp / "dialogue_subs.srt"
@@ -1743,79 +1621,65 @@ def subtitle_dialogue_spans(mkvextract: str, ffprobe: str, media: Path, track: d
     return [(s, e, None) for s, e in merged]
 
 
-def dialog_remove_track(ffmpeg: str, ffprobe: str, mkvextract: str, media: Path, audio_pos: int,
-                        cfg: Config, chosen: dict, tmp: Path, stem_tool: str | None,
-                        tracks: list | None = None) -> tuple[Path, bool]:
+def dialog_remove_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
+                        cfg: Config, chosen: dict, tmp: Path,
+                        stem_tool: str | None) -> tuple[Path, bool]:
     """--method dialog: strip ALL dialogue from the track (not just flagged
     words). Returns (clean_audio_path, used_center_trick).
 
-    If the track has a recognised center channel and dialogue is dominant
-    there DURING THE TRACK'S DIALOGUE MOMENTS (derived from an embedded
-    subtitle track via subtitle_dialogue_spans - falls back to testing the
-    whole file when there's no usable subtitle track), only that channel is
-    muted for the entire runtime - every other channel's music/effects play
-    through untouched, and the channel count is trivially preserved. If not
-    (stereo/mono, or a >2ch track without a clean center), the stemmer
-    extracts the non-dialogue content from every channel instead (see
-    build_instrumental_stem) and that becomes the whole output track.
+    Always stems dialogue out of every channel (build_instrumental_stem) -
+    same "always-stem" default as mute_track() - UNLESS the caller
+    explicitly asks for center-channel-only muting via cfg.center_mute
+    (--center-mute), the same opt-in-only posture as --method bleep. There
+    is no automatic center-channel dominance detection anymore: it worked
+    for a source where dialogue is ~100% center-isolated (a nature
+    documentary's narration), but broke on a real film mix (The Emperor's
+    New Groove) where dialogue is only SOMETIMES center-isolated - songs,
+    panned lines, and effects sharing the channel - and a single aggregate
+    test across the whole file can't represent that; see AGENTS.md's
+    "Center-channel-only removal" section for the history.
 
-    Testing against the whole file instead of just the dialogue moments is a
-    real trap on this kind of source: a nature-documentary mix can spend most
-    of its runtime on narration-free music/effects, which dilutes an
-    over-the-whole-file measurement enough to hide a center channel that's
-    actually clearly dominant specifically while the narrator is talking -
-    confirmed on a real nature-documentary track, where the whole-file reading
-    put the center channel as the QUIETEST of the six (~-86 dB, everything
-    else ~-30 to -43 dB) while its subtitle-gated reading told the opposite
-    story once the astats batching fix (_ASTATS_BATCH_LIMIT) made measuring
-    that many spans possible at all."""
+    When cfg.center_mute is set: the chosen track needs >2 channels and a
+    recognised channel_layout (CHANNEL_LAYOUTS) with an FC (center)
+    position, or this fails loudly (SystemExit) rather than silently
+    falling back to stemming - asking explicitly means the caller is
+    trusted to already know the source qualifies, so a silent fallback
+    would hide a real mistake instead of surfacing it."""
     props = chosen["properties"]
     n_ch = int(props.get("audio_channels") or 2)
     sr = int(props.get("audio_sampling_frequency") or 48000)
-    duration = probe_duration(ffprobe, media)
-    whole_span = [(0.0, duration, None)]
-
-    dialogue_spans = whole_span
-    span_note = "the whole file (no usable subtitle track found)"
-    subs_track = _pick_dialogue_subs_track(tracks) if tracks else None
-    if subs_track is not None:
-        try:
-            derived = subtitle_dialogue_spans(mkvextract, ffprobe, media, subs_track, tmp)
-        except Exception as exc:
-            derived = []
-            print(f"  [warn] couldn't derive dialogue timing from subtitles ({exc!r}) - "
-                  f"testing the center channel across the whole file instead", file=sys.stderr)
-        if derived:
-            dialogue_spans = derived
-            cov = sum(e - s for s, e, _ in derived)
-            span_note = f"{len(derived)} dialogue span(s) from subtitles ({cov:.0f}s covered)"
-    print(f"  center-channel test uses: {span_note}")
 
     center_idx = layout_name = None
-    if n_ch > 2:
-        center_idx, layout_name, dominant, levels, raw = _center_channel_dominance(
-            ffmpeg, ffprobe, media, audio_pos, dialogue_spans, n_ch, cfg)
-        if layout_name is None:
-            print(f"  channels: {n_ch}ch, layout {raw or 'unknown'} has no recognised center "
-                  f"channel -> stemming dialogue out of every channel")
-        else:
-            lv = ", ".join(f"ch{i}={v:.1f}dB" for i, v in sorted(levels.items()))
-            if dominant:
-                print(f"  channels: {layout_name}, center=FC(#{center_idx}) carries the dialogue "
-                      f"alone ({lv}) -> muting center channel only, for the whole file")
-            else:
-                print(f"  channels: {layout_name}, center=FC(#{center_idx}) NOT clearly dialogue-only "
-                      f"({lv}) -> stemming dialogue out of every channel")
-                center_idx = None
+    if cfg.center_mute:
+        if n_ch <= 2:
+            raise SystemExit(
+                f"[error] --center-mute requested but the chosen track has only {n_ch} channel(s) "
+                f"- no center channel is possible")
+        raw = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", f"a:{audio_pos}",
+             "-show_entries", "stream=channel_layout", "-of", "csv=p=0", str(media)],
+            capture_output=True, text=True, check=True).stdout.strip()
+        names = CHANNEL_LAYOUTS.get(raw)
+        if not (names and len(names) == n_ch and "FC" in names):
+            raise SystemExit(
+                f"[error] --center-mute requested but the track's channel layout "
+                f"({raw or 'unknown'}) has no recognised center (FC) channel")
+        center_idx = names.index("FC")
+        layout_name = raw
+        print(f"  channels: {layout_name}, center=FC(#{center_idx}) - muting center channel only "
+              f"for the whole file (explicitly requested, no dominance check)")
 
     if center_idx is not None:
+        duration = probe_duration(ffprobe, media)
+        whole_span = [(0.0, duration, None)]
         graph = build_mute_filter(whole_span, audio_pos, n_ch, center_idx, layout_name)
         return _encode_track(ffmpeg, media, graph, n_ch, cfg, tmp), True
 
     if stem_tool is None:
         raise SystemExit(
-            f"[error] --method dialog needs the stemmer for this source (no clean center channel "
-            f"to mute alone) but none was found at {STEM_VENV} - see README for one-time setup")
+            f"[error] --method dialog needs the stemmer for this source but none was found at "
+            f"{STEM_VENV} - see README for one-time setup (or pass --center-mute if this source "
+            f"has a known-clean center channel)")
     inst_wav = build_instrumental_stem(ffmpeg, stem_tool, media, audio_pos, n_ch, sr, tmp, cfg,
                                        layout_name)
     bitrate = cfg.clean_bitrate if n_ch <= 2 else cfg.clean_bitrate_surround
@@ -2261,7 +2125,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input", help="media file (mkv recommended)")
     p.add_argument("--method", choices=["mute", "bleep", "cut", "dialog"],
-                   help="removal method: 'mute' (default, silence, center-channel-aware), "
+                   help="removal method: 'mute' (default, each flagged span stemmed), "
                         "'bleep', 'cut' (splice out entirely - audio-only inputs only), or "
                         "'dialog' (strip ALL dialogue - not just flagged words - into a new "
                         "(Wordless) track; ignores the wordlists/--categories entirely)")
@@ -2277,16 +2141,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--merge-gap", dest="merge_gap", type=float)
     p.add_argument("--beep-hz", dest="beep_hz", type=int, help="'bleep' only")
     p.add_argument("--beep-gain-db", dest="beep_gain_db", type=float, help="'bleep' only")
-    p.add_argument("--center-margin-db", dest="center_margin_db", type=float,
-                   help="'mute'/'dialog' only: how many dB louder the center channel must be than "
-                        "every other channel to mute it alone (default 6)")
+    p.add_argument("--center-mute", dest="center_mute", action="store_true", default=None,
+                   help="'dialog' only: mute just the center channel for the whole file instead of "
+                        "stemming dialogue out of every channel - opt-in per file only, never "
+                        "inferred; fails loudly if the chosen track has no recognised center channel")
     p.add_argument("--mute-fill", dest="mute_fill", choices=["stems", "silence"],
-                   help="'mute' only: what plays during a muted span with no clean center channel "
-                        "to mute alone - the stemmed-out ambient noise/music (default) or dead "
-                        "silence (old behaviour)")
+                   help="'mute' only: what plays during a muted span - the stemmed-out ambient "
+                        "noise/music (default) or dead silence (old behaviour)")
     p.add_argument("--stem-model", dest="stem_model",
                    help="audio-separator model filename used for stemming (mute_fill=stems, and "
-                        "--method dialog whenever it can't just mute a center channel)")
+                        "--method dialog unless --center-mute is given)")
     p.add_argument("--dialog-default", dest="dialog_track_default", action="store_true", default=None,
                    help="'dialog' only: make the new (Wordless) track the default audio track "
                         "instead of adding it as a non-default alt track")
@@ -2378,7 +2242,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.pad is not None:
         cfg.pad_start = cfg.pad_end = args.pad
     for name in ["method", "pad_start", "pad_end", "merge_gap", "beep_hz",
-                 "beep_gain_db", "center_margin_db", "mute_fill", "stem_model",
+                 "beep_gain_db", "center_mute", "mute_fill", "stem_model",
                  "dialog_track_default", "clean_codec", "clean_bitrate",
                  "clean_bitrate_surround", "cut_bitrate", "source_track",
                  "sync_ms", "subs_track", "srt_backfill", "sidecar_subs", "sidecar_lang",
@@ -2713,7 +2577,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             spans, all_hits, total = [], [], 0.0
             clean_audio, used_center = dialog_remove_track(
-                ffmpeg, ffprobe, mkvextract, media, audio_pos, cfg, chosen, tmp, stem_tool, tracks)
+                ffmpeg, ffprobe, media, audio_pos, cfg, chosen, tmp, stem_tool)
             clean_srt = None
         else:
             extra_hits = load_extra_spans(args.extra_spans) if args.extra_spans else None

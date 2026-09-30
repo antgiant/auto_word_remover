@@ -894,153 +894,116 @@ old whole-file approach was dropped in favor of this.
 No stemmer installed (`STEM_VENV` not found) -> falls back to the old plain
 `volume=0:enable='SPANS'` silence on the whole track.
 
-### Center-channel-only removal (`--method dialog` only)
+### Center-channel-only removal (`--method dialog`, explicit opt-in only)
 
-Movie 5.1/7.1 mixes almost always carry dialogue on the center channel alone,
-with music/effects spread across the others. `--method dialog` (which strips
-*all* dialogue from the track, not just flagged words) exploits that: when
-dialogue really is isolated to the center channel, muting only that channel
-removes every spoken word with the background continuing completely
-unbroken - a much better result than stemming dialogue out of every channel,
-which is the fallback whenever the center channel isn't clean. (`method =
-"mute"` used to make this same per-flagged-word decision - see "Always-stem
-muting" above for why it doesn't anymore; everything below is
-`dialog_remove_track()` only.)
+`dialog_remove_track()` always stems dialogue out of every channel by
+default now - same "always-stem" posture as `mute_track()` above, and
+removed for a related reason: there is no automatic decision anymore at
+all, not even a smarter one. Movie 5.1/7.1 mixes can carry dialogue on the
+center channel alone, and when that's true, muting only that channel beats
+stemming - so this DID ship for a while as automatic per-file detection
+(`detect_center_dominance`: RMS-compare the center channel against every
+other channel during the source's own subtitle-derived dialogue spans,
+batched past ffmpeg's ~100-term AVExpr limit, gated on a `center_margin_db`
+threshold). It worked well on a source where dialogue is essentially 100%
+center-isolated and nothing else worth keeping lives there (a nature
+documentary's narration - see the git history for the validated synthetic-
+and real-source testing that shipped it, and the WhisperX cross-check
+below).
 
-1. Skip entirely if the chosen track has <=2 channels (no center channel is
-   possible) - stem dialogue out of the whole (mono/stereo) track.
-2. Otherwise `ffprobe` the track's `channel_layout` (e.g. `5.1(side)`, `7.1`)
-   and look it up in `CHANNEL_LAYOUTS` (built from `ffmpeg -layouts`, the
-   authoritative channel-order source). If the layout isn't recognised or has
-   no `FC` (center) position - e.g. plain `stereo`, `quad`, `6.0(front)` -
-   stem dialogue out of every channel; don't guess an index from the channel
-   count alone.
-3. **Detect** (`detect_center_dominance`): silence every channel everywhere
-   *except* a set of test spans, then run `astats` and compare each channel's
-   RMS *during just those spans*. Because every channel gets the identical
-   silence mask elsewhere, this comparison is unaffected by the rest of the
-   file - it purely measures who's loudest while dialogue is actually
-   happening. If the center channel is at least `center_margin_db` (default
-   6 dB) louder than every other channel, dialogue is confirmed center-only.
-   Test spans come from the source's own subtitle track when one exists (see
-   the subtitle-gating note below), falling back to the whole file only when
-   there's no usable subtitle track.
-4. **Remove**: if confirmed, `channelsplit` the track into its named
-   channels, mute *only* the center pad for the entire runtime, pass every
-   other pad through with `anull`, then `join` them back with an explicit
-   `map=i.0-<ChannelName>` (so the container keeps its real layout tag) -
-   channel count trivially preserved. If not confirmed, the stemmer extracts
-   the non-dialogue content from every channel instead
-   (`build_instrumental_stem`) and that becomes the whole output track.
+It broke on a real film mix: **The Emperor's New Groove**. Dialogue there is
+only SOMETIMES center-isolated - songs, panned lines, and effects sharing
+the channel - so a single aggregate dominance reading across the whole file
+can't represent it, and gets it wrong in both directions: a "dominant"
+verdict mutes legitimate non-dialogue center content site-unseen for the
+ENTIRE runtime (the old code muted the whole file once confirmed, never
+scoped to just the dialogue moments), while a "not dominant" verdict sends
+an otherwise-mostly-clean source through the much slower stemmer
+unnecessarily. Removed rather than patched with a smarter per-span
+classifier: stemming is unconditionally correct regardless of how complex
+the mix is, just slower, and every failure mode of the old auto-detection
+was a false positive on "this file is safe to fast-path" - the actual
+per-source knowledge needed to make that call safely lives with a human,
+not a dB heuristic.
 
-Validated with synthetic 5.1 WAVs (`ffmpeg -f lavfi ... amerge ... aformat=
-channel_layouts=5.1`) plus real multichannel sources (see below). Confirmed
-on synthetic data: (a) center-dominant case -> non-center channels measured
+Center-only muting is still available, but only when a human explicitly
+asks for it per file (`--center-mute` / `cfg.center_mute`) - the same
+"opt-in, never inferred" posture as `--method bleep`. When requested:
+
+1. The chosen track needs >2 channels, or this fails loudly (`SystemExit`) -
+   no silent fallback to stemming, since the whole point of asking
+   explicitly is that the caller already believes this source qualifies and
+   a silent fallback would hide that belief being wrong.
+2. `ffprobe` the track's `channel_layout` (e.g. `5.1(side)`, `7.1`) and look
+   it up in `CHANNEL_LAYOUTS` (built from `ffmpeg -layouts`, the
+   authoritative channel-order source). No recognised layout, or none with
+   an `FC` (center) position - e.g. plain `stereo`, `quad`, `6.0(front)` -
+   fails loudly the same way; don't guess an index from the channel count
+   alone.
+3. `channelsplit` the track into its named channels, mute *only* the center
+   pad for the entire runtime, pass every other pad through with `anull`,
+   then `join` them back with an explicit `map=i.0-<ChannelName>` (so the
+   container keeps its real layout tag) - channel count trivially
+   preserved. No dominance test, no margin: asking explicitly means this
+   step is trusted outright.
+
+Validated (back when this ran automatically) with synthetic 5.1 WAVs
+(`ffmpeg -f lavfi ... amerge ... aformat=channel_layouts=5.1`) plus real
+multichannel sources: center-dominant case -> non-center channels measured
 **bit-identical** (via `astats`) inside vs. outside the muted span, center
-channel drops ~64 dB (silence) only inside it; (b) even-energy case ->
-correctly falls back to stemming every channel instead of guessing.
+channel drops ~64 dB (silence) only inside it. `build_mute_filter` (the
+actual mute step) is unchanged by any of this - still the same channel-split/
+mute-center/rejoin graph, still used by both the explicit `--center-mute`
+path and `_whisperx_check.py`'s own validation muting.
 
-#### `detect_center_dominance` span-count ceiling (fixed) + `--method dialog`'s default test window
-
-`detect_center_dominance`'s `enable='not(SPANS)'` expression goes through
-ffmpeg's AVExpr boolean parser, which **hard-fails past ~100 chained
-`between(...)+between(...)+...` terms** - bisected empirically against a real
-build: 99 terms parse fine, 100 fails every time ("Error when evaluating the
-expression"), so it's a hard-coded limit in ffmpeg itself, not a length/perf
-thing. This was originally found via the old `mute_track()`'s per-flagged-word
-spans, which rarely hit it (that whole code path is gone now - see
-"Always-stem muting" above); `dialog_remove_track`'s spans (one per subtitle
-cue, for a whole episode) hit it routinely. Fixed by batching (`_ASTATS_BATCH_LIMIT = 80`) and combining the per-batch dB
-readings correctly (`_combine_batch_rms`) - dB doesn't average linearly, and
-each batch is itself diluted by measuring across the WHOLE file with only its
-own spans un-silenced, so naive averaging would double-count that dilution.
-`detect_center_dominance` now takes `ffprobe` too (needs the file's total
-duration for the correction) - update both call sites if you touch this.
-
-`--method dialog` (`dialog_remove_track`) has no natural "flagged spans" to
-gate the dominance check on (it's removing ALL dialogue, not specific words),
-so it originally tested across the WHOLE file. **That's a real trap**: a
-nature-documentary mix can spend most of its runtime on narration-free music/
-effects, which dilutes an over-the-whole-file RMS comparison enough to hide a
-center channel that's actually clearly dominant specifically while the
-narrator is talking. Confirmed on a real nature-documentary episode
-(embedded AC3 5.1(side)): whole-file reading put the center channel
-as the QUIETEST of the six (~-86 dB vs ~-30 to -43 dB elsewhere); re-tested
-using only the moments its own embedded PGS subtitles say something's being
-said, center came out LOUDEST (~-27/-25 dB vs ~-30/-32 dB on front L/R) - the
-opposite conclusion. Fixed by making that the default: `dialog_remove_track`
-now pulls dialogue-cue spans from the source's own subtitle track
-(`subtitle_dialogue_spans` - a text track gives exact cue end times via
-`flag_language.parse_srt`; an image-based one like PGS/VobSub only carries a
-presentation start per cue, so the end is estimated: whichever comes first of
-+4s or the next cue's start) and gates the center-channel test on THOSE,
-falling back to the old whole-file span only when the source has no usable
-subtitle track at all.
-
-**Real-world margin data point** (same episode, properly subtitle-gated -
-143 merged spans, 2353s of confirmed dialogue time): center beat the loudest
-other channel by **~4.7-5.2 dB** (DTS 5.1 / AC3 5.1 respectively) - a real,
-consistent signal, but UNDER the 6 dB default `center_margin_db`, so out of
-the box this source still falls through to the (much slower) stemmer path
-despite the center channel genuinely carrying the dialogue. Spot-checks on
-two other episodes of the same series (short fixed windows, not properly
-subtitle-gated) also showed center consistently loudest by a few dB. Given
-the existing note above that 6 dB was never more than a synthetic-test
-starting point: a nature-documentary narration mix may want a value around
-3-5 dB via `--center-margin-db` rather than the default - hasn't been raised
-to the user for a permanent default change, so `config.toml`'s `6.0` is
-untouched; this is a per-source tuning note, not a validated new default.
-Superseded for actually deciding fast-vs-slow-path on a real batch by the
-WhisperX validator below, which doesn't need a margin at all.
+`subtitle_dialogue_spans`/`_pick_dialogue_subs_track` (deriving dialogue-cue
+timing from a subtitle track, merging nearby cues) also survive removal of
+the detection - `clean.py` itself no longer calls them for any automatic
+decision, but `_whisperx_check.py` still uses them to pick real dialogue
+windows to validate an explicit `--center-mute` request against.
 
 #### WhisperX validation: ground truth instead of a dB proxy (`_whisperx_check.py`)
 
 A dB-margin test is a proxy for "is there residual narration" - it can't
-actually tell whether what leaks through is intelligible. `_whisperx_check.py`
-(standalone, not yet merged into `clean.py`) asks the real question directly
-for `--method dialog`'s center-channel-only case: pick the longest
-subtitle-confirmed dialogue spans, run WhisperX (via voice_to_text) on both
-the real audio and a center-channel-muted version of the same spans (the
-exact `build_mute_filter` graph `dialog_remove_track` would use), and
-compare. A clean mute leaves only short generic hallucinated phrases
-("Thank you.", "Oh, God.") with near-zero word overlap against the real
-transcript (which reads as actual coherent, on-topic narration - "Columbus
-crabs are thriving...", not word salad); real bleed-through shows up as an
-actual matching sentence fragment. `whisperx_validate_center_mute()` requires
-EVERY tested window (default 3, the longest merged spans) to score under
-`overlap_threshold` (0.2) to pass.
+actually tell whether what leaks through is intelligible, and the whole
+class of problem the aggregate test had (one number can't represent a mixed
+file) is exactly what made it unsafe as an automatic decision in the first
+place. `_whisperx_check.py` (standalone, not merged into `clean.py`) asks
+the real question directly: pick the longest subtitle-confirmed dialogue
+spans, run WhisperX (via voice_to_text) on both the real audio and a
+center-channel-muted version of the same spans (the exact `build_mute_filter`
+graph the explicit `--center-mute` path would use), and compare. A clean
+mute leaves only short generic hallucinated phrases ("Thank you.", "Oh,
+God.") with near-zero word overlap against the real transcript (which reads
+as actual coherent, on-topic narration - "Columbus crabs are thriving...",
+not word salad); real bleed-through shows up as an actual matching sentence
+fragment. `whisperx_validate_center_mute()` requires EVERY tested window
+(default 3, the longest merged spans) to score under `overlap_threshold`
+(0.2) to pass.
 
-This matters because the dB-margin dilution bug above was investigated USING
-this validator, and the fix changed the real-world verdict: one episode's
-sidecar (see the gotcha below) measured as center being the QUIETEST channel
-by ~58 dB - WhisperX confirmed nothing intelligible came through either way
-on that bad source, so it wasn't informative there. But the *embedded* track,
-tested with the batching fix, showed a real ~5 dB margin - still under the
-6 dB default - and WhisperX gave a clean, unambiguous "PASSED, no residual
-narration" on all three tested windows. That result generalised: every
-remaining episode in the same season/series (10 files across two quality
-tiers) passed WhisperX validation too, at the exact ~4-5 dB margins that a
-straight `center_margin_db=6` default would have rejected outright and sent
-through 45-75 minutes of unnecessary per-channel stemming instead of the
-~10-20 minute center-mute pass. **Practical effect on a batch**: a driver
-script can run this check per file and force `--center-margin-db -99` (skip
-the dB gate entirely) when it passes, falling back to the normal margin test
-(and from there, to stemming) when it doesn't - see `_whisperx_check.py`'s
-own docstring for the shape of that. One episode had a window with overlap
-0.171 - close to the 0.2 cutoff, and the leaked words read as a real
-narration fragment, not hallucination - still passed since every window has
-to fail to reject the whole file, but it's the closest call seen; worth a
-listen-through if this method gets relied on somewhere prose accuracy
-matters more than a documentary M&E track.
+Real-world numbers from when this validator was used to sanity-check the
+old automatic dB-margin test on a real episodic source: same-source margins
+of ~4.7-5.2 dB (DTS 5.1 / AC3 5.1) that the 6 dB default would have rejected
+outright still passed WhisperX validation cleanly across every tested
+window on all 10 files in the batch - the dB proxy was being needlessly
+conservative on a source that really was clean. That result is now the
+justification for making `--center-mute` opt-in-with-validation rather than
+opt-in-blind: `_batch_pe3.py` is the current example of the intended
+workflow - WhisperX-validate each file, pass `--center-mute` only when it
+passes, let `clean.py` stem everything else. One tested window had overlap
+0.171, close to the 0.2 cutoff, with leaked words reading as a real
+narration fragment rather than hallucination - still passed since every
+window has to fail to reject the whole file, but it's the closest call
+seen; worth a listen-through if prose accuracy matters more than a
+documentary M&E track for a given source.
 
-Not yet wired into `clean.py` itself as a first-class option (no
-`--validate-with-whisperx` flag) - it depends on voice_to_text/WhisperX,
-which `mute_track`/`dialog_remove_track` don't otherwise require, and the
-per-file cost (subtitle extraction + several short WhisperX transcriptions)
-is real, if much cheaper than stemming. Promote it if this keeps proving out
-on other sources - the pattern (pick real dialogue spans, transcribe muted +
-unmuted, compare) generalises past center-channel muting to validating any
-dialogue-removal method, including the stemmer's own output.
+Costs a few short WhisperX transcriptions per file (real, but much cheaper
+than a stemming pass) and needs voice_to_text/WhisperX, which
+`dialog_remove_track` doesn't otherwise require - that's why it stays a
+separate script rather than a `clean.py` flag. The pattern (pick real
+dialogue spans, transcribe muted + unmuted, compare) generalises past
+center-channel muting to validating any dialogue-removal method, including
+the stemmer's own output, if that's ever worth doing.
 
 **Sidecar-file gotcha, logged as a warning for future batch work**: don't
 assume a `.ac3`/`.wav` sitting next to a media file is a clean, untouched
@@ -1069,9 +1032,11 @@ against the embedded track before trusting a sidecar as input to anything.
   "Always-stem muting" above) is calibrated against a specific GPU and
   stemmer model - re-measure `STEM_STARTUP_S`/`STEM_RATE` if either changes,
   it's not something exposed as a per-run/per-library setting anymore.
-- `center_margin_db` (6 dB, `--method dialog` only now) was chosen from a synthetic test, not a corpus of
-  real mixes - loud action/music scenes with softer dialogue may need a lower
-  margin, tune per source with `--center-margin-db`.
+- `--center-mute` (`--method dialog` only) has no automatic detection or
+  validation of its own - the caller is trusted to already know the source's
+  dialogue is genuinely center-isolated. `_whisperx_check.py` is the way to
+  actually check that belief instead of assuming it (see "Center-channel-
+  only removal" above).
 - **Quote comma-separated values passed to `clean.ps1`** (`--categories
   profanity,irreverence`, etc.) - `clean.ps1` captures forwarded args via
   `[Parameter(ValueFromRemainingArguments=$true)][string[]]$Passthru`, and

@@ -305,10 +305,10 @@ needs, any Python 3.10+ — see the version note above).
 | `--dry-run` | print the spans and stop |
 | `--pad 0.15` | padding (s) before & after each word (`--pad-start` / `--pad-end` for asymmetry) |
 | `--categories profanity,irreverence` | which lists to act on (default `profanity`) — **quote this value** (`--categories "profanity,irreverence"`); PowerShell mangles an unquoted comma into a space before it reaches `clean.py`, silently emptying the matcher list (see AGENTS.md) |
-| `--center-margin-db` | `mute`/`dialog`: how many dB louder the center channel must be than every other channel to mute it alone (default 6) |
-| `--mute-fill stems\|silence` | `mute` only: fill a center-less muted span with the stemmed-out ambient noise/music (default) or dead silence |
+| `--mute-fill stems\|silence` | `mute` only: fill a muted span with the stemmed-out ambient noise/music (default) or dead silence |
 | `--stem-model` | audio-separator model for stemming (default `UVR-MDX-NET-Inst_HQ_3.onnx`) |
 | `--dialog-default` | `dialog` only: make the new `(Wordless)` track the default audio track |
+| `--center-mute` | `dialog` only: mute just the center channel for the whole file instead of stemming every channel — opt-in per file only, never auto-detected; fails loudly if the track has no recognised center channel |
 | `--beep-hz` / `--beep-gain-db` | `bleep` only: tone frequency / level (default 1000 Hz, −6 dBFS) |
 | `--clean-codec ac3\|eac3\|aac\|flac` / `--clean-bitrate` / `--clean-bitrate-surround` | `mute`/`bleep`/`dialog` only: codec + bitrate for the cleaned track (default `ac3` @ 224k for <=2ch, 448k for >2ch; or use `flac` for lossless) |
 | `--cut-bitrate` | `cut` only: bitrate for a lossy source codec (default 96k) |
@@ -381,22 +381,23 @@ oaths). Uncomment the block at the bottom to also flag every bare
 
 ## WhisperX validation (experimental)
 
-`_whisperx_check.py` answers a sharper question than the dB-margin test above
-can: is a center-channel mute actually **inaudible**, not just quieter on
-average? It picks the longest subtitle-confirmed dialogue spans in a file,
-transcribes the real audio and a center-muted version of the same spans with
-WhisperX (via voice_to_text), and compares. A clean mute leaves only short
-generic hallucinated phrases ("Thank you.", "Oh, God.") with near-zero word
-overlap against the real (coherent, on-topic) transcript; real bleed-through
-shows up as an actual matching sentence fragment.
+`--method dialog`'s `--center-mute` is opt-in and unvalidated by clean.py
+itself — it trusts whoever passed the flag to already know the source
+qualifies. `_whisperx_check.py` is a way to actually check that trust: is a
+center-channel mute actually **inaudible**, not just assumed clean? It picks
+the longest subtitle-confirmed dialogue spans in a file, transcribes the real
+audio and a center-muted version of the same spans with WhisperX (via
+voice_to_text), and compares. A clean mute leaves only short generic
+hallucinated phrases ("Thank you.", "Oh, God.") with near-zero word overlap
+against the real (coherent, on-topic) transcript; real bleed-through shows up
+as an actual matching sentence fragment.
 
-Not wired into `clean.py` as a flag yet — it's a standalone script, since it
+Not wired into `clean.py` as a flag — it's a standalone script, since it
 needs WhisperX and costs a few short transcriptions per file (real, but much
-cheaper than a stemming pass). Useful when `--center-margin-db`'s default (or
-even a lowered one) is keeping `--method dialog` on the slow stemmer path for
-a source where the center channel is probably fine — see AGENTS.md
-("WhisperX validation") for how it changed the real-world call on a batch of
-episodic content.
+cheaper than a stemming pass). Run it against a candidate source BEFORE
+committing to `--center-mute` on the real file, or against the actual output
+afterward — see AGENTS.md ("WhisperX validation") for how it was used to
+verify a batch of episodic content back when this was still automatic.
 
 ```powershell
 $py = "..\voice_to_text\.venv\Scripts\python.exe"
