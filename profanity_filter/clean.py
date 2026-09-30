@@ -2204,8 +2204,20 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
         order += [audio_ref]
         order += [f"0:{t['id']}" for t in orig_audio if t["id"] in no_narr_ids]
         order += [f"0:{t['id']}" for t in orig_audio if t["id"] not in no_narr_ids]
-    else:
+    elif audio_default:
         order += [audio_ref] + [f"0:{t['id']}" for t in orig_audio]
+    elif orig_audio:
+        # non-default new track (the "(Secondary Audio)" no-narration variant,
+        # its first build) - whatever's currently the first audio track (the
+        # true original if this is the file's first ever audio addition, or an
+        # already-first "(Cleaned)" track from an earlier separate clean.py
+        # run) stays first, and the new track slots in right after it as the
+        # second audio stream - every other original track keeps its relative
+        # order after that.
+        order += [f"0:{orig_audio[0]['id']}", audio_ref]
+        order += [f"0:{t['id']}" for t in orig_audio[1:]]
+    else:
+        order += [audio_ref]
     if subs_ref:
         order.append(subs_ref)
     if extra_subs_ref:
