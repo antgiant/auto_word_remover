@@ -1,3 +1,4 @@
 gpu.lock
+gpu_queue/
 __pycache__/
 *.pyc

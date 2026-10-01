@@ -148,6 +148,14 @@ HERE = Path(__file__).resolve().parent
 VOICE_TO_TEXT = HERE.parent / "voice_to_text"
 GPU_LOCK_DIR = HERE.parent / "gpu_lock"
 
+# Set once near the top of main() to "<media.name> [<cfg.method>]" - read by
+# _invoke_separator() so the shared gpu_lock's reason string names the real
+# movie/file being processed, not just a temp intermediate wav's filename
+# (e.g. "ch0_stereo.wav", which says nothing about which of dozens of
+# concurrently-queued files it belongs to). One process only ever handles
+# one input file, so a plain module global is safe here - no threading.
+_CURRENT_JOB = ""
+
 # Empirically calibrated audio-separator per-invocation cost model, used by
 # mute_track() to predict per-span vs. whole-track total wall-clock time and
 # pick whichever is actually faster on this machine's GPU, instead of a
@@ -164,6 +172,19 @@ GPU_LOCK_DIR = HERE.parent / "gpu_lock"
 # 0.094). Re-measure both constants if the GPU or stemmer model changes.
 STEM_STARTUP_S = 9.0
 STEM_RATE = 0.10
+
+# A same-day attempt to also fold a flat per-invocation gpu_lock queueing
+# penalty into this model (STEM_LOCK_OVERHEAD_S) was reverted: that
+# conflated real GPU compute time with a guessed, flat contention assumption
+# that would cost genuine extra compute (whole-track over a long file is
+# MORE actual separator work than a handful of short per-span clips, not
+# less) even when the GPU is idle and no such queueing exists. Starvation
+# under real contention is gpu_lock's own FIFO queue's job to prevent (see
+# gpu_lock.py's ticket queue, fixed the same day) - every waiter now gets a
+# bounded, fair turn regardless of how many acquisitions a file needs, so
+# this model is free to stay what it was always meant to be: a pure
+# compute-time prediction, uncontaminated by guesses about what else
+# happens to be sharing the GPU at the time.
 SPLICE_CONTEXT_S = 2.0  # padding added on each side of a span before stemming - see splice_stemmed_spans
 
 CODEC_EXT = {"flac": ".mka", "ac3": ".ac3", "eac3": ".eac3", "aac": ".m4a"}
@@ -1369,7 +1390,8 @@ def _invoke_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config,
         cmd += ["--single_stem", single_stem]
     for attempt in range(1, STEM_RETRY_ATTEMPTS + 1):
         try:
-            gpu_ctx = (gpu_lock.hold("Profanity_Filter", f"stemming {wav_in.name}")
+            job = f"{_CURRENT_JOB} - " if _CURRENT_JOB else ""
+            gpu_ctx = (gpu_lock.hold("Profanity_Filter", f"stemming {job}{wav_in.name}")
                       if gpu_lock else contextlib.nullcontext())
             with gpu_ctx:
                 run(cmd)
@@ -2247,6 +2269,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+STALE_TEMP_DIR_MAX_AGE_S = 12 * 3600  # 12h, deliberately generous
+
+
+def _dir_last_activity(d: Path) -> float:
+    """Most recent mtime of anything under d, recursively - a directory's
+    OWN mtime only bumps when a DIRECT child is added/removed, not when a
+    file several levels deep (e.g. splice_segments/span12_stem/clip_out/...)
+    gets written to, so checking just d.stat().st_mtime would call an
+    actively-growing tree stale far too early."""
+    latest = d.stat().st_mtime
+    for p in d.rglob("*"):
+        try:
+            latest = max(latest, p.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
+
+
+def _sweep_stale_temp_dirs(out_dir: Path) -> None:
+    """Remove any leftover "pf_*" scratch dir (main()'s own
+    tempfile.TemporaryDirectory(prefix="pf_", dir=out_dir)) idle for longer
+    than any real single-file run has ever taken. A normal run - success or
+    a plain Python exception - always cleans its own tmp dir up via that
+    context manager's __exit__; one only survives when the interpreter was
+    killed before reaching it; a forceful taskkill/process-manager stop, or
+    the real access-violation crash this file's docstrings mention as an
+    observed audio-separator failure mode under GPU contention. Found
+    accumulating silently back to 2026-09-24, discovered and first swept
+    2026-10-01 - 12+ scratch dirs' worth of leftover audio, never cleaned up
+    on its own because nothing ever looked. 12h is well past every real
+    single-file processing time observed even under heavy multi-process GPU
+    contention, so anything idle that long is safe to treat as orphaned
+    rather than still legitimately owned by a slow sibling run."""
+    now = time.time()
+    for d in out_dir.glob("pf_*"):
+        if not d.is_dir():
+            continue
+        try:
+            age = now - _dir_last_activity(d)
+        except OSError:
+            continue
+        if age > STALE_TEMP_DIR_MAX_AGE_S:
+            try:
+                shutil.rmtree(d)
+                print(f"  [note] swept stale temp dir from an earlier crashed/killed run: "
+                      f"{d.name} (idle {age / 3600:.1f}h)", file=sys.stderr)
+            except OSError as exc:
+                print(f"  [warn] couldn't remove stale temp dir {d.name}: {exc!r}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -2279,6 +2351,8 @@ def main(argv: list[str] | None = None) -> int:
     media = Path(args.input).expanduser().resolve()
     if not media.is_file():
         raise SystemExit(f"[error] not found: {media}")
+    global _CURRENT_JOB
+    _CURRENT_JOB = f"{media.name} [{cfg.method}]"
 
     streams = probe_streams(ffprobe, media)
     if not has_audio_track(streams):
@@ -2303,6 +2377,7 @@ def main(argv: list[str] | None = None) -> int:
     if not out_dir.is_absolute():
         out_dir = HERE / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_temp_dirs(out_dir)
     name_suffix = cfg.dialog_track_suffix if cfg.method == "dialog" else cfg.track_name_suffix
     # The cleaned result replaces the source in place - same folder, same
     # stem. Only the extension can change (mkvmerge always writes .mkv), so
