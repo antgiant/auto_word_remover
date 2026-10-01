@@ -2269,7 +2269,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-STALE_TEMP_DIR_MAX_AGE_S = 12 * 3600  # 12h, deliberately generous
+STALE_TEMP_DIR_MAX_AGE_S = 24 * 3600  # 24h - was 12h; raised after a real near-miss the same
+#   day this was added: a manual cleanup pass (same idea, done by hand) removed an
+#   8.5-hour-idle-looking dir that turned out to still belong to a live Doctor Dolittle
+#   (1967) run, 47 spans in, quietly waiting out heavy GPU queue contention between spans
+#   rather than actually dead - crashed it, losing ~9.8h of real progress. 12h would not
+#   have caught this particular case (it was well under that), but the margin was clearly
+#   thinner than assumed for a machine this contended; doubling it costs nothing but a
+#   slightly longer window before a genuinely-dead dir gets reclaimed.
 
 
 def _dir_last_activity(d: Path) -> float:
