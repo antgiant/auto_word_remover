@@ -222,7 +222,19 @@ def release() -> None:
     holder = _read_lock()
     if holder is not None and holder.get("pid") != os.getpid():
         return  # not ours - never remove someone else's active lock
-    with contextlib.suppress(FileNotFoundError):
+    # PermissionError alongside FileNotFoundError for the same reason
+    # _try_remove_stale() suppresses it: Windows can refuse a delete while
+    # another process has the file open for even a moment (e.g. a waiter's
+    # _read_lock() mid-read, or a racing _try_remove_stale() on a dead-
+    # looking holder), even though we've just confirmed the PID in it is
+    # our own. Confirmed live 2026-10-01: a release() crashed this way
+    # after a file's processing was otherwise complete, losing 6.5h of
+    # progress - a fresh rerun is the only recovery once that happens.
+    # Safe to swallow either way: if the file truly didn't go away, our own
+    # process is about to exit regardless (this only ever runs at the end
+    # of a `with gpu_lock.hold(...)` block), and the next waiter's
+    # _try_remove_stale() will reclaim it via the normal dead-PID path.
+    with contextlib.suppress(FileNotFoundError, PermissionError):
         os.remove(LOCK_PATH)
 
 
