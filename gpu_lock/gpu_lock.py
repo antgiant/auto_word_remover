@@ -185,7 +185,16 @@ def acquire(owner: str, reason: str, timeout: float | None = None) -> None:
 
             try:
                 fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
+                # Windows can raise PermissionError (errno 13) here instead
+                # of FileExistsError when another process is mid-delete on
+                # this same path (release() or _try_remove_stale() racing
+                # us) - a transient access-denied rather than a clean
+                # "already exists" (confirmed live 2026-09-30/10-01: crashed
+                # a clean.py run outright instead of retrying). Treat it the
+                # same as FileExistsError: back off and retry: _read_lock()
+                # and _try_remove_stale() already tolerate the file being
+                # gone by the time we get to them.
                 holder = _read_lock()
                 if _try_remove_stale(holder):
                     continue
