@@ -14,11 +14,18 @@ Typical use:
 
 Outputs (written next to the input unless --output-dir is given):
     <name>.txt           plain text, one line per segment
-    <name>.json          full WhisperX result (segments + per-word start/end/score/speaker)
+    <name>.json          full WhisperX result (segments + per-word start/end/score/speaker;
+                         segments also carry the original ASR decoder's avg_logprob/
+                         no_speech_prob/compression_ratio/temperature, re-attached after
+                         alignment - see transcribe_file()'s pre_align_meta)
     <name>.srt           subtitles
     <name>.vtt           web captions
     <name>.tsv           start<TAB>end<TAB>text
-    <name>.words.json    flat list of every word: {word,start,end,score,speaker}
+    <name>.words.json    flat list of every word: {word,start,end,score,speaker,
+                         no_speech_prob,avg_logprob} (the last two are the word's segment's,
+                         not per-word - no_speech_prob in particular answers "does this sound
+                         like speech at all," a different question from `score`'s "how well
+                         does this text's timing align to the audio")
     <name>.speakers.txt  readable transcript grouped by speaker turn
 
 Configuration defaults live in config.toml next to this file; every one can be
@@ -278,7 +285,8 @@ def speakers_text(result) -> str:
 def flat_words(result) -> list[dict]:
     return [
         {"word": w.get("word", "").strip(), "start": w.get("start"), "end": w.get("end"),
-         "score": w.get("score"), "speaker": w.get("speaker")}
+         "score": w.get("score"), "speaker": w.get("speaker"),
+         "no_speech_prob": s.get("no_speech_prob"), "avg_logprob": s.get("avg_logprob")}
         for s in result.get("segments", []) for w in s.get("words", [])
     ]
 
@@ -330,6 +338,21 @@ def transcribe_file(path: Path, cfg: Config, models: dict) -> dict:
     language = result["language"]
     print(f"    transcribed  ({time.time()-t0:.0f}s, lang={language})", flush=True)
 
+    # whisperx.align() replaces result["segments"] wholesale with its own
+    # aligned segment dicts, which don't carry the original ASR-level
+    # confidence fields - capture them here, before that happens, so they can
+    # be merged back in afterward. These answer "does this sound like speech
+    # at all" (from the ASR decoder itself), a different and often more
+    # useful question than the forced-aligner's word-level "score" (which
+    # only measures how well assumed text matches audio timing, and says
+    # nothing about whether that text was ever actually spoken - confirmed
+    # live 2026-10-01: on a hallucinated-profanity false positive, aligner
+    # "score" for the hallucinated words was statistically indistinguishable
+    # from ordinary correctly-transcribed words, 0.417 vs 0.448 median).
+    CONFIDENCE_KEYS = ("avg_logprob", "no_speech_prob", "compression_ratio", "temperature")
+    pre_align_meta = [{k: seg.get(k) for k in CONFIDENCE_KEYS if k in seg}
+                      for seg in result["segments"]]
+
     # --- alignment ---
     if cfg.align:
         try:
@@ -349,6 +372,16 @@ def transcribe_file(path: Path, cfg: Config, models: dict) -> dict:
                 return_char_alignments=False, print_progress=cfg.print_progress,
             )
             result["language"] = language
+            aligned_segments = result.get("segments", [])
+            if len(aligned_segments) == len(pre_align_meta):
+                for seg, meta in zip(aligned_segments, pre_align_meta):
+                    for k, v in meta.items():
+                        seg.setdefault(k, v)
+            else:
+                print(f"    [warn] segment count changed after alignment "
+                      f"({len(pre_align_meta)} -> {len(aligned_segments)}) - pre-alignment "
+                      f"confidence fields (avg_logprob/no_speech_prob) dropped for this file",
+                      file=sys.stderr, flush=True)
             print(f"    aligned      ({time.time()-t0:.0f}s)", flush=True)
         except Exception as exc:
             print(f"    [warn] alignment failed ({exc!r}); keeping segment-level times", file=sys.stderr, flush=True)
