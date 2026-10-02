@@ -327,6 +327,9 @@ needs, any Python 3.10+ — see the version note above).
 | `--output-dir DIR` | scratch dir for temp files (default `out\`) — not where the result ends up; that always replaces the source |
 | `--overwrite` | allow clobbering a leftover file at the destination from an earlier run where the extension changed; irrelevant when the destination is the source's own path (always replaced) |
 | `--force` | `mute`/`bleep` only: rerunning on an already-cleaned file re-detects from the true original source and only replaces the existing `(Cleaned)` track if the flagged words actually changed — `--force` rebuilds and replaces it anyway, even with no change (see AGENTS.md) |
+| `--stt-only` | detect-and-report only: transcribe + run the local-subtitle-only backfill chain (OpenSubtitles forced off) and write `<name>.flags.json`, but never touch audio or replace the source — for pre-warming the (expensive) transcript ahead of a real clean on a file you're not ready to clean yet. A later plain run reuses the cached, alignment-checked `<name>.json` automatically. Not valid with `--method dialog` |
+| `--transcript-formats all` | `--stt-only` (or any fresh transcript): request the full Voice_to_Text output set (srt/vtt/txt/tsv/speakers.txt/words.json), not just `json` |
+| `--diarize-transcript` | `--stt-only` (or any fresh transcript): also run speaker diarization (off by default — detection never needs it, and it's a real extra GPU cost) |
 
 Run `clean.ps1 --help` (or `clean.py --help`) for the full list, including
 `--retranscribe`, `--no-srt-backfill`, and `--config` (point at a different

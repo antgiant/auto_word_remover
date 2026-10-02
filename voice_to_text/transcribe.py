@@ -17,7 +17,11 @@ Outputs (written next to the input unless --output-dir is given):
     <name>.json          full WhisperX result (segments + per-word start/end/score/speaker;
                          segments also carry the original ASR decoder's avg_logprob/
                          no_speech_prob/compression_ratio/temperature, re-attached after
-                         alignment - see transcribe_file()'s pre_align_meta)
+                         alignment - see transcribe_file()'s pre_align_meta). result["_meta"]
+                         ["aligned"] reflects whether forced alignment actually SUCCEEDED
+                         (not merely whether it was requested) - a consumer that trusts this
+                         file's per-word timings (e.g. profanity_filter) should check it before
+                         reuse rather than assume every .json has word-accurate timing.
     <name>.srt           subtitles
     <name>.vtt           web captions
     <name>.tsv           start<TAB>end<TAB>text
@@ -354,6 +358,11 @@ def transcribe_file(path: Path, cfg: Config, models: dict) -> dict:
                       for seg in result["segments"]]
 
     # --- alignment ---
+    align_succeeded = False   # distinct from cfg.align (what was REQUESTED) - this is whether
+    #   forced alignment actually completed; _meta["aligned"] below records this, not the
+    #   request, so a caller deciding whether to trust this file's word-level timings (e.g.
+    #   profanity_filter's ensure_transcript()) can't be fooled by a request that silently
+    #   fell back to segment-level times after an exception in the try block below.
     if cfg.align:
         try:
             if language not in models["align_cache"]:
@@ -382,6 +391,7 @@ def transcribe_file(path: Path, cfg: Config, models: dict) -> dict:
                       f"({len(pre_align_meta)} -> {len(aligned_segments)}) - pre-alignment "
                       f"confidence fields (avg_logprob/no_speech_prob) dropped for this file",
                       file=sys.stderr, flush=True)
+            align_succeeded = True
             print(f"    aligned      ({time.time()-t0:.0f}s)", flush=True)
         except Exception as exc:
             print(f"    [warn] alignment failed ({exc!r}); keeping segment-level times", file=sys.stderr, flush=True)
@@ -410,7 +420,7 @@ def transcribe_file(path: Path, cfg: Config, models: dict) -> dict:
         "duration_sec": round(dur, 3),
         "model": cfg.model,
         "compute_type": models["compute_type"],
-        "aligned": cfg.align,
+        "aligned": align_succeeded,
         "diarized": cfg.diarize,
         "elapsed_sec": round(time.time() - t0, 1),
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),

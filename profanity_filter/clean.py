@@ -125,10 +125,27 @@ Usage:
   clean.py "Movie.mkv" --method dialog
   clean.py "Movie.mkv" --dry-run
   clean.py "Movie.mkv" --force  # rebuild even if a rerun finds the same words already covered
+  clean.py "Movie.mkv" --stt-only --transcript-formats all --diarize-transcript
+      # pre-warm the transcript + local-subtitle backfill only - writes <name>.flags.json,
+      # never touches audio or replaces the source (see "stt" step below)
 
 The stemmer (mute_fill="stems", and --method dialog by default) needs a
 one-time setup - see README.md - and both features degrade automatically
 (to plain silence / a clear error) when it isn't installed.
+
+--stt-only runs steps 1-3 below (transcript, flag, backfill - OpenSubtitles
+forced off, so only subtitles already local to the file are used: embedded
+text/CC608, a sidecar file, or an OCR'd PGS/VobSub bitmap track) and writes
+"<name>.flags.json" instead of continuing to step 4 (remove)/5 (subs)/6
+(remux)/7 (replace) - the source is never touched. A later plain
+`clean.py <file>` run on the same file reuses the cached "<name>.json"
+transcript automatically (ensure_transcript() - see its own docstring for
+the alignment check that guards this reuse) instead of re-running
+Voice_to_Text, so the (GPU-heavy) transcription cost is paid at most once no
+matter which mode ran first. Note the report filename is deliberately NOT
+"<name>.bleeps.json" - that name is a "fully processed, nothing left to do"
+sentinel some batch drivers key off of (see AGENTS.md), and an --stt-only
+pass is explicitly not a real clean.
 """
 from __future__ import annotations
 
@@ -374,6 +391,28 @@ class Config:
     retranscribe: bool = False
     overwrite: bool = False
 
+    stt_only: bool = False              # detect-and-report only: run transcript + the local-only
+    #                                    subtitle-discovery/backfill chain (OpenSubtitles forced off -
+    #                                    see main()) and write "<name>.flags.json", but never touch
+    #                                    audio/mux/replace the source. Meant for a sweep that wants the
+    #                                    (expensive, GPU-bound) transcript - and the (cheap) local-
+    #                                    subtitle backfill - cached ahead of time without actually
+    #                                    cleaning the file yet. Deliberately writes a DIFFERENT report
+    #                                    name than --record-clean's "<name>.bleeps.json": that filename
+    #                                    is the "<name>.bleeps.json" ? fully processed, skip forever"
+    #                                    sentinel a batch driver like _batch_movies_full.py's
+    #                                    discover_new() keys off of - an stt-only pass must never look
+    #                                    like a real clean to that logic.
+    transcript_formats: str = "json"    # forwarded to voice_to_text's own --formats - "json" (default,
+    #                                    the only format clean.py's own detection needs) or "all"/a
+    #                                    comma list for a sweep that wants the full output set (srt/
+    #                                    vtt/txt/tsv/speakers.txt/words.json) cached for other uses too
+    transcript_diarize: bool = False    # forwarded as --diarize/--no-diarize to voice_to_text - off by
+    #                                    default (clean.py's own detection never needs speaker labels,
+    #                                    and diarization is a real extra GPU cost); a caller building a
+    #                                    generally-useful transcript library (e.g. the --stt-only sweep)
+    #                                    can turn it on
+
 
 def load_config(path: Path) -> Config:
     cfg = Config()
@@ -536,21 +575,54 @@ def has_audio_track(streams: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 # steps
 # ---------------------------------------------------------------------------
-def ensure_transcript(media: Path, cfg: Config) -> Path:
+def _transcript_is_aligned(js: Path) -> bool:
+    """True only if `js` was produced by a WhisperX run where forced
+    alignment actually SUCCEEDED (transcribe.py's result["_meta"]["aligned"]
+    - see its own docstring/comment, fixed alongside this to reflect real
+    success rather than just whether alignment was requested). Without
+    forced alignment, per-word timing is only whole-segment granularity,
+    which is too coarse to safely drive span removal - a transcript that
+    predates _meta (or had alignment fail/get skipped) must never be
+    silently trusted as if it were a normal word-accurate cache hit. Used
+    by ensure_transcript()/ensure_vocals_transcript() to gate reuse of any
+    pre-existing "<name>.json" - including one dropped next to a file by an
+    external sweep (e.g. a Voice_to_Text-only batch run over a library this
+    tool hasn't cleaned yet), not just one this tool produced itself."""
+    try:
+        data = json.loads(js.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool((data.get("_meta") or {}).get("aligned"))
+
+
+def ensure_transcript(media: Path, cfg: Config, formats: str = "json",
+                      diarize: bool = False) -> Path:
     js = media.with_suffix(".json")
     if js.is_file() and not cfg.retranscribe:
-        print(f"  transcript: {js.name} (reusing)")
-        return js
+        if _transcript_is_aligned(js):
+            print(f"  transcript: {js.name} (reusing)")
+            return js
+        print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript "
+              f"(_meta.aligned missing/false) - word timings would be too coarse to trust; "
+              f"re-transcribing instead of reusing it", file=sys.stderr)
     py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
     script = VOICE_TO_TEXT / "transcribe.py"
     if not py.is_file() or not script.is_file():
-        raise SystemExit(f"[error] no '{js.name}' next to the input and "
+        raise SystemExit(f"[error] no usable '{js.name}' next to the input and "
                          f"Voice_to_Text not found at {VOICE_TO_TEXT}")
     print(f"  transcript: running Voice_to_Text on {media.name} ...")
-    run([str(py), "-X", "utf8", str(script), str(media),
-         "--formats", "json", "--no-diarize"], cwd=str(VOICE_TO_TEXT))
+    # --overwrite always passed: this call only ever happens when a fresh run is actually
+    # wanted (js absent, cfg.retranscribe, or the reuse-rejection above) - without it,
+    # transcribe.py's own "<name>.json exists -> skip" check would silently hand back
+    # whatever stale/unaligned file is already sitting there instead of redoing the work.
+    cmd = [str(py), "-X", "utf8", str(script), str(media), "--formats", formats, "--overwrite"]
+    cmd.append("--diarize" if diarize else "--no-diarize")
+    run(cmd, cwd=str(VOICE_TO_TEXT))
     if not js.is_file():
         raise SystemExit("[error] transcription produced no .json")
+    if not _transcript_is_aligned(js):
+        print(f"  [warn] {js.name}: alignment did not succeed even on this fresh pass - "
+              f"word timings fall back to coarser segment-level times", file=sys.stderr)
     return js
 
 
@@ -1548,8 +1620,11 @@ def ensure_vocals_transcript(media: Path, vocals_wav: Path, tmp: Path, cfg: Conf
     media's."""
     js = media.with_name(f"{media.stem}.vocals.json")
     if js.is_file() and not cfg.retranscribe:
-        print(f"  transcript (vocals stem): {js.name} (reusing)")
-        return js
+        if _transcript_is_aligned(js):
+            print(f"  transcript (vocals stem): {js.name} (reusing)")
+            return js
+        print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript - "
+              f"re-transcribing the vocals stem instead of reusing it", file=sys.stderr)
     py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
     script = VOICE_TO_TEXT / "transcribe.py"
     if not py.is_file() or not script.is_file():
@@ -2265,6 +2340,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "clean' apart from 'never checked' without separate bookkeeping of its "
                         "own. Off by default so a plain interactive run's silence keeps meaning "
                         "'nothing happened here'")
+    p.add_argument("--stt-only", dest="stt_only", action="store_true", default=None,
+                   help="detect-and-report only: run the transcript + local-subtitle-only "
+                        "backfill chain (no OpenSubtitles) and write <name>.flags.json, but "
+                        "never touch audio or replace the source - for pre-warming the "
+                        "(expensive) transcript + backfill ahead of a real clean. Not valid "
+                        "with --method dialog (no wordlist scan happens there)")
+    p.add_argument("--transcript-formats", dest="transcript_formats",
+                   help="voice_to_text --formats to request when a transcript has to be run "
+                        "(default 'json' - all clean.py's own detection needs); 'all' or a "
+                        "comma list for a sweep that wants the full output set cached too")
+    p.add_argument("--diarize-transcript", dest="transcript_diarize", action="store_true",
+                   default=None,
+                   help="request speaker diarization when a transcript has to be run (off by "
+                        "default - clean.py's own detection never needs speaker labels, and "
+                        "it's a real extra GPU cost)")
     p.add_argument("--config", default=str(HERE / "config.toml"))
     return p
 
@@ -2344,12 +2434,21 @@ def main(argv: list[str] | None = None) -> int:
                  "sync_ms", "subs_track", "srt_backfill", "sidecar_subs", "sidecar_lang",
                  "pgs_ocr", "pgs_ocr_lang", "vobsub_ocr", "vobsub_ocr_lang", "opensubtitles",
                  "opensubtitles_lang", "opensubtitles_query", "opensubtitles_id",
-                 "stem_retranscribe", "output_dir", "retranscribe", "overwrite"]:
+                 "stem_retranscribe", "output_dir", "retranscribe", "overwrite",
+                 "stt_only", "transcript_formats", "transcript_diarize"]:
         val = getattr(args, name, None)
         if val is not None:
             setattr(cfg, name, val)
     if args.categories:
         cfg.categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+
+    if cfg.stt_only:
+        if cfg.method == "dialog":
+            raise SystemExit("[error] --stt-only doesn't apply to --method dialog - dialog "
+                             "strips all dialogue without ever scanning the wordlists, so "
+                             "there's no detection pass to report")
+        cfg.opensubtitles = False   # stt-only is for pre-warming local-only detection - never
+        #   spend an OpenSubtitles download/quota on a file that isn't being cleaned yet
 
     tools = locate_tools()
     ffmpeg, ffprobe = tools["ffmpeg"], tools["ffprobe"]
@@ -2414,7 +2513,8 @@ def main(argv: list[str] | None = None) -> int:
         twice."""
         nonlocal js
         if js is None:
-            js = ensure_transcript(media, cfg)
+            js = ensure_transcript(media, cfg, formats=cfg.transcript_formats,
+                                   diarize=cfg.transcript_diarize)
         return js
 
     tracks_all = run_json([mkvmerge, "-J", str(media)])["tracks"]
@@ -2687,6 +2787,35 @@ def main(argv: list[str] | None = None) -> int:
                 words = ", ".join(sorted({h["match"] for h in hs}))
                 tag = "  [srt-only]" if hs and all(h.get("source") == "srt-backfill" for h in hs) else ""
                 print(f"    {fmt_hms(s)} - {fmt_hms(e)}  {words}{tag}")
+
+            if cfg.stt_only:
+                if pgs_source_track is not None:
+                    subs_source = "pgs_ocr"
+                elif vobsub_source_track is not None:
+                    subs_source = "vobsub_ocr"
+                elif resynced_extra_srt is not None:
+                    subs_source = "sidecar"
+                elif chosen_subs is not None:
+                    subs_source = "embedded"
+                else:
+                    subs_source = None
+                report_path = media.with_name(f"{media.stem}.flags.json")
+                report_path.write_text(json.dumps({
+                    "source": str(media),
+                    "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "transcript": str(js),
+                    "subtitle_backfill_source": subs_source,
+                    "hits": len(all_hits),
+                    "hits_from_srt_backfill": sum(
+                        1 for h in all_hits if h.get("source") == "srt-backfill"),
+                    "spans": [{"start": round(s, 3), "end": round(e, 3),
+                               "matches": sorted({h["match"] for h in hs})} for s, e, hs in spans],
+                }, indent=2), encoding="utf-8")
+                print(f"  stt-only: wrote {report_path.name} ({len(all_hits)} hit(s), "
+                      f"subtitle backfill source: {subs_source or 'none found locally'}) - "
+                      f"no audio changed, nothing replaced")
+                return 0
+
             new_words = sorted({h["match"].lower() for s, e, hs in spans for h in hs})
             if already_cleaned:
                 prev_report = final_dest.parent / f"{final_dest.stem}.bleeps.json"

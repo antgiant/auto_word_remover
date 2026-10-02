@@ -715,6 +715,65 @@ rerun happens; would need `ensure_transcript` to extract the chosen original
 track itself rather than handing the whole container to `transcribe.py` to
 close properly.
 
+### `--stt-only` (pre-warming a transcript without cleaning) and the alignment-reuse guard
+
+`ensure_transcript()` reuses `<name>.json` next to the input when present -
+but only after `_transcript_is_aligned()` confirms `result["_meta"]["aligned"]`
+is `true`. This matters because that file doesn't have to be one `clean.py`
+itself produced: anything that drops a `<name>.json` next to a media file -
+most notably a sibling sweep like `_batch_in_progress_video.py` (personal,
+`Profanity_Filter` shell - see below) running `clean.py --stt-only` ahead of
+time - is a candidate for reuse too. `transcribe.py`'s own `_meta["aligned"]`
+reflects whether forced alignment actually **succeeded**, not merely whether
+it was requested (fixed alongside this - previously it just echoed
+`cfg.align`, so a run where the `try`/`except` around `whisperx.align()`
+silently fell back to coarser segment-level timing still claimed `aligned:
+true`). A `<name>.json` that fails this check (missing `_meta`, or
+`aligned: false`) is treated exactly like a missing file - re-transcribed,
+not blindly trusted - since word-level hit timing isn't safe to build spans
+from without real forced alignment. `ensure_vocals_transcript()` guards its
+own `<name>.vocals.json` reuse the same way, for consistency (lower practical
+risk there - that file's only ever written by `clean.py` itself, always via
+the same always-aligned transcribe.py call).
+
+`--stt-only` (`cfg.stt_only`) runs the full pipeline through step 3
+(transcript -> flag -> backfill) - with `cfg.opensubtitles` forced off
+regardless of config/CLI, since paying for a download/quota on a file that
+isn't being cleaned yet defeats the purpose - then writes `<name>.flags.json`
+(hits/spans/`subtitle_backfill_source`) and returns **before** step 4
+(remove) ever runs: no ffmpeg, no mkvmerge, no stemming, source never
+touched. Rejected outright for `--method dialog` (no wordlist scan happens
+there, so there's nothing to report). The report is deliberately NOT named
+`<name>.bleeps.json` - that's the "fully processed, skip forever" sentinel
+`_batch_movies_full.py`'s `discover_new()`-equivalent scanning keys off of; a
+`--stt-only` pass finding a file isn't a real clean and must never look like
+one to that logic (a file swept here, then later moved into a real library
+and picked up by the daily movies sweep, must still get a genuine clean.py
+run - the sweep only needs to see that its OWN sentinel, `<name>.flags.json`,
+isn't there yet).
+
+`--transcript-formats`/`--diarize-transcript` (`cfg.transcript_formats`/
+`cfg.transcript_diarize`, forwarded to `ensure_transcript()`) default to
+`"json"`/`False` - unchanged from always-on behaviour, since `clean.py`'s own
+detection never needs more than the bare json or speaker labels. A sweep
+building a generally-useful transcript library (not just feeding `clean.py`)
+passes `all`/`True` to get the full Voice_to_Text output set (srt/vtt/txt/
+tsv/speakers.txt/words.json) plus diarization cached alongside.
+
+**`_batch_in_progress_video.py`** (personal, `Profanity_Filter` shell, not
+this repo - same reasoning as `_batch_movies_full.py`): a much simpler
+sibling of that script, sweeping `J:\Media\In Progress Video` nightly with
+`clean.py --stt-only --transcript-formats all --diarize-transcript`. No
+OpenSubtitles means no quota/retry-queue machinery to carry over, and no
+Extras-folder distinction either (that only ever existed to decide whether
+to skip an OpenSubtitles call). "New" is keyed off `<name>.flags.json`
+absence, same idea as the movies script's `<name>.bleeps.json` key. Run via
+the "ProfanityFilter STT Sweep - In Progress Video" Scheduled Task (daily
+3:30am, 30 min after the movies sweep - both are safe to run concurrently,
+since gpu_lock's fair FIFO queue serializes real GPU contention regardless,
+but staggering avoids both paying Python/model-load startup overhead at the
+exact same moment).
+
 ### Coexisting with a "(No Narration)"/"(Wordless)" alt track
 
 A file can carry a narration-free alt track from a prior `--method dialog`

@@ -66,6 +66,10 @@ Three tools that work together, each usable on its own:
   (image-based) subtitle formats.
 - **Smart reruns** — running the tool again on an already-cleaned file only
   rebuilds if the actual set of flagged words changed.
+- **Detect-only mode** (`--stt-only`) — transcribe and cross-check local
+  subtitles without touching audio, for pre-warming a library ahead of a real
+  cleaning pass. A later full run reuses that cached transcript automatically
+  (with a check that it's genuinely word-aligned, not just present).
 - **Audiobook/podcast support** — `cut` losslessly splices flagged spans out
   of mp3 sources (no re-encode) and remaps chapter markers onto the new,
   shorter timeline; ID3 tags and cover art are preserved.
