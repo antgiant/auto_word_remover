@@ -366,6 +366,22 @@ class Config:
     opensubtitles_query: str = ""      # override the title auto-guessed from the filename
     opensubtitles_id: str = ""         # exact OpenSubtitles file_id to download - bypasses search
 
+    faith_detection: bool = True        # TMDB keyword/genre lookup (tmdb.py) to detect an overtly
+    #                                    Christian / faith-based film (movie OR TV) - when found,
+    #                                    swaps "irreverence"/"profanity" for the stricter
+    #                                    "irreverence_strict"/"profanity_strict" wordlists in
+    #                                    resolve_categories() (FAITH_CATEGORY_SWAP). irreverence.txt's
+    #                                    exclamation patterns ("sweet Jesus", "my Lord", "God
+    #                                    willing", ...) and profanity.txt's bare "hell"/"ass"/"whore"/
+    #                                    "prick" are overwhelmingly SINCERE prayer/worship or literal
+    #                                    scripture in that genre, not profanity - muting them would be
+    #                                    the opposite of this tool's purpose. Needs a free TMDB API
+    #                                    key (see tmdb.py docstring); degrades gracefully (a warning,
+    #                                    the normal wordlists are used) without one, or when neither
+    #                                    category is even in --categories to begin with.
+    tmdb_query: str = ""                # override the title auto-guessed from the filename for the
+    #                                    TMDB faith-based lookup above (same idea as opensubtitles_query)
+
     stem_retranscribe: bool = True     # absolute last resort, tried only when the ENTIRE subtitle-
     #                                    discovery chain above (embedded/sidecar/PGS/VobSub/
     #                                    OpenSubtitles) came up with nothing at all - meaning the
@@ -631,6 +647,38 @@ def load_matchers(cfg: Config) -> dict:
         sys.path.insert(0, str(HERE))
     import flag_language  # lives in this folder
     return flag_language.load_matchers(only=set(cfg.categories))
+
+
+FAITH_CATEGORY_SWAP = {"irreverence": "irreverence_strict", "profanity": "profanity_strict"}
+
+
+def resolve_categories(cfg: Config, media: Path) -> list[str]:
+    """Swap "irreverence"/"profanity" for the stricter "irreverence_strict"/
+    "profanity_strict" wordlists (see wordlists/*_strict.txt) when `media` is
+    detected as an overtly Christian / faith-based film via tmdb.py -
+    irreverence.txt's exclamation patterns ("sweet Jesus", "my Lord", "oh my
+    God", ...) and profanity.txt's bare "hell"/"ass"/"whore"/"prick" are
+    overwhelmingly sincere prayer/worship or literal scripture in that genre,
+    not profanity, so removing them would undo exactly what this tool is
+    for. See AGENTS.md ("Faith-based detection"). No-op (returns
+    cfg.categories unchanged) when neither category is in play,
+    faith_detection is off, or detection can't tell either way (no API key,
+    no match, network error)."""
+    cats = list(cfg.categories)
+    if not (set(cats) & FAITH_CATEGORY_SWAP.keys()) or not cfg.faith_detection:
+        return cats
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import tmdb
+    try:
+        faith = tmdb.check_faith_based(media, cfg, force=cfg.retranscribe)
+    except Exception as exc:
+        print(f"  [warn] faith-based detection failed ({exc!r}) - using the normal "
+              f"profanity/irreverence wordlists", file=sys.stderr)
+        return cats
+    if not faith:
+        return cats
+    return [FAITH_CATEGORY_SWAP.get(c, c) for c in cats]
 
 
 def load_extra_spans(path: Path) -> list[dict]:
@@ -2310,6 +2358,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="override the OpenSubtitles search title auto-guessed from the filename")
     p.add_argument("--opensubtitles-id", dest="opensubtitles_id",
                    help="exact OpenSubtitles file_id to download - bypasses search entirely")
+    p.add_argument("--no-faith-detection", dest="faith_detection", action="store_false", default=None,
+                   help="don't look up TMDB to detect an overtly Christian/faith-based film (see "
+                        "tmdb.py) - always use the normal irreverence wordlist instead of the "
+                        "stricter irreverence_strict one")
+    p.add_argument("--tmdb-query", dest="tmdb_query",
+                   help="override the title auto-guessed from the filename for the TMDB "
+                        "faith-based-detection lookup")
     p.add_argument("--no-stem-retranscribe", dest="stem_retranscribe", action="store_false",
                    default=None,
                    help="don't isolate vocals and re-transcribe as an absolute last resort when "
@@ -2434,6 +2489,7 @@ def main(argv: list[str] | None = None) -> int:
                  "sync_ms", "subs_track", "srt_backfill", "sidecar_subs", "sidecar_lang",
                  "pgs_ocr", "pgs_ocr_lang", "vobsub_ocr", "vobsub_ocr_lang", "opensubtitles",
                  "opensubtitles_lang", "opensubtitles_query", "opensubtitles_id",
+                 "faith_detection", "tmdb_query",
                  "stem_retranscribe", "output_dir", "retranscribe", "overwrite",
                  "stt_only", "transcript_formats", "transcript_diarize"]:
         val = getattr(args, name, None)
@@ -2500,6 +2556,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"== {media.name} ==")
     matchers, js = {}, None
     if cfg.method != "dialog":                    # 'dialog' strips ALL dialogue - no wordlists needed
+        cfg.categories = resolve_categories(cfg, media)
         matchers = load_matchers(cfg)
 
     def get_transcript() -> Path:

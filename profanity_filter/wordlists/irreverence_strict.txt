@@ -1,0 +1,75 @@
+# irreverence_strict.txt  --  irreverence.txt, minus phrases that are
+# commonly SINCERE prayer/worship rather than profanity.
+#
+# Used automatically in place of irreverence.txt when tmdb.py detects an
+# overtly Christian / faith-based film (see clean.py's resolve_categories /
+# Config.faith_detection) - can also be selected by hand with
+# --categories "profanity,irreverence_strict". irreverence.txt's own
+# exclamation patterns are tuned for ordinary movies, where a phrase shaped
+# like "sweet Jesus" or "oh my God" is almost always a flippant exclamation.
+# In a faith-based film those exact phrases are frequently genuine prayer or
+# devotional address instead - muting them censors the sincere content the
+# film is actually about, the opposite of this tool's purpose.
+#
+# Dropped entirely vs. irreverence.txt, because each is a common SINCERE
+# form in faith content, not profanity:
+#   sweet Jesus / sweet Lord / sweet mother of God   - term of devotion
+#   good Lord / my Lord                               - reverent address
+#   lord have mercy                                   - literal liturgy (Kyrie eleison)
+#   holy mother of God                                - Marian title (Theotokos)
+#   Jesus, Mary, and Joseph                            - a real Catholic invocation
+#   oh my God / oh my Lord                             - too ambiguous in this genre
+#   God almighty / God in heaven / God willing /
+#     God forbid / God help (me|us|you)                - common sincere invocations
+#
+# Still flagged here (unambiguous mockery/exclamation/profanity compounds,
+# not prayer forms): goddamn-type compounds, "Jesus [fucking/freaking/
+# fricking] Christ", "Christ on a ___", "Christ almighty", "holy Christ/
+# Jesus" (shock, not a doctrinal title), minced oaths (omg, geez, jeepers,
+# cripes, golly, ...), and the frustration idioms "for X's sake(s)" / "for
+# the love of X" / "swear to God" / "honest to God" - these read as
+# exasperation or a vain oath even in faith-based dialogue, not devotion.
+#
+# Syntax (same as profanity.txt / irreverence.txt):
+#   plain text   = literal phrase, case-insensitive, whole-word
+#   re:<pattern> = raw case-insensitive regex
+#   '#'          = comment
+
+# --- expletive compounds built on "God" ---
+re:\bgod ?damn\w*
+re:\bgod ?dam+it\b
+re:\bgoddamn\w*
+re:\bg[ -]?d\b
+
+# --- "Jesus" / "Christ" as mockery/shock, not a prayer form ---
+re:\bjesus (fricking christ|freaking christ|fucking christ)\b
+re:\bchrist (almighty|on a \w+)\b
+re:\bholy (christ|jesus)\b
+
+# --- minced oaths / euphemisms (always casual slang, never devotional) ---
+re:\boh my (gosh|goodness|word)\b
+re:\bomg\b
+re:\bgee+z\w*
+re:\bjee+z\w*
+re:\bgosh darn\w*
+re:\bgol ?dang\w*
+re:\bdad ?gum\w*
+re:\bgod ?dang\w*
+re:\bjeepers( creepers)?\b
+re:\bcripes\b
+re:\bgolly\b
+re:\bgadzooks\b
+re:\bjiminy( cricket| christmas)?\b
+
+# --- frustration idioms / vain oaths (exasperation, not devotion) ---
+re:\bfor (the love of )?(god|christ|heaven|pete|pity|goodness)'?s? sakes?\b
+re:\bfor the love of (god|christ|pete|all that is holy)\b
+re:\b(i )?swear to god\b
+re:\bhonest to (god|goodness)\b
+
+# --- bare sacred names: high false-positive rate, OFF by default ---
+# Uncomment any of these to flag every occurrence for manual review.
+# re:\bgod'?s?\b
+# re:\blord'?s?\b
+# re:\bjesus\b
+# re:\bchrist\b

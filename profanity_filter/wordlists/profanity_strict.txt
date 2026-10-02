@@ -1,0 +1,81 @@
+# profanity_strict.txt  --  profanity.txt, minus bare words that are also
+# literal biblical/theological vocabulary, not slang, in that specific sense.
+#
+# Used automatically in place of profanity.txt when tmdb.py detects an
+# overtly Christian / faith-based film (see clean.py's resolve_categories /
+# Config.faith_detection) - can also be selected by hand with
+# --categories "profanity_strict,irreverence_strict".
+#
+# Unlike irreverence.txt's exclamation PHRASES, these are single bare words
+# with genuinely overlapping senses - a regex can't tell "what the hell"
+# (casual curse) apart from "saved from hell" (sincere theology); they're
+# lexically identical. Dropping them here is a real trade, not a free win:
+# a faith-based film's more dramatic scenes using one of these words as an
+# actual insult/curse will go uncensored. Accepted deliberately, the same
+# honest trade-off this project already makes everywhere else ("occasionally
+# mutes too much, very rarely too little" - see root README).
+#
+# Dropped entirely vs. profanity.txt, because each is also literal
+# scripture/doctrine, not just slang:
+#   hell (bare)      - the theological place/concept (Matthew 5:22, 10:28,
+#                       Revelation 20:14, ...), constant in salvation/
+#                       damnation-themed dialogue
+#   ass (bare)       - "ass" meaning donkey - Balaam's ass (Numbers 22),
+#                       Jesus riding into Jerusalem on an ass (the Palm
+#                       Sunday narrative) - the classic "Scunthorpe problem"
+#                       false positive, especially common in Nativity/
+#                       biblical-adaptation films
+#   whore (+ forms)  - KJV/other translations use "whore"/"whoredom"
+#                       literally (Revelation 17's "great whore", Hosea,
+#                       Ezekiel - describing idolatry) - a direct scripture
+#                       quote or Bible-adaptation film could trip this
+#   prick (bare)     - KJV Acts 9:5, "it is hard for thee to kick against
+#                       the pricks" (Paul's conversion) - occasionally quoted
+#                       in testimony/conversion scenes
+#
+# Still flagged here: everything else in profanity.txt, including "damn"/
+# "dammit" (kept - judged to carry real profane use far more often than it
+# carries sincere theological use, unlike the four above) and idioms that
+# use one of the dropped words but are always profane regardless of context
+# ("bloody hell", "piece of crap/shit", "son of a bitch").
+#
+# Syntax (same as profanity.txt):
+#   plain text   = literal word / phrase, matched case-insensitively, whole-word
+#   re:<pattern> = a raw (case-insensitive) regular expression
+#   '#'          = comment
+
+re:fu+ck\w*
+re:mother ?fu+ck\w*
+re:motherf\w*
+re:sh[i1]+t\w*
+bullshit
+horseshit
+batshit
+re:\bdumbass\w*
+re:\bjackass\w*
+re:\basshole\w*
+re:\basshat\w*
+re:\bass ?wipe\w*
+re:\bass ?clown\w*
+re:\bdamn\w*
+re:\bdammit\b
+re:b[i1]+tch\w*
+re:\bbastard\w*
+re:\bdick(head|wad|face|bag)\w*
+re:\bdicks?\b
+re:\bpiss(ed|ing|er|es)?\b
+re:\bpiss off\b
+re:\bcunt\w*
+re:\bcocksuck\w*
+re:\btwat\w*
+re:\bwank(er|ing|ed|s)?\b
+re:\bbollocks\b
+re:\bslut\w*
+re:\bnigg(a|er)\w*
+re:\bfag(got)?s?\b
+re:\bretard\w*
+re:\bcrap(py|ping|ped|s)?\b
+re:\bbugger\w*
+re:\bbloody hell\b
+re:\bson of a bitch\b
+re:\bpiece of (shit|crap)\b

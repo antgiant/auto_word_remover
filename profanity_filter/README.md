@@ -163,6 +163,22 @@ already has an "original" passing through untouched): an uncensored
 censored `"<lang> (OpenSubtitles) (Cleaned)"` track (still the default
 subtitle) matching the cleaned one.
 
+### 6. TMDB setup (optional)
+
+Only needed for automatic faith-based detection (see "Faith-based films" below) -
+without a key, `clean.py` always uses the normal `irreverence` wordlist.
+Skip this if you're fine tuning that by hand instead (`--categories` /
+`--no-faith-detection`); it degrades gracefully (a warning, the normal
+wordlist is used) when no key is configured.
+
+1. Get a free API key at
+   [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
+   (create an account, then request a "Developer"/v3 API key).
+2. Put it somewhere `tmdb.py` will find it - either:
+   - a `TMDB_API_KEY` environment variable, or
+   - a new file named `tmdb.key` right next to `tmdb.py`, containing nothing
+     but the key on one line (gitignored - never committed).
+
 ### Install checklist
 
 - [ ] `voice_to_text` set up as a sibling folder (its own venv, its own README)
@@ -170,6 +186,7 @@ subtitle) matching the cleaned one.
 - [ ] `bin\mkvtoolnix\mkvmerge.exe` present (or MKVToolNix installed system-wide)
 - [ ] *(optional)* `.venv-stem\` set up per step 4, GPU verified if you have one
 - [ ] *(optional)* an OpenSubtitles API key per step 5, for the TV-recording subtitle fallback
+- [ ] *(optional)* a TMDB API key per step 6, for automatic faith-based detection
 
 ---
 
@@ -207,7 +224,12 @@ needs, any Python 3.10+ — see the version note above).
    short interjections. Missed words are timed via the transcript's own word
    timings where they line up, interpolated where the word was dropped
    outright. On a test film this roughly doubled the hits found (25 -> 46).
-   Disable with `--no-srt-backfill`. If there's no usable embedded text
+   Disable with `--no-srt-backfill`. Before scanning, a TMDB lookup
+   (`tmdb.py`) checks whether the film is overtly Christian/faith-based; if
+   so, the `irreverence` category is swapped for the stricter
+   `irreverence_strict` wordlist so sincere prayer/worship lines aren't
+   muted as if they were profanity — see "Faith-based films" below.
+   If there's no usable embedded text
    track, a **sidecar subtitle file** next to the input (e.g. `Movie.srt`,
    `Movie.en.srt`) is tried next; if there's no usable local subtitle at
    all (embedded or sidecar), it falls back to OCR'ing an embedded PGS/
@@ -320,6 +342,8 @@ needs, any Python 3.10+ — see the version note above).
 | `--opensubtitles-query "title"` | override the search title auto-guessed from the filename |
 | `--opensubtitles-id 12345` | exact OpenSubtitles file_id to download - bypasses search entirely |
 | `--opensubtitles-lang en` | 2-letter language to search/download (default `en`) |
+| `--no-faith-detection` | don't look up TMDB to detect an overtly Christian/faith-based film - always use the normal `irreverence` wordlist (see "Faith-based films") |
+| `--tmdb-query "title"` | override the title auto-guessed from the filename for the TMDB faith-based lookup |
 | `--no-stem-retranscribe` | don't isolate vocals and re-transcribe as an absolute last resort when no subtitle source was found anywhere (needs the stemmer) |
 | `--sync-ms N` | `mute`/`bleep`/`dialog` only: delay the clean track by N ms if lip-sync drifts |
 | `--extra-spans file.json` | hand-reviewed `[{start,end,label,category}]` spans to remove in addition to the wordlists (e.g. content no regex can safely catch) — always included, regardless of `--categories` |
@@ -380,6 +404,33 @@ default ("goddamn", "oh my God", "Jesus Christ", "for heaven's sake", minced
 oaths). Uncomment the block at the bottom to also flag every bare
 "God" / "Jesus" / "Lord" / "Christ" for manual review.
 
+### Faith-based films (and TV)
+
+`irreverence.txt`'s exclamation patterns are tuned for ordinary movies,
+where a phrase shaped like "sweet Jesus" or "oh my God" is almost always a
+flippant exclamation. In an overtly Christian / faith-based title, those same
+phrases are frequently sincere prayer or devotional address instead —
+filtering them out mutes exactly the content the film is about, the
+opposite of what this tool is for. `profanity.txt` has a smaller version of
+the same problem: bare "hell" and "ass" are also literal biblical vocabulary
+("saved from hell", "rode in on an ass"), and bare "whore"/"prick" occasionally
+turn up in a direct scripture quote.
+
+When a [TMDB API key](#6-tmdb-setup-optional) is configured, `clean.py`
+looks the title up on TMDB before scanning (a TV series if the filename has
+a "SxxExx" in it, a movie otherwise) and, if it's tagged as a
+Christian/faith-based title there, automatically swaps `irreverence` →
+`wordlists/irreverence_strict.txt` and `profanity` →
+`wordlists/profanity_strict.txt` — each is the normal list minus the entries
+that are commonly sincere/biblical in that genre (see the comment block at
+the top of each file for exactly what's dropped and why — note that
+`profanity_strict.txt` accepts a real trade: since "hell"/"ass" are single
+words, not phrases, dropping them also lets a faith-based film's more
+dramatic scenes use them as a genuine curse/insult without being censored).
+No key configured, no TMDB match, or `--no-faith-detection` → the normal
+wordlists are used, same as always. You can also select the stricter lists
+by hand on any file with `--categories "profanity_strict,irreverence_strict"`.
+
 ---
 
 ## WhisperX validation (experimental)
@@ -416,9 +467,12 @@ clean.py             the pipeline: transcript -> flag -> remove -> remux
 flag_language.py     standalone detection (no media/ffmpeg needed)
 opensubtitles.py     last-resort subtitle source (search + download), for
                      when there's no usable local subtitle at all
+tmdb.py              faith-based-film detection (TMDB genre/keyword lookup) -
+                     swaps in wordlists/irreverence_strict.txt when a match
 _whisperx_check.py   experimental: validate a center-mute with real ASR
 config.toml          defaults for clean.py (copy + --config to override)
-wordlists\           profanity.txt / irreverence.txt - edit freely
+wordlists\           profanity.txt / irreverence.txt / profanity_strict.txt /
+                     irreverence_strict.txt - edit freely
 bin\                 gitignored - mkvmerge/mkvextract go here (see Install)
 .venv-stem\          gitignored - optional stemmer venv (see Install step 4)
 out\                 scratch dir (temp files + --keep-temp debug artifacts) -

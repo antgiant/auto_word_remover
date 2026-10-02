@@ -17,7 +17,8 @@ for the whole toolkit and goes stale fast otherwise.
 |---|---|
 | `flag_language.py` | transcript scanner — finds every profanity / irreverence hit + timestamp in any common transcript format. Standalone CLI **and** importable API. |
 | `opensubtitles.py` | last-resort subtitle source — search + download from OpenSubtitles when there's no usable local subtitle at all (see "OpenSubtitles fallback" below). Standalone, pure stdlib. |
-| `wordlists/` | `profanity.txt`, `irreverence.txt` — plain-text match lists, re-read every run |
+| `tmdb.py` | faith-based-film detection — TMDB genre/keyword lookup that swaps the `irreverence` category for the stricter `irreverence_strict` one on an overtly Christian/faith-based film (see "Faith-based detection" below). Standalone, pure stdlib. |
+| `wordlists/` | `profanity.txt`, `irreverence.txt`, `profanity_strict.txt`, `irreverence_strict.txt` — plain-text match lists, re-read every run |
 | `clean.py` | end-to-end: media in → transcript → flag → mute (or bleep) one audio track → mkvmerge remux → cleaned `.mkv` |
 | `clean.ps1` | launcher (runs `clean.py` with the sibling voice_to_text project's venv, UTF-8 console) |
 | `config.toml` | `clean.py` defaults |
@@ -380,6 +381,153 @@ real commercial-broken TV recording - validated so far only by code review
 against the documented algorithm and by exercising `resync_units_to_
 transcript()`/`is_ad_cue()` on synthetic inputs.
 
+### Faith-based detection (`tmdb.py`, swapping to the `*_strict.txt` wordlists)
+
+**The gap this closes**: `irreverence.txt` was already written to be
+high-precision - only exclamatory/expletive *shapes* are active by default
+("oh my God", "sweet Jesus", "God willing", "lord have mercy", "my Lord",
+...), not every bare sacred name. That precision assumption holds for an
+ordinary movie, where a line shaped like "Sweet Jesus, help me" is
+overwhelmingly a flippant exclamation. It breaks down specifically for an
+overtly Christian / faith-based title, where those exact phrase shapes are
+frequently genuine prayer or devotional address instead - "Lord have
+mercy" is literally a line of liturgy (Kyrie eleison), "sweet Jesus" and
+"my Lord" are common terms of devotion, "Jesus, Mary, and Joseph" is a real
+Catholic invocation, and "God willing" / "God help us" are everyday sincere
+dialogue in that genre. Muting them doesn't just produce a false positive -
+it censors the sincere religious content the film is actually about, the
+opposite of what this tool exists to do.
+
+`profanity.txt` has a smaller version of the same problem, but with a
+different shape: bare `hell` and `ass` are also literal biblical vocabulary
+("saved from hell", Balaam's ass / Jesus riding into Jerusalem on an ass),
+and bare `whore`/`prick` occasionally show up in a direct scripture quote
+(Revelation 17, Acts 9:5 KJV). Unlike `irreverence.txt`'s multi-word
+*phrases*, these are single bare words with genuinely overlapping senses -
+no regex can tell "what the hell" (casual curse) apart from "saved from
+hell" (sincere theology). Dropping them is a real trade, not a free win:
+`wordlists/profanity_strict.txt` accepts that a faith-based title's more
+dramatic scenes using one of these words as an actual insult/curse will go
+uncensored, as the lesser evil next to muting sincere scripture/theology.
+
+**Detection (`tmdb.py`)**: a small stdlib-only module, same shape as
+`opensubtitles.py` (urllib only, free API key via `TMDB_API_KEY` env var or
+a gitignored `tmdb.key` file next to it, never raises out of its public
+entry point). `check_faith_based(media, cfg)`:
+
+1. Reuses `opensubtitles.guess_query(media)` for the title/year guess
+   (`--tmdb-query` overrides the title text, same idea as
+   `--opensubtitles-query`) - deliberately not duplicated, since both
+   modules need the exact same filename-noise-stripping logic and
+   `opensubtitles.py` has zero API dependencies of its own to import for
+   this. Also keeps the parsed `season_number` even when `--tmdb-query` is
+   given, since **that's** what decides movie vs. TV below, not the title.
+2. **Movie vs. TV**: TMDB needs a completely different pair of endpoints for
+   a series than a movie, so `guess_query()`'s `season_number` (the same
+   signal `opensubtitles.search()` already keys its own
+   `season_number`/`episode_number` params off of - i.e. a "SxxExx" found in
+   the filename) picks `search_tv()`/`tv_keywords()`/`tv_genres()` over
+   `search_movie()`/`movie_keywords()`/`movie_genres()`. Mapped field names
+   differ too (`name`/`first_air_date` vs. `title`/`release_date`) - handled
+   inline in `check_faith_based()`, not pushed onto callers.
+   **One genuine API inconsistency hit here**: the movie keywords endpoint
+   (`GET /movie/{id}/keywords`) returns them under a `"keywords"` key, but
+   the TV one (`GET /tv/{id}/keywords`) returns the same shape under
+   `"results"` instead - not a typo, a real quirk in TMDB's own API that
+   `tv_keywords()` has a comment calling out so it doesn't look like a bug
+   on a future read.
+3. `GET /search/movie` (or `/search/tv`) on TMDB, takes the top (already
+   relevance-ranked) result.
+4. The matched title's keywords + genres (movie or TV, per above) checked
+   against `FAITH_KEYWORDS` - a deliberately narrow substring list
+   ("christian film", "faith-based", "gospel", "evangelical", "biblical",
+   "megachurch", "missionary", ...). Kept narrow on purpose: broad terms
+   like "prayer" or "pastor" would false-positive ordinary dramas that
+   merely feature a religious scene without the film itself being faith
+   content.
+5. Caches the result (query, matched TMDB id/title, genres, keywords,
+   `faith_based`) as `<name>.tmdb.meta.json` next to the media, so a rerun
+   never re-hits the network - mirrors `opensubtitles.py`'s own
+   `.meta.json` caching. A failed search is cached too (`faith_based:
+   null`), so a title TMDB can't find doesn't re-query every run either.
+
+Returns `True`/`False` once matched, or `None` when it genuinely can't tell
+(no API key, no search result, a network/API error) - `clean.py` treats
+`None` exactly like `False` (keep the normal wordlist) and this never
+blocks or fails the pipeline, same degrade-gracefully posture as every
+other optional integration here.
+
+**Wiring (`clean.py`)**: `resolve_categories(cfg, media)` runs right before
+`load_matchers(cfg)` in `main()` (skipped entirely for `--method dialog`,
+which never touches the wordlists). It's a no-op unless `cfg.categories`
+contains `"irreverence"` and/or `"profanity"` (`FAITH_CATEGORY_SWAP`'s keys)
+and `cfg.faith_detection` is on (the default); otherwise it calls
+`tmdb.check_faith_based()` and, only on a `True`, returns `cfg.categories`
+with each key in `FAITH_CATEGORY_SWAP` mapped to its `_strict` value
+(`"irreverence"` -> `"irreverence_strict"`, `"profanity"` ->
+`"profanity_strict"` - a category present in `cfg.categories` but absent
+from the map, e.g. a custom one, passes through unchanged). `cfg.categories`
+itself is reassigned to the result, so both `load_matchers()` and the later
+`find_spans()` category filter (`cats = set(cfg.categories)`) see the
+swapped names consistently without either needing to know why they changed.
+`--no-faith-detection` disables the lookup outright (always the normal
+wordlists); `"irreverence_strict"`/`"profanity_strict"` were added to
+`flag_language.CATEGORIES` so they load from their `wordlists/*_strict.txt`
+file exactly like any other category, and can also be selected directly by
+hand with `--categories "profanity_strict,irreverence_strict"` without TMDB
+involved at all.
+
+**`wordlists/irreverence_strict.txt`**: not a separate hand-written list
+maintained independently - it's `irreverence.txt` with the
+sincere-in-context entries removed, and its own header comment documents
+exactly what was dropped and why (so the two files don't silently drift
+out of sync over time without someone noticing). Kept: profanity-compound
+patterns (`goddamn`, `god dammit`, ...), unambiguous shock/mockery forms
+(`Christ on a ___`, `holy Christ/Jesus`, `Jesus fucking Christ`), minced
+oaths that are always casual slang (`geez`, `jeepers`, `omg`, ...), and the
+frustration idioms (`for god's sake`, `swear to God`, `honest to God`) -
+these read as exasperation or a vain oath (itself the kind of thing
+Christian teaching on reverent speech warns against) even in faith-based
+dialogue, not devotion. Dropped: `sweet Jesus`/`sweet Lord`, `good Lord`/
+`my Lord`, `lord have mercy`, `holy mother of God`, `Jesus, Mary, and
+Joseph`, `oh my God`/`oh my Lord`, and the `God almighty`/`God in heaven`/
+`God willing`/`God forbid`/`God help (me|us|you)` block - each a form
+that's commonly sincere in this genre specifically. `"Jesus wept"` was also
+dropped from the shock-exclamation entry it used to share with the
+profanity-compound variants: it's a direct, well-known Bible quote (John
+11:35), so flagging it is a textbook example of the exact problem this
+whole feature exists to fix.
+
+**`wordlists/profanity_strict.txt`**: same idea, `profanity.txt` minus four
+bare-word entries - `hell`, `ass`, `whore` (+ forms), `prick` - each also
+literal scripture/doctrine in this genre (see that file's own header for
+the verse-level detail). Deliberately did NOT drop `damn`/`dammit`: judged
+to carry real profane use far more often than sincere theological use,
+unlike the other four, so keeping it trades away less real detection than
+it would gain in false-positive avoidance. Idioms that happen to use a
+dropped word but are always profane regardless of context
+(`bloody hell`, `son of a bitch`, `piece of shit/crap`) are kept as-is -
+only the bare-word entries were ambiguous, not these.
+
+**Setup**: free v3 API key at
+[themoviedb.org/settings/api](https://www.themoviedb.org/settings/api),
+then `TMDB_API_KEY` env var or a `tmdb.key` file next to `tmdb.py` (same
+two-step convention as `opensubtitles.key`). No key -> a warning, detection
+skipped, normal wordlist used - never a hard failure.
+
+**Known limitation, not fixed here**: `FAITH_KEYWORDS` matching is
+case-insensitive substring matching against whatever a film happens to be
+tagged with on TMDB - community-sourced tagging is inconsistent, so a real
+faith-based film with sparse/no keywords on TMDB will simply fall through
+to the normal `irreverence` wordlist (the same safe default as having no
+API key at all), not a crash or a wrong censor. Not yet validated against a
+real batch of faith-based titles end-to-end - built and reasoned through
+from TMDB's documented keyword/genre shape, same status as the
+OpenSubtitles title-guessing heuristic above. The movie/TV branch is new and
+specifically unvalidated against a real TV recording's filename shapes
+beyond the synthetic "SxxExx" cases `guess_query()` was already tested
+against for OpenSubtitles.
+
 ### VobSub OCR + bitmap censoring (DVD bitmap subtitles, `vobsub_ocr.py`)
 
 The VobSub (DVD-era, `S_VOBSUB`) analogue of `pgs_ocr.py` above, same
@@ -548,7 +696,11 @@ high-precision expletive patterns active ("goddamn", "oh my God",
 "Jesus Christ", "for heaven's sake", minced oaths); a commented block at the
 bottom, if enabled, flags every bare "God" / "Jesus" / "Lord" / "Christ" —
 expect many false positives on devotional content. Tune the lists rather than
-hard-coding terms in the script.
+hard-coding terms in the script. `irreverence_strict.txt`/`profanity_strict.txt`
+are `irreverence.txt`/`profanity.txt` minus the entries that are commonly
+*sincere* prayer/devotion or literal scripture rather than profanity —
+auto-selected for an overtly Christian/faith-based title, see "Faith-based
+detection" below.
 
 ## clean.py — remove profanity from a media file
 

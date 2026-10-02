@@ -48,7 +48,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 WORDLIST_DIR = HERE / "wordlists"
-CATEGORIES = ("profanity", "irreverence")
+CATEGORIES = ("profanity", "irreverence", "profanity_strict", "irreverence_strict")
 TRANSCRIPT_EXTS = {".json", ".srt", ".vtt", ".lrc", ".tsv", ".txt"}
 
 # preference order when a folder holds several formats for the same recording

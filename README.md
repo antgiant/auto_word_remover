@@ -66,6 +66,11 @@ Three tools that work together, each usable on its own:
   (image-based) subtitle formats.
 - **Smart reruns** — running the tool again on an already-cleaned file only
   rebuilds if the actual set of flagged words changed.
+- **Faith-based film awareness** — a free TMDB lookup detects an overtly
+  Christian/faith-based film and automatically swaps in a stricter wordlist
+  that doesn't flag sincere prayer/worship lines ("sweet Jesus", "my Lord",
+  "God willing", ...) as if they were profanity, so the filter doesn't end
+  up censoring the very content the film is about.
 - **Detect-only mode** (`--stt-only`) — transcribe and cross-check local
   subtitles without touching audio, for pre-warming a library ahead of a real
   cleaning pass. A later full run reuses that cached transcript automatically

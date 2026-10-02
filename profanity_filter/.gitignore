@@ -15,3 +15,6 @@ __pycache__/
 
 # OpenSubtitles API key (see opensubtitles.py) - never commit this
 /opensubtitles.key
+
+# TMDB API key (see tmdb.py) - never commit this
+/tmdb.key

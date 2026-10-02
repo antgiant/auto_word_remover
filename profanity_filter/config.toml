@@ -130,6 +130,22 @@ opensubtitles_lang = "en"    # 2-letter language to search/download
 opensubtitles_query = ""     # override the title auto-guessed from the filename
 opensubtitles_id = ""        # exact OpenSubtitles file_id to download - bypasses search
 
+# detect an overtly Christian / faith-based title (movie OR TV, via its
+# filename's "SxxExx") with a TMDB genre/keyword lookup (tmdb.py) and, when
+# found, swap "irreverence"/"profanity" for the stricter
+# "irreverence_strict"/"profanity_strict" wordlists (wordlists/*_strict.txt)
+# - irreverence.txt's exclamation patterns ("sweet Jesus", "my Lord", "God
+# willing", ...) and profanity.txt's bare "hell"/"ass"/"whore"/"prick" are
+# overwhelmingly SINCERE prayer/worship or literal scripture in that genre,
+# not profanity, so removing them undoes exactly what this tool is for.
+# Needs a free TMDB API key (see tmdb.py docstring - TMDB_API_KEY env var, or
+# a gitignored tmdb.key file next to tmdb.py); degrades gracefully (a
+# warning, the normal wordlists are used) without one, or when neither
+# category is even in `categories` to begin with. Result is cached next to
+# the input as "<name>.tmdb.meta.json".
+faith_detection = true
+tmdb_query = ""              # override the title auto-guessed from the filename for the TMDB lookup
+
 # cross-check the embedded SRT for profanity the transcript missed entirely
 # (dropped or mis-heard words); located via the transcript's own word timings
 # where possible, interpolated between neighbours otherwise. See
