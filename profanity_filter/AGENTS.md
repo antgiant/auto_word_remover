@@ -761,18 +761,29 @@ passes `all`/`True` to get the full Voice_to_Text output set (srt/vtt/txt/
 tsv/speakers.txt/words.json) plus diarization cached alongside.
 
 **`_batch_in_progress_video.py`** (personal, `Profanity_Filter` shell, not
-this repo - same reasoning as `_batch_movies_full.py`): a much simpler
-sibling of that script, sweeping `J:\Media\In Progress Video` nightly with
+this repo): sweeps `J:\Media\In Progress Video` with
 `clean.py --stt-only --transcript-formats all --diarize-transcript`. No
-OpenSubtitles means no quota/retry-queue machinery to carry over, and no
-Extras-folder distinction either (that only ever existed to decide whether
-to skip an OpenSubtitles call). "New" is keyed off `<name>.flags.json`
-absence, same idea as the movies script's `<name>.bleeps.json` key. Run via
-the "ProfanityFilter STT Sweep - In Progress Video" Scheduled Task (daily
-3:30am, 30 min after the movies sweep - both are safe to run concurrently,
-since gpu_lock's fair FIFO queue serializes real GPU contention regardless,
-but staggering avoids both paying Python/model-load startup overhead at the
-exact same moment).
+OpenSubtitles means no quota/retry-queue machinery, and no Extras-folder
+distinction either (that only ever existed to decide whether to skip an
+OpenSubtitles call). "New" is keyed off `<name>.flags.json` absence, same
+idea as the movies script's `<name>.bleeps.json` key.
+
+Follows **`_no_narration_sweep.py`'s refresh/worker run model**, not
+`_batch_movies_full.py`'s single-daily-lock one - a file added right after a
+once-a-day run would otherwise sit untouched for up to 24h before its
+transcript even started. "Run" means two separately-lockable things: a quick
+REFRESH (rglob the library, recompute the pending queue wholesale from
+"no `.flags.json` sidecar yet" - cheap, no ffprobe/clean.py involved) that
+always happens, and a WORKER (actually invoking `clean.py --stt-only`, one
+file at a time, possibly for many minutes) that only one instance may run at
+once - a second instance just refreshes the queue and exits if a worker is
+already active, exactly like the no-narration sweep's own
+refresh-vs-worker split. Run via the "ProfanityFilter STT Sweep - In
+Progress Video" Scheduled Task - hourly (`CalendarTrigger` + `Repetition`
+`PT1H`/`P1D`, same pattern as "NoNarration Hourly Sweep"'s own trigger),
+`MultipleInstances = Parallel` (not `IgnoreNew` - a refresh-only firing must
+never be blocked behind a worker that could still be running from hours
+ago).
 
 ### Coexisting with a "(No Narration)"/"(Wordless)" alt track
 
