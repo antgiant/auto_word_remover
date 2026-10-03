@@ -84,6 +84,11 @@ clean_bitrate_surround = "448k"    # lossy codecs only, for a >2 channel source
 source_track = "default"
 
 track_name_suffix = " (Cleaned)"
+# used instead of track_name_suffix above when faith_detection (below) swaps
+# in the stricter *_strict wordlists for an overtly Christian/faith-based
+# title, so that version's track/filename is distinguishable from a
+# normal-rules "(Cleaned)" one at a glance.
+faith_track_suffix = " (Cleaned - Christian Edition)"
 sync_ms = 0                  # mkvmerge --sync for the clean track; bump if lip-sync drifts
 
 # "dialog" only: name/default-ness of the new dialogue-free track.

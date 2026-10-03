@@ -153,6 +153,7 @@ import argparse
 import contextlib
 import dataclasses
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -308,6 +309,14 @@ class Config:
     #                                    recognised center channel
     source_track: str = "default"      # "default" | index | 3-letter language
     track_name_suffix: str = " (Cleaned)"
+    faith_track_suffix: str = " (Cleaned - Christian Edition)"  # used instead of
+    #                                    track_name_suffix when faith_detection (below) swaps in
+    #                                    the *_strict wordlists - see resolve_categories() - so a
+    #                                    faith-based title's cleaned track/filename is never
+    #                                    mistaken for (or silently overwritten by) a normal-rules
+    #                                    "(Cleaned)" one, and the two are distinguishable at a
+    #                                    glance. Not used for cfg.method == "dialog" (that method
+    #                                    never calls resolve_categories - see main()).
     sync_ms: int = 0                   # mkvmerge --sync for the clean track
 
     mute_fill: str = "stems"           # "mute" only: "stems" (default) plays the stemmed-out
@@ -663,7 +672,14 @@ def resolve_categories(cfg: Config, media: Path) -> list[str]:
     for. See AGENTS.md ("Faith-based detection"). No-op (returns
     cfg.categories unchanged) when neither category is in play,
     faith_detection is off, or detection can't tell either way (no API key,
-    no match, network error)."""
+    no match, network error).
+
+    Also swaps cfg.track_name_suffix to cfg.faith_track_suffix as a side
+    effect when the swap fires, so the cleaned track/filename this run
+    produces is distinguishable from a normal-rules "(Cleaned)" one - every
+    later consumer of cfg.track_name_suffix (is_own_output_track, remux,
+    clean_label, the --keep-temp debug copies) runs after this call in
+    main() and reads cfg.track_name_suffix fresh, so the swap just works."""
     cats = list(cfg.categories)
     if not (set(cats) & FAITH_CATEGORY_SWAP.keys()) or not cfg.faith_detection:
         return cats
@@ -678,6 +694,7 @@ def resolve_categories(cfg: Config, media: Path) -> list[str]:
         return cats
     if not faith:
         return cats
+    cfg.track_name_suffix = cfg.faith_track_suffix
     return [FAITH_CATEGORY_SWAP.get(c, c) for c in cats]
 
 
@@ -1508,13 +1525,27 @@ def _invoke_separator(stem_tool: str, wav_in: Path, out_dir: Path, cfg: Config,
            "--output_dir", str(out_dir), "--output_format", "WAV"]
     if single_stem is not None:
         cmd += ["--single_stem", single_stem]
+    # audio-separator's pydub backend writes its WAV output via
+    # tempfile.NamedTemporaryFile() with no dir= (see pydub's
+    # AudioSegment.export, taken whenever a codec is passed - which the
+    # "WAV" --output_format always does), so it lands in the OS default
+    # temp dir (%TEMP%/%TMP%) rather than --output_dir. On this machine
+    # that's the system drive, which runs much tighter on free space than
+    # the drive this scratch tree lives on - a multi-GB whole-track
+    # extraction landing there intermittently exhausts it with a
+    # "No space left on device" that has nothing to do with how much room
+    # is actually left under out_dir. Pointing TEMP/TMP at out_dir itself
+    # keeps the stemmer's temp files on the same (spacious) drive/tree as
+    # everything else this job already writes, and lets the existing
+    # stale-scratch-dir sweep clean them up same as any other leftover.
+    env = dict(os.environ, TEMP=str(out_dir), TMP=str(out_dir))
     for attempt in range(1, STEM_RETRY_ATTEMPTS + 1):
         try:
             job = f"{_CURRENT_JOB} - " if _CURRENT_JOB else ""
             gpu_ctx = (gpu_lock.hold("Profanity_Filter", f"stemming {job}{wav_in.name}")
                       if gpu_lock else contextlib.nullcontext())
             with gpu_ctx:
-                run(cmd)
+                run(cmd, env=env)
             return
         except subprocess.CalledProcessError:
             if attempt == STEM_RETRY_ATTEMPTS:

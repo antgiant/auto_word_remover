@@ -477,6 +477,16 @@ file exactly like any other category, and can also be selected directly by
 hand with `--categories "profanity_strict,irreverence_strict"` without TMDB
 involved at all.
 
+On the same `True` branch, `resolve_categories()` also overwrites
+`cfg.track_name_suffix` with `cfg.faith_track_suffix` (default `" (Cleaned -
+Christian Edition)"` vs. the normal `" (Cleaned)"`), so the output track/
+filename for a faith-based title is never mistaken for a normal-rules one
+at a glance. This runs before every other reader of `cfg.track_name_suffix`
+in `main()` (`is_own_output_track`, `remux`, `clean_label`, the
+`--keep-temp` debug copies), so the swap just propagates - no extra
+plumbing needed. `--method dialog` never calls `resolve_categories()` at
+all, so `faith_track_suffix` has no effect there.
+
 **`wordlists/irreverence_strict.txt`**: not a separate hand-written list
 maintained independently - it's `irreverence.txt` with the
 sincere-in-context entries removed, and its own header comment documents
