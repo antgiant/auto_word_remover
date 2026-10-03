@@ -414,6 +414,11 @@ def ocr_cue(cue: Cue, lang: str = "eng", psm: int = 6,
         img = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
 
     data = pytesseract.image_to_data(img, lang=lang, config=f"--psm {psm}", output_type=Output.DICT)
+    if "text" not in data:
+        # Tesseract emitted no TSV rows at all (not even a header) for this
+        # cue - seen on a degenerate/blank bitmap. No text recognized is a
+        # legitimate outcome for a subtitle cue, not an error.
+        return "", []
     words: list[dict] = []
     lines: dict[tuple, list[str]] = {}
     line_ids: dict[tuple, int] = {}
