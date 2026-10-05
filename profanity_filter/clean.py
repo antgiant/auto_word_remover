@@ -1140,12 +1140,27 @@ def is_own_output_track(t: dict, cfg: Config) -> bool:
     against, and silently blocked the no-usable-subtitle stem_retranscribe
     fallback from ever running on the file."""
     name = t.get("properties", {}).get("track_name") or ""
-    audio_suffix = cfg.dialog_track_suffix if cfg.method == "dialog" else cfg.track_name_suffix
+    # mute/bleed/cut has TWO possible suffixes a prior run could have used -
+    # cfg.track_name_suffix (normal) or cfg.faith_track_suffix (Christian/
+    # faith-based swap, see resolve_categories()) - and this run's OWN
+    # categories/detection result doesn't tell you which one a PAST run
+    # picked. Checking only whichever suffix happens to be active THIS run
+    # missed the other one entirely: a track named "... (Cleaned - Christian
+    # Edition)" wasn't recognized as this tool's own output by a run whose
+    # cfg.track_name_suffix was still the plain "(Cleaned)" (e.g. faith
+    # detection off/bypassed this time, or just not re-triggered), so it fell
+    # through as an ordinary audio track - and since it's the one flagged
+    # default (the newly-cleaned track always is), choose_audio() picked it
+    # straight back up as the source to clean AGAIN. Checking both suffixes
+    # regardless of which is active now fixes that.
+    audio_suffixes = ((cfg.dialog_track_suffix,) if cfg.method == "dialog"
+                      else (cfg.track_name_suffix, cfg.faith_track_suffix))
 
     def _matches(suffix: str) -> bool:
         return name == suffix.strip() or name.endswith(suffix)
 
-    return _matches(audio_suffix) or _matches(OPENSUBS_TRACK_SUFFIX) or _matches(SIDECAR_TRACK_SUFFIX)
+    return (any(_matches(s) for s in audio_suffixes)
+            or _matches(OPENSUBS_TRACK_SUFFIX) or _matches(SIDECAR_TRACK_SUFFIX))
 
 
 def _span_expr(spans) -> str:
