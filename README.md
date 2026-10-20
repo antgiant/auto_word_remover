@@ -56,7 +56,11 @@ Three tools that work together, each usable on its own:
 
 - **Multiple removal methods** — `mute` (default, smart-filled), `bleep`,
   `cut` (splice out entirely — for audio-only sources like audiobooks and
-  podcasts), and `dialog` (strip *all* narration into a wordless alt track).
+  podcasts), `dialog` (strip *all* narration into a wordless alt track), and
+  `replace` (swap the flagged word for a different, non-profane one, spoken
+  in a voice matching the original speaker — donor-word reuse, local
+  voice-cloned TTS, and pitch/energy matching, falling back to `mute` per
+  occurrence whenever it can't produce a confident result).
 - **Layered subtitle-aware detection** — embedded text track → CC608 →
   sidecar `.srt`/`.vtt`/`.ass` file → OCR of Blu-ray (PGS) and DVD (VobSub)
   bitmap subtitles → OpenSubtitles download with automatic resync — each
@@ -110,6 +114,12 @@ real setup time, especially on the first pass:
     separately.
   - **OpenSubtitles fallback** needs a free API key from
     opensubtitles.com.
+  - **`--method replace`** (swap the flagged word for a different one
+    instead of removing it) needs a third Python virtual environment with
+    a local TTS engine, a voice-conversion model, and a matching CUDA
+    build of PyTorch installed by hand (several more GB of downloads).
+    Skip it and `--method replace` falls back to muting every single
+    occurrence — same degrade-gracefully posture as the rest of this list.
 - Every optional piece degrades gracefully — a missing dependency prints a
   warning and the pipeline keeps going with what it has; it never hard-fails
   just because an extra wasn't set up.

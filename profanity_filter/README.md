@@ -179,6 +179,40 @@ wordlist is used) when no key is configured.
    - a new file named `tmdb.key` right next to `tmdb.py`, containing nothing
      but the key on one line (gitignored - never committed).
 
+### 7. TTS/Voice-Conversion setup (optional)
+
+Only needed for `--method replace` (swap a flagged word for a different,
+non-profane one instead of removing it - see AGENTS.md's "Word
+replacement" for the full design). Skip this and `--method replace` still
+works, it just falls back to muting every single occurrence - same
+degrade-gracefully posture as every other optional piece here.
+
+Same dedicated-venv idea as step 4's stemmer, for the same reason: this
+stack's own torch/CUDA pins should never touch `.venv-stem`'s or
+`voice_to_text\.venv`'s. `.venv-tts\` next to this file - never installed
+into the venv `clean.py` itself runs under.
+
+```powershell
+python -m venv .venv-tts
+.venv-tts\Scripts\pip install piper-tts pyworld numpy scipy soundfile
+.venv-tts\Scripts\pip install rvc-python   # verify the current package name/license first - this
+#                                            ecosystem moves fast; a maintained fork may be current
+
+# same CPU-only-by-default caveat as step 4's stemmer - install a matching
+# CUDA build of torch explicitly:
+.venv-tts\Scripts\pip install `
+  "torch==2.6.0+cu124" "torchvision==0.21.0+cu124" `
+  --index-url https://download.pytorch.org/whl/cu124
+
+.venv-tts\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
+# should print True
+```
+
+You'll also need at least one Piper voice model (an `.onnx` file) under
+`.venv-tts\piper_voices\` - see Piper's own documentation for downloading
+one. `word_replace.py` degrades to muting every occurrence if `.venv-tts\`
+or a voice model isn't found - it never hard-fails the whole run over it.
+
 ### Install checklist
 
 - [ ] `voice_to_text` set up as a sibling folder (its own venv, its own README)
@@ -187,6 +221,7 @@ wordlist is used) when no key is configured.
 - [ ] *(optional)* `.venv-stem\` set up per step 4, GPU verified if you have one
 - [ ] *(optional)* an OpenSubtitles API key per step 5, for the TV-recording subtitle fallback
 - [ ] *(optional)* a TMDB API key per step 6, for automatic faith-based detection
+- [ ] *(optional)* `.venv-tts\` set up per step 7, for `--method replace`
 
 ---
 
@@ -323,7 +358,7 @@ needs, any Python 3.10+ — see the version note above).
 
 | Flag | Meaning |
 |---|---|
-| `--method mute\|bleep\|cut\|dialog` | removal method (default `mute`; `cut` is audio-only-input only; `dialog` strips ALL dialogue, ignores the wordlists) |
+| `--method mute\|bleep\|cut\|dialog\|replace` | removal method (default `mute`; `cut` is audio-only-input only; `dialog` strips ALL dialogue, ignores the wordlists; `replace` swaps the word for a different one instead of removing it - see AGENTS.md, falls back to `mute` per occurrence when it can't produce a confident result) |
 | `--dry-run` | print the spans and stop |
 | `--pad 0.15` | padding (s) before & after each word (`--pad-start` / `--pad-end` for asymmetry) |
 | `--categories profanity,irreverence` | which lists to act on (default `profanity`) — **quote this value** (`--categories "profanity,irreverence"`); PowerShell mangles an unquoted comma into a space before it reaches `clean.py`, silently emptying the matcher list (see AGENTS.md) |
@@ -332,6 +367,14 @@ needs, any Python 3.10+ — see the version note above).
 | `--dialog-default` | `dialog` only: make the new `(Wordless)` track the default audio track |
 | `--center-mute` | `dialog` only: mute just the center channel for the whole file instead of stemming every channel — opt-in per file only, never auto-detected; fails loudly if the track has no recognised center channel |
 | `--beep-hz` / `--beep-gain-db` | `bleep` only: tone frequency / level (default 1000 Hz, −6 dBFS) |
+| `--replace-wordlist file.txt` | `replace` only: path to the word → replacement-word(s) map (default `wordlists/replacements.txt`) |
+| `--replace-max-candidates N` | `replace` only: try at most this many replacement words per occurrence (default 2) |
+| `--replace-donor-window N` | `replace` only: restrict donor-word search to within N seconds of the occurrence (default 0 = whole file) |
+| `--replace-min-speaker-audio N` | `replace` only: seconds of a speaker's isolated audio needed before training a voice-conversion model for them (default 30) |
+| `--no-replace-prosody` | `replace` only: don't transplant the original word's pitch/energy onto the replacement |
+| `--no-replace-scene-blend` | `replace` only: don't loudness/EQ-match the replacement to its surrounding scene |
+| `--replace-quality-threshold N` | `replace` only: minimum candidate score (0–1) to accept instead of muting (default 0.55) |
+| `--retrain-voice-model` | `replace` only: force-retrain a speaker's cached voice-conversion model |
 | `--clean-codec ac3\|eac3\|aac\|flac` / `--clean-bitrate` / `--clean-bitrate-surround` | `mute`/`bleep`/`dialog` only: codec + bitrate for the cleaned track (default `ac3` @ 224k for <=2ch, 448k for >2ch; or use `flac` for lossless) |
 | `--cut-bitrate` | `cut` only: bitrate for a lossy source codec (default 96k) |
 | `--source-track default\|0\|1\|eng` | which audio track to clean |
@@ -404,6 +447,12 @@ default ("goddamn", "oh my God", "Jesus Christ", "for heaven's sake", minced
 oaths). Uncomment the block at the bottom to also flag every bare
 "God" / "Jesus" / "Lord" / "Christ" for manual review.
 
+`wordlists\replacements.txt` is a different kind of file, used only by
+`--method replace`: a word/phrase → replacement-word(s) map
+(`fuck, fucking => freak, fudge`), not a detection list — see its own
+header and AGENTS.md's "Word replacement" for the format and how multiple
+candidates are picked.
+
 ### Faith-based films (and TV)
 
 `irreverence.txt`'s exclamation patterns are tuned for ordinary movies,
@@ -469,12 +518,19 @@ opensubtitles.py     last-resort subtitle source (search + download), for
                      when there's no usable local subtitle at all
 tmdb.py              faith-based-film detection (TMDB genre/keyword lookup) -
                      swaps in wordlists/irreverence_strict.txt when a match
+word_replace.py      --method replace orchestration (clean.py imports this one)
+word_replace_synth.py / word_replace_tts_driver.py
+                     two-stage TTS -> voice-conversion synthesis; the driver
+                     runs under its own .venv-tts
+word_replace_prosody.py / word_replace_blend.py / word_replace_score.py
+                     pitch/energy transplant, scene blending, candidate scoring
 _whisperx_check.py   experimental: validate a center-mute with real ASR
 config.toml          defaults for clean.py (copy + --config to override)
 wordlists\           profanity.txt / irreverence.txt / profanity_strict.txt /
-                     irreverence_strict.txt - edit freely
+                     irreverence_strict.txt / replacements.txt - edit freely
 bin\                 gitignored - mkvmerge/mkvextract go here (see Install)
 .venv-stem\          gitignored - optional stemmer venv (see Install step 4)
+.venv-tts\           gitignored - optional TTS/voice-conversion venv (step 7)
 out\                 scratch dir (temp files + --keep-temp debug artifacts) -
                      the cleaned result replaces the source in place instead
 AGENTS.md            engineering notes: how things work, known gotchas,
@@ -493,3 +549,6 @@ AGENTS.md            engineering notes: how things work, known gotchas,
   packages) — only needed for `mute_fill = "stems"` (the default) and
   `--method dialog`; see [Stemmer setup](#4-stemmer-setup-optional).
   Both degrade gracefully without it.
+- **Piper + RVC + pyworld**, in their own `.venv-tts\` — only needed for
+  `--method replace`; see [TTS/Voice-Conversion setup](#7-ttsvoice-conversion-setup-optional).
+  Degrades gracefully (falls back to muting every occurrence) without it.

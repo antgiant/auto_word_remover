@@ -96,6 +96,28 @@ dialog_track_suffix = " (Wordless)"
 dialog_track_default = false  # true = make it the default audio track (like "(Cleaned)" does);
 #                                false (default) = add it as a non-default alt track instead
 
+# "replace" only: swap a flagged word for a different, non-profane one -
+# spoken in a voice matching the original speaker, with a mandatory
+# fallback to the normal mute behaviour per occurrence whenever that can't
+# be done confidently. Forces diarization on regardless of
+# transcript_diarize below (needed for donor/voice-model speaker matching -
+# see AGENTS.md). Needs a one-time .venv-tts setup - see README; degrades
+# to muting every occurrence if it isn't installed.
+# replace_wordlist defaults to wordlists/replacements.txt next to clean.py -
+# not set here since a relative path here would resolve against the
+# current working directory, not this file's folder (--replace-wordlist on
+# the CLI takes an absolute path if you need a different file)
+replace_max_word_candidates = 2       # try at most this many replacement words per occurrence
+replace_min_donor_isolation_s = 0.12  # shorter real donor clips are too likely to be alignment noise
+replace_donor_search_window_s = 0.0   # 0 = search the whole file for a donor clip
+replace_min_speaker_audio_s = 30.0    # need at least this much isolated vocal audio per speaker
+#                                        before attempting to train a voice-conversion model for them
+replace_prosody = true                # transplant the original word's pitch/energy onto the replacement
+replace_scene_blend = true            # loudness/EQ/reverb-match the replacement to its scene
+replace_score_model = "small"         # WhisperX model used to re-check each rendered candidate
+replace_quality_threshold = 0.55      # a candidate scoring below this (0-1) is rejected -> mute instead
+retrain_voice_model = false           # force-retrain a cached per-speaker voice-conversion model
+
 # embedded SubRip subtitles: every cue that overlaps a removed span gets its
 # profane words censored, then re-muxed as a new default "(Cleaned)" track.
 # method="mute" removes the word entirely (no audible trace is left either);

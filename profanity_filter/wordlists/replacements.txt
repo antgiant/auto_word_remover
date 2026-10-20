@@ -1,0 +1,79 @@
+# replacements.txt  --  word/phrase -> non-profane replacement word(s), for
+# --method replace
+#
+# One entry per line. '#' starts a comment.
+#   surface1, surface2, ... => repl1, repl2, ...
+# - LEFT: literal, case-insensitive surface forms exactly as they appear in
+#   a flagged hit's matched text - inflections (fuck/fucking/fucked/...)
+#   are spelled out explicitly, there is no morphology/stemming here. A
+#   multi-word phrase works the same way (see the irreverence.txt section
+#   below) - the whole phrase is one key, not split into per-word lookups.
+# - RIGHT: one or more candidate replacement words/phrases, in your own
+#   priority order (used as a tiebreak when two candidates are otherwise
+#   equally good - see word_replace.select_replacement_words, which picks
+#   whichever candidate's length is closest to the original word's).
+# - A lookup MISS (surface form not listed here) degrades gracefully: that
+#   one occurrence falls back to the existing mute behaviour for just its
+#   own span - never a hard failure, never silently dropped.
+# - Not every open-ended wordlist pattern can be covered here. irreverence.txt
+#   detects some phrases via regex wildcards (e.g. "christ on a \w+" matches
+#   infinitely many literal variants) - a hand-authored exact-phrase table
+#   can only list the common instances you actually expect. An unlisted
+#   variant is a lookup miss -> mute, same as any other miss.
+#
+# This is a STARTER list, not a finished one - it's meant to be rewritten.
+# Pick your own replacement words freely (silly, deadpan, in-joke, whatever
+# you want); nothing here needs to read as a serious "TV edit" word choice.
+# Re-read every run; tune freely.
+
+fuck, fucking, fucked, fucks, fucker, fuckers => freak, flip, fudge
+motherfucker, motherfuckers, motherfucking => mother trucker, melon farmer
+shit, shitting, shitted, shits => crap, shoot, nuts
+bullshit => nonsense, baloney
+horseshit => nonsense
+batshit => bonkers
+dumbass, dumbasses => dummy, doofus
+jackass, jackasses => jerk, goofball
+asshole, assholes => jerk, creep
+asshat, asshats => goofball
+asswipe, asswipes => jerk
+assclown, assclowns => clown
+damn, dammit => darn, dang
+bitch, bitches, bitchy => witch, grouch
+bastard, bastards => scoundrel, rascal
+dickhead, dickheads, dickwad, dickface => jerk, knucklehead
+dick, dicks => jerk
+piss, pissed, pissing, pisser => peeved, ticked off
+hell => heck
+ass => butt
+cunt, cunts => witch
+cocksucker, cocksuckers => jerk
+twat, twats => jerk
+wanker, wankers, wanking, wanked => goofball
+bollocks => nonsense
+prick => jerk
+slut, sluts => tramp
+whore, whores => tramp
+retard, retards => dummy
+crap, crappy, crapping, crapped, craps => junk, rubbish
+bugger, buggers, buggered => bother
+goddamn, goddamned, goddamnit => dang, darn
+nigga, nigger, niggers => biscuit
+fag, faggot, faggots, fags => biscuit
+
+# --- multi-word phrases (irreverence.txt coverage) ---
+oh my god, oh my lord, oh my gosh, oh my goodness, oh my word => oh my stars, oh my goodness gracious
+good god, great god, dear god, sweet god, holy god, almighty god, my god => good grief, great scott
+jesus christ, jesus h christ => jiminy cricket, cheese and crackers
+jesus mary and joseph, jesus mary joseph => sugar snaps, biscuits and gravy
+christ almighty => cracking crackers
+holy christ, holy jesus, holy mother of god => holy cow, holy moly
+sweet jesus, sweet lord, sweet mother of god => sweet potatoes, sweet biscuits
+good lord => good grief
+lord have mercy => mercy me
+my lord => my stars
+swear to god, i swear to god => swear on a stack of pancakes
+for god's sake, for christ's sake, for heaven's sake, for pete's sake, for goodness sake => for goodness sake, for pete's sake
+honest to god, honest to goodness => honest to goodness
+god dammit, goddamn it => sugar snaps, fiddlesticks
+jeepers, jeepers creepers => jeepers

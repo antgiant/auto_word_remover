@@ -18,8 +18,13 @@ for the whole toolkit and goes stale fast otherwise.
 | `flag_language.py` | transcript scanner — finds every profanity / irreverence hit + timestamp in any common transcript format. Standalone CLI **and** importable API. |
 | `opensubtitles.py` | last-resort subtitle source — search + download from OpenSubtitles when there's no usable local subtitle at all (see "OpenSubtitles fallback" below). Standalone, pure stdlib. |
 | `tmdb.py` | faith-based-film detection — TMDB genre/keyword lookup that swaps the `irreverence` category for the stricter `irreverence_strict` one on an overtly Christian/faith-based film (see "Faith-based detection" below). Standalone, pure stdlib. |
-| `wordlists/` | `profanity.txt`, `irreverence.txt`, `profanity_strict.txt`, `irreverence_strict.txt` — plain-text match lists, re-read every run |
-| `clean.py` | end-to-end: media in → transcript → flag → mute (or bleep) one audio track → mkvmerge remux → cleaned `.mkv` |
+| `wordlists/` | `profanity.txt`, `irreverence.txt`, `profanity_strict.txt`, `irreverence_strict.txt` — plain-text match lists, re-read every run; `replacements.txt` — hand-authored word → replacement-word(s) map for `--method replace` (see "Word replacement" below) |
+| `word_replace.py` | `--method replace` orchestration: wordlist lookup/selection, donor-word search, the per-hit fallback chain, splice assembly, subtitle substitution. The only one of the files below `clean.py` itself imports. |
+| `word_replace_synth.py` / `word_replace_tts_driver.py` | two-stage TTS → voice-conversion synthesis; the driver runs under its own `.venv-tts` (see "Word replacement" below) |
+| `word_replace_prosody.py` | pitch/energy contour extraction + imposition (`pyworld`) |
+| `word_replace_score.py` | batched candidate re-transcription + scoring (calls `voice_to_text/transcribe_clip_batch.py`) |
+| `word_replace_blend.py` | loudness/EQ/reverb-approximation blending, pure ffmpeg |
+| `clean.py` | end-to-end: media in → transcript → flag → mute/bleep/replace one audio track → mkvmerge remux → cleaned `.mkv` |
 | `clean.ps1` | launcher (runs `clean.py` with the sibling voice_to_text project's venv, UTF-8 console) |
 | `config.toml` | `clean.py` defaults |
 | `bin/mkvtoolnix/` | portable MKVToolNix (mkvmerge v101) — `clean.py` finds it here automatically |
@@ -28,6 +33,8 @@ for the whole toolkit and goes stale fast otherwise.
 
 No venv of its own — `clean.ps1` / callers use `..\voice_to_text\.venv\Scripts\python.exe`
 (Python 3.11, already has everything). `flag_language.py` itself is pure stdlib.
+`--method replace`'s own TTS/voice-conversion stack is the one exception - see
+"Word replacement" below for its dedicated `.venv-tts`.
 
 **GPU lock**: two paths touch it now. `clean.py`/`_whisperx_check.py` invoke
 `voice_to_text\transcribe.py` as a subprocess for any WhisperX work, and
@@ -712,6 +719,11 @@ are `irreverence.txt`/`profanity.txt` minus the entries that are commonly
 auto-selected for an overtly Christian/faith-based title, see "Faith-based
 detection" below.
 
+`replacements.txt` is a different KIND of file - a word/phrase → replacement-
+word(s) mapping, not a detection wordlist (it's never run through
+`compile_wordlist()`/`load_matchers()`, and isn't a member of `CATEGORIES`).
+Used only by `--method replace` - see "Word replacement" below.
+
 ## clean.py — remove profanity from a media file
 
 ```powershell
@@ -823,7 +835,7 @@ now: the `TemporaryDirectory` location and where `--keep-temp` drops debug
 copies of the clean track / filter graph / clean subtitle. It is **not** where
 the cleaned result ends up - that's always `final_dest`.
 
-### Re-running on an already-cleaned file (`mute`/`bleep` only)
+### Re-running on an already-cleaned file (`mute`/`bleep`/`replace` only)
 
 Running `clean.py` a second time on a file it already cleaned doesn't just
 add another `(Cleaned)` track alongside the old one, and doesn't blindly
@@ -859,12 +871,14 @@ field records, no new state file needed):
   already exists: the existing track is left as-is - there's nothing to
   build a replacement from, and this tool doesn't "un-clean" a file.
 
-Scoped to `mute`/`bleep` only, matching what the user actually asked for
-("only if that would result in a different set of words"): `dialog` doesn't
-use wordlists at all (it strips ALL dialogue, so there's no word set to
-compare - it always reruns), and `cut` fully replaces the file with a
-shorter one with no separate alt track to detect/compare against in the
-first place.
+Scoped to `mute`/`bleep`/`replace` only, matching what the user actually
+asked for ("only if that would result in a different set of words"):
+`dialog` doesn't use wordlists at all (it strips ALL dialogue, so there's
+no word set to compare - it always reruns), and `cut` fully replaces the
+file with a shorter one with no separate alt track to detect/compare
+against in the first place. `replace` reuses `cfg.track_name_suffix` (see
+"Word replacement" above) so it's covered by this mechanism for free -
+no separate code path needed.
 
 **Known gap, not fixed here**: `ensure_transcript()` reuses `<name>.json` if
 present (the common case, and the only case this matters for) but otherwise
@@ -1125,6 +1139,179 @@ old whole-file approach was dropped in favor of this.
 
 No stemmer installed (`STEM_VENV` not found) -> falls back to the old plain
 `volume=0:enable='SPANS'` silence on the whole track.
+
+### Word replacement (`--method replace`, local TTS + voice conversion)
+
+Swaps a flagged word/phrase for a DIFFERENT, non-profane one instead of
+removing it - spoken in a voice matching the original speaker, entirely
+locally. This is a genuinely hard audio problem (naive voice-cloned TTS
+alone tends to sound flatly "read," mismatches duration, and sits dry
+against the scene's ambience), so this method layers several strategies
+rather than relying on one, and falls back to the normal `mute` behavior
+per OCCURRENCE (not per file) whenever a step below can't produce a
+confident result - never a hard failure, same "degrade gracefully"
+posture as every other optional piece of this project.
+
+**`wordlists/replacements.txt`** (hand-authored, step 1 of this feature -
+see that file's own header for the exact line format): surface form(s) →
+ordered replacement candidate(s), e.g. `fuck, fucking => freak, fudge`.
+Looked up via `word_replace.normalize_surface()` (reuses
+`flag_language._norm_tok`'s punctuation-stripping normalization - a second,
+independently-drifting normalizer bit this project once already, see SRT
+backfill's "Gotcha already hit and fixed" note above) against each hit's
+exact matched text, case/punctuation/whitespace-insensitively, phrase or
+single word alike. A lookup MISS - a surface form not listed, including
+any open-ended `re:` wildcard slot in `irreverence.txt` a literal table
+can't exhaustively enumerate (e.g. `christ on a \w+`) - mutes that one
+occurrence, same as every other failure mode below. Multiple replacement
+candidates are supported and picked deterministically
+(`select_replacement_words()`): whichever candidate's character length is
+closest to the original matched text's own length sorts first, ties broken
+by the file's own left-to-right order - a rough, reproducible proxy for
+duration fit, re-verified for real later via the scoring pass.
+
+**Diarization is forced on, unconditionally**, the moment `--method
+replace` is selected (`main()`, right after `cfg` is loaded) - regardless
+of `transcript_diarize`/`--diarize-transcript`:
+```python
+if cfg.method == "replace":
+    cfg.transcript_diarize = True
+```
+Donor-word matching and per-speaker voice-conversion models (both below)
+are only meaningful with real speaker labels; without them, donor search
+degrades to a time-proximity guess and every speaker's voice model
+training audio collapses into one shared bucket. A cache-reuse guard
+(`_transcript_has_speakers()`, parallel to `_transcript_is_aligned()`)
+makes sure a pre-existing, non-diarized `<name>.json`/`<name>.vocals.json`
+from an earlier (non-`replace`) run is never silently trusted here -
+`ensure_transcript()`/`ensure_vocals_transcript()` re-transcribe with
+`--diarize` instead when that check fails. **Known cost**: this means a
+`replace` run pays for real diarization even on a file whose transcript
+would otherwise be fully cached - accepted deliberately, since speaker
+accuracy is the whole point of forcing it on. `replace_num_speakers`/
+`replace_min_speakers`/`replace_max_speakers` optionally hint the count
+through to `voice_to_text`'s own diarization when you already know it.
+
+**Donor-word search** (`word_replace.find_donor_clip()`): before
+synthesizing anything, search this SAME file's own word timeline
+(`flag_language.load_word_timeline()`) for a real spoken instance of the
+chosen replacement word/phrase elsewhere in the file - a sliding window
+sized to the candidate's own word count, normalized and compared the same
+way the wordlist lookup is. A real recorded instance, time/pitch-fitted
+into the target span, sidesteps the "flat TTS delivery" problem entirely
+because the prosody is real human speech, just borrowed. **Speaker-aware**:
+a candidate whose diarized speaker is confirmed DIFFERENT from the hit's
+own is rejected outright (never just deprioritized) via
+`word_replace.speaker_at()` interval lookups built from
+`flag_language.parse_transcript()`'s `Unit.speaker`/`start`/`end`; when
+either side's speaker is unknown (diarization left that stretch
+unassigned - overlapping speech and fast back-and-forth dialogue are known
+failure modes for any diarizer, pyannote included), falls back to
+time-then-pitch proximity. **Speaker matching is only as good as the
+diarization pass underneath it** - not a claim of perfect speaker
+isolation.
+
+**Two-stage synthesis** (`word_replace_synth.py` +
+`word_replace_tts_driver.py`), tried when no donor exists: a neutral local
+TTS (Piper, recommended - verify the current package name/API before
+installing, this ecosystem churns fast) generates the replacement text
+with roughly correct duration (its own `length_scale` knob, one corrective
+re-run if needed), then a per-speaker voice-conversion model (RVC,
+recommended) converts it to that speaker's timbre. The voice-conversion
+model is trained ONCE per speaker per film, from that speaker's own
+isolated vocal audio (reusing the same `audio-separator` stemming infra
+`build_vocals_stem` uses elsewhere in this project - see
+`word_replace._ensure_file_vocals_stem()`/`_speaker_training_wav()`), and
+cached next to the media as `<name>.<speaker>.vc_model.meta.json` + a
+sibling `<name>.<speaker>.vc_model/` directory (reused on rerun unless
+`--retrain-voice-model`). Needs at least `replace_min_speaker_audio_s`
+(default 30s) of that speaker's isolated audio in the file - below that,
+synthesis falls back to a neutral (un-converted) voice rather than
+skipping synthesis outright. Runs in its own dedicated `.venv-tts` (same
+reasoning as `.venv-stem`: its torch/CUDA pins should never touch any
+other venv's) - not auto-installed, see README's "TTS/Voice-Conversion
+setup"; missing entirely, synthesis is simply never attempted and the
+fallback chain moves straight to muting.
+
+**Prosody transplantation** (`word_replace_prosody.py`, `pyworld`/WORLD
+vocoder): before a flagged span's original audio is touched, its pitch
+(F0) contour and energy envelope are extracted; once a donor or synthesized
+candidate is duration-fitted, that SAME contour is imposed onto it
+(voiced frames only - unvoiced/silent frames are left alone so consonants
+and silence aren't forced into a tone), so a shouted or tearful line
+doesn't come back sounding flatly read. A human opt-out
+(`--no-replace-prosody`), not an automatic fallback - same posture as
+`--center-mute`.
+
+**Scene-matched blending** (`word_replace_blend.py`, pure ffmpeg,
+`--no-replace-scene-blend` to disable): loudness-matches the candidate to
+the RMS level of its immediate neighbors (`astats`-driven plain
+`volume=<gain>dB`, not `loudnorm` - its R128 integrated measurement needs
+several seconds, a poor fit for a sub-second clip) and applies a coarse
+3-band EQ nudge the same way. A reverb/ambience-matching step
+(`estimate_ambient_decay()`/`apply_reverb_blend()`) also exists, using a
+crude RT20-style decay-time proxy read off the instrumental/ambient stem
+plus a conservative `aecho` tail - **explicitly the lowest-confidence
+piece of this whole feature**, not a real room-impulse-response match;
+it's implemented but not currently wired up with a live ambient-clip
+reference in the main pipeline (loudness/EQ matching IS active), left as
+a clearly-separated piece for a future pass that extracts a real nearby
+instrumental clip rather than skipping it. True blind RIR estimation was
+judged out of scope for this feature entirely.
+
+**Multi-candidate generation + quality gating** (`word_replace_score.py` +
+`voice_to_text/transcribe_clip_batch.py`): up to `replace_max_word_candidates`
+(default 2) replacement words are tried, donor and/or synthesized, and
+EVERY candidate render across the WHOLE file is re-transcribed in one
+batched subprocess call (`transcribe_clip_batch.py`, a small driver next to
+`transcribe.py` that loads WhisperX once for the whole batch rather than
+once per candidate - no new venv needed, it runs under the shared
+`voice_to_text/.venv`) using a deliberately smaller/cheaper model
+(`replace_score_model`, default `"small"`) than the main transcript's own.
+Each candidate scores `0.7*intelligibility + 0.3*duration_fit` (difflib
+ratio against the intended text; `1 - |actual-target|/target` clipped to
+[0,1]); the highest-scoring candidate at or above `replace_quality_threshold`
+(default 0.55) wins - below that, the occurrence is muted instead.
+
+**Subtitle substitution** (`word_replace.censor_srt_with_replacements()`):
+a new function, not forced into `censor_srt()`'s single-global-mask
+signature - each regex match is resolved against the per-hit outcome
+(keyed by time) that `replace_track()` already produced: a muted
+occurrence's word is deleted (identical to `method="mute"`'s own subtitle
+behavior), a replaced one is substituted with the chosen replacement text,
+case-matched to the original (ALL-CAPS → ALL-CAPS, Title → Title, else
+lowercase). PGS/VobSub bitmap subtitle sources keep their existing
+blank-redaction behavior under `replace` - no text substitution on image
+subs, a documented scope limit, not silently wrong.
+
+**Rerun-dedup**: deliberately reuses `cfg.track_name_suffix` ("(Cleaned)")
+rather than a separate `replace_track_suffix` - `is_own_output_track()`
+already covers it with zero code changes, since `replace` isn't
+`"dialog"`. One deliberate side effect: switching `--method mute` ↔
+`--method replace` on a rerun correctly treats the OTHER method's prior
+track as stale and replaces it, rather than accumulating a second
+"(Cleaned)" track - the behavior a user changing their mind about method
+would want. The word-set-comparison skip-rebuild logic ("Re-running on an
+already-cleaned file" below) applies to `replace` the same way it does to
+`mute`/`bleep`, since nothing in that code path is actually gated to a
+specific method - only `dialog` (no wordlist scan at all) and `cut` (no
+separate alt track to compare against) are structurally excluded.
+
+**Known limitations, not fixed here**: no real diarization is a claim this
+section doesn't make - diarization is forced on, but it's never perfect,
+and overlapping speech/crowd scenes/fast back-and-forth dialogue can still
+leave a candidate's speaker unresolved or misassigned (donor search and
+voice-model bucketing both fall back to a less-confident heuristic in that
+case, never a crash). Multi-word phrase replacement IS in scope (unlike an
+earlier draft of this plan), but an open-ended detection regex (`christ on
+a \w+`) can still outrun what a literal `replacements.txt` table
+practically enumerates. A multi-word phrase candidate's internal rhythm
+is time-fitted as one uniform stretch, not per-word within the phrase - a
+replacement with a very different word count than the original can sound
+slightly off in internal cadence even once the total duration matches.
+Reverb blending is implemented but not live-wired (see above). Tool
+choices (Piper, RVC, pyworld) are this project's current recommendation,
+not a guarantee - verify availability/API/license before installing.
 
 ### Center-channel-only removal (`--method dialog`, explicit opt-in only)
 

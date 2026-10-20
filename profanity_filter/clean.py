@@ -436,7 +436,48 @@ class Config:
     #                                    default (clean.py's own detection never needs speaker labels,
     #                                    and diarization is a real extra GPU cost); a caller building a
     #                                    generally-useful transcript library (e.g. the --stt-only sweep)
-    #                                    can turn it on
+    #                                    can turn it on. --method replace forces this on regardless -
+    #                                    see main().
+    replace_num_speakers: int | None = None     # "replace" only: hint the exact speaker count to
+    #                                    voice_to_text's diarization (forced on for this method -
+    #                                    see main()) when you already know it; None = auto-detect
+    replace_min_speakers: int | None = None     # "replace" only: same idea, a lower bound
+    replace_max_speakers: int | None = None     # "replace" only: same idea, an upper bound
+
+    # "replace" only: swap a flagged word/phrase for a different, non-profane
+    # one instead of removing it - see wordlists/replacements.txt and
+    # word_replace.py. Falls back to the normal mute behaviour, per flagged
+    # occurrence, whenever a step below can't produce a confident result.
+    replace_wordlist: str = str(HERE / "wordlists" / "replacements.txt")  # hand-authored word -> replacement(s) map
+    replace_max_word_candidates: int = 2   # try at most this many replacement words per flagged
+    #                                    occurrence (in replacements.txt's own priority order) before
+    #                                    giving up and muting it
+    replace_min_donor_isolation_s: float = 0.12   # a candidate donor clip (a real recorded instance
+    #                                    of the replacement word elsewhere in this same file) shorter
+    #                                    than this is too likely to be alignment noise to trust
+    replace_donor_search_window_s: float = 0.0    # restrict donor search to within this many seconds
+    #                                    of the flagged occurrence; 0 (default) searches the whole file
+    replace_min_speaker_audio_s: float = 30.0     # need at least this much isolated vocal audio for
+    #                                    a given speaker before attempting to train a voice-conversion
+    #                                    model for them - below this, synthesis is skipped for that
+    #                                    speaker's hits (falls back to donor-only / mute)
+    replace_prosody: bool = True          # transplant the original word's pitch/energy contour onto
+    #                                    the replacement audio so emotional delivery isn't flattened -
+    #                                    a human opt-out (like center_mute), not an automatic fallback
+    replace_scene_blend: bool = True      # loudness/EQ-match the replacement audio to its neighbours
+    #                                    and apply a rough reverb-decay approximation so it doesn't
+    #                                    sit dry against the scene's own ambience
+    replace_score_model: str = "small"    # WhisperX model size used to re-transcribe and score each
+    #                                    rendered candidate - deliberately smaller/cheaper than the
+    #                                    main transcript's own model, this only needs rough
+    #                                    intelligibility, not production accuracy
+    replace_quality_threshold: float = 0.55   # a candidate scoring below this (0-1, intelligibility +
+    #                                    duration fit) is rejected; if every candidate for a flagged
+    #                                    occurrence is rejected, that occurrence is muted instead
+    retrain_voice_model: bool = False     # force-retrain a speaker's cached voice-conversion model
+    #                                    even if a cached one already exists - separate from
+    #                                    --retranscribe since training cost is a different thing to
+    #                                    force
 
 
 def load_config(path: Path) -> Config:
@@ -620,16 +661,38 @@ def _transcript_is_aligned(js: Path) -> bool:
     return bool((data.get("_meta") or {}).get("aligned"))
 
 
+def _transcript_has_speakers(js: Path) -> bool:
+    """True only if `js` carries real diarized speaker labels on at least
+    one segment - parallel to _transcript_is_aligned(), same reasoning: a
+    cached "<name>.json" can be perfectly aligned but have been produced by
+    an earlier, non-diarized run (the common case before --method replace
+    existed), and silently reusing it would skip speaker labeling entirely
+    for donor-word matching / per-speaker voice models (see word_replace.py).
+    Used by ensure_transcript()/ensure_vocals_transcript() to gate cache
+    reuse specifically when cfg.transcript_diarize is True (forced on for
+    --method replace - see main())."""
+    try:
+        data = json.loads(js.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return any(seg.get("speaker") for seg in (data.get("segments") or []))
+
+
 def ensure_transcript(media: Path, cfg: Config, formats: str = "json",
                       diarize: bool = False) -> Path:
     js = media.with_suffix(".json")
     if js.is_file() and not cfg.retranscribe:
-        if _transcript_is_aligned(js):
+        if _transcript_is_aligned(js) and (not diarize or _transcript_has_speakers(js)):
             print(f"  transcript: {js.name} (reusing)")
             return js
-        print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript "
-              f"(_meta.aligned missing/false) - word timings would be too coarse to trust; "
-              f"re-transcribing instead of reusing it", file=sys.stderr)
+        if _transcript_is_aligned(js):
+            print(f"  [warn] {js.name} exists and is aligned, but carries no diarized speaker "
+                  f"labels and diarization is required this run - re-transcribing with "
+                  f"--diarize instead of reusing it", file=sys.stderr)
+        else:
+            print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript "
+                  f"(_meta.aligned missing/false) - word timings would be too coarse to trust; "
+                  f"re-transcribing instead of reusing it", file=sys.stderr)
     py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
     script = VOICE_TO_TEXT / "transcribe.py"
     if not py.is_file() or not script.is_file():
@@ -642,12 +705,23 @@ def ensure_transcript(media: Path, cfg: Config, formats: str = "json",
     # whatever stale/unaligned file is already sitting there instead of redoing the work.
     cmd = [str(py), "-X", "utf8", str(script), str(media), "--formats", formats, "--overwrite"]
     cmd.append("--diarize" if diarize else "--no-diarize")
+    if diarize:
+        if cfg.replace_num_speakers is not None:
+            cmd += ["--num-speakers", str(cfg.replace_num_speakers)]
+        if cfg.replace_min_speakers is not None:
+            cmd += ["--min-speakers", str(cfg.replace_min_speakers)]
+        if cfg.replace_max_speakers is not None:
+            cmd += ["--max-speakers", str(cfg.replace_max_speakers)]
     run(cmd, cwd=str(VOICE_TO_TEXT))
     if not js.is_file():
         raise SystemExit("[error] transcription produced no .json")
     if not _transcript_is_aligned(js):
         print(f"  [warn] {js.name}: alignment did not succeed even on this fresh pass - "
               f"word timings fall back to coarser segment-level times", file=sys.stderr)
+    if diarize and not _transcript_has_speakers(js):
+        print(f"  [warn] {js.name}: diarization produced no speaker labels on this pass - "
+              f"donor/voice-model speaker matching will fall back to its undiarized heuristic",
+              file=sys.stderr)
     return js
 
 
@@ -1713,11 +1787,13 @@ def ensure_vocals_transcript(media: Path, vocals_wav: Path, tmp: Path, cfg: Conf
     Voice_to_Text names its output after ITS input's stem, not the original
     media's."""
     js = media.with_name(f"{media.stem}.vocals.json")
+    diarize = cfg.transcript_diarize
     if js.is_file() and not cfg.retranscribe:
-        if _transcript_is_aligned(js):
+        if _transcript_is_aligned(js) and (not diarize or _transcript_has_speakers(js)):
             print(f"  transcript (vocals stem): {js.name} (reusing)")
             return js
-        print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript - "
+        print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript, or lacks the "
+              f"diarized speaker labels this run requires - "
               f"re-transcribing the vocals stem instead of reusing it", file=sys.stderr)
     py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
     script = VOICE_TO_TEXT / "transcribe.py"
@@ -1727,8 +1803,17 @@ def ensure_vocals_transcript(media: Path, vocals_wav: Path, tmp: Path, cfg: Conf
     staged = tmp / f"{media.stem}.wav"
     shutil.copy2(vocals_wav, staged)
     print(f"  transcript (vocals stem): running Voice_to_Text on the isolated vocal track...")
-    run([str(py), "-X", "utf8", str(script), str(staged),
-         "--formats", "json", "--no-diarize", "--output-dir", str(tmp)], cwd=str(VOICE_TO_TEXT))
+    cmd = [str(py), "-X", "utf8", str(script), str(staged),
+          "--formats", "json", "--diarize" if diarize else "--no-diarize",
+          "--output-dir", str(tmp)]
+    if diarize:
+        if cfg.replace_num_speakers is not None:
+            cmd += ["--num-speakers", str(cfg.replace_num_speakers)]
+        if cfg.replace_min_speakers is not None:
+            cmd += ["--min-speakers", str(cfg.replace_min_speakers)]
+        if cfg.replace_max_speakers is not None:
+            cmd += ["--max-speakers", str(cfg.replace_max_speakers)]
+    run(cmd, cwd=str(VOICE_TO_TEXT))
     produced = tmp / f"{media.stem}.json"
     if not produced.is_file():
         raise SystemExit("[error] vocals-stem transcription produced no .json")
@@ -2332,11 +2417,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="clean.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input", help="media file (mkv recommended)")
-    p.add_argument("--method", choices=["mute", "bleep", "cut", "dialog"],
+    p.add_argument("--method", choices=["mute", "bleep", "cut", "dialog", "replace"],
                    help="removal method: 'mute' (default, each flagged span stemmed), "
-                        "'bleep', 'cut' (splice out entirely - audio-only inputs only), or "
+                        "'bleep', 'cut' (splice out entirely - audio-only inputs only), "
                         "'dialog' (strip ALL dialogue - not just flagged words - into a new "
-                        "(Wordless) track; ignores the wordlists/--categories entirely)")
+                        "(Wordless) track; ignores the wordlists/--categories entirely), or "
+                        "'replace' (swap the flagged word for a different, non-profane one, "
+                        "spoken in a voice matching the speaker, falling back to 'mute' per "
+                        "occurrence when that can't be done confidently - see "
+                        "wordlists/replacements.txt and AGENTS.md)")
     p.add_argument("--categories", help="comma list: profanity,irreverence")
     p.add_argument("--extra-spans", dest="extra_spans",
                    help="JSON file of hand-reviewed [{start,end,label,category}] spans (input's "
@@ -2455,7 +2544,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    default=None,
                    help="request speaker diarization when a transcript has to be run (off by "
                         "default - clean.py's own detection never needs speaker labels, and "
-                        "it's a real extra GPU cost)")
+                        "it's a real extra GPU cost; --method replace forces this on regardless)")
+    p.add_argument("--replace-wordlist", dest="replace_wordlist",
+                   help="'replace' only: path to the word -> replacement-word(s) map "
+                        "(default wordlists/replacements.txt)")
+    p.add_argument("--replace-max-candidates", dest="replace_max_word_candidates", type=int,
+                   help="'replace' only: try at most this many replacement words per flagged "
+                        "occurrence (in replacements.txt's own priority order) before muting it")
+    p.add_argument("--replace-donor-window", dest="replace_donor_search_window_s", type=float,
+                   help="'replace' only: restrict donor-word search to within this many seconds "
+                        "of the flagged occurrence (default 0 = search the whole file)")
+    p.add_argument("--replace-min-speaker-audio", dest="replace_min_speaker_audio_s", type=float,
+                   help="'replace' only: minimum seconds of a speaker's isolated vocal audio "
+                        "needed before attempting to train a voice-conversion model for them")
+    p.add_argument("--no-replace-prosody", dest="replace_prosody", action="store_false",
+                   default=None,
+                   help="'replace' only: don't transplant the original word's pitch/energy "
+                        "contour onto the replacement audio")
+    p.add_argument("--no-replace-scene-blend", dest="replace_scene_blend", action="store_false",
+                   default=None,
+                   help="'replace' only: don't loudness/EQ/reverb-match the replacement audio "
+                        "to its surrounding scene")
+    p.add_argument("--replace-quality-threshold", dest="replace_quality_threshold", type=float,
+                   help="'replace' only: minimum candidate score (0-1) to accept instead of "
+                        "muting the occurrence (default 0.55)")
+    p.add_argument("--replace-num-speakers", dest="replace_num_speakers", type=int,
+                   help="'replace' only: hint the exact speaker count for diarization")
+    p.add_argument("--replace-min-speakers", dest="replace_min_speakers", type=int,
+                   help="'replace' only: hint a lower-bound speaker count for diarization")
+    p.add_argument("--replace-max-speakers", dest="replace_max_speakers", type=int,
+                   help="'replace' only: hint an upper-bound speaker count for diarization")
+    p.add_argument("--retrain-voice-model", dest="retrain_voice_model", action="store_true",
+                   default=None,
+                   help="'replace' only: force-retrain a speaker's cached voice-conversion "
+                        "model even if a cached one already exists")
     p.add_argument("--config", default=str(HERE / "config.toml"))
     return p
 
@@ -2537,12 +2659,28 @@ def main(argv: list[str] | None = None) -> int:
                  "opensubtitles_lang", "opensubtitles_query", "opensubtitles_id",
                  "faith_detection", "tmdb_query",
                  "stem_retranscribe", "output_dir", "retranscribe", "overwrite",
-                 "stt_only", "transcript_formats", "transcript_diarize"]:
+                 "stt_only", "transcript_formats", "transcript_diarize",
+                 "replace_wordlist", "replace_max_word_candidates", "replace_donor_search_window_s",
+                 "replace_min_speaker_audio_s", "replace_prosody", "replace_scene_blend",
+                 "replace_quality_threshold", "replace_num_speakers", "replace_min_speakers",
+                 "replace_max_speakers", "retrain_voice_model"]:
         val = getattr(args, name, None)
         if val is not None:
             setattr(cfg, name, val)
     if args.categories:
         cfg.categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+
+    if cfg.method == "replace":
+        # Donor-word matching and per-speaker voice-conversion models (see
+        # word_replace.py) are only meaningful with real speaker labels -
+        # without them, donor search degrades to a time-proximity guess and
+        # voice-model training collapses everyone in the file into one
+        # bucket. Forced unconditionally rather than left as a config toggle
+        # a user could forget to set - same posture as --stt-only forcing
+        # cfg.opensubtitles off below.
+        cfg.transcript_diarize = True
+        print("  replace: diarization forced on (needed to match donor words "
+              "and voice models to the correct speaker)")
 
     if cfg.stt_only:
         if cfg.method == "dialog":
@@ -2871,6 +3009,8 @@ def main(argv: list[str] | None = None) -> int:
                 vocals_js = ensure_vocals_transcript(media, vocals_wav, tmp, cfg)
                 vocals_hits = scan_vocals_transcript(vocals_js, matchers)
 
+        per_hit_outcomes = None  # only ever set for cfg.method == "replace" (see below) - defined
+        #   here unconditionally so _build_report() can safely reference it for every method
         if cfg.method == "dialog":
             print("  method: dialog removal - stripping ALL dialogue (not just flagged words) "
                   "into a new (Wordless) track")
@@ -2975,6 +3115,14 @@ def main(argv: list[str] | None = None) -> int:
             elif cfg.method == "mute":
                 clean_audio, used_center = mute_track(ffmpeg, ffprobe, media, audio_pos, spans, cfg,
                                                       chosen, tmp, stem_tool, cached_instrumental)
+            elif cfg.method == "replace":
+                if str(HERE) not in sys.path:
+                    sys.path.insert(0, str(HERE))
+                import word_replace
+                clean_audio, per_hit_outcomes = word_replace.replace_track(
+                    ffmpeg, ffprobe, media, audio_pos, spans, cfg, chosen, tmp, js,
+                    stem_tool=stem_tool, cached_whole_instrumental=cached_instrumental,
+                    stem_clip_fn=stem_clip_all_channels)
             elif src_codec == "mp3":
                 clean_audio, src_dur, new_dur = mp3_splice_cut(ffmpeg, ffprobe, media, audio_pos, spans, tmp)
                 lossless_splice = True
@@ -3012,18 +3160,30 @@ def main(argv: list[str] | None = None) -> int:
                       f"redacted directly in the image across {vobsub_stats['entries_touched']} "
                       f"entries")
             elif raw_srt is not None:
-                # mute: audio has no audible trace of the word left, so the
-                # subtitle removes it entirely rather than visibly marking
-                # it; bleep: the word is audibly replaced by a tone, so the
-                # subtitle marks it the same way with subs_mask ("***").
-                subs_mask = "" if cfg.method == "mute" else cfg.subs_mask
-                new_text, ncues, nwords = censor_srt(
-                    raw_srt.read_text(encoding="utf-8-sig"), spans, matchers,
-                    subs_mask, cfg.subs_pad)
+                if cfg.method == "replace":
+                    # Each flagged occurrence got its own independent outcome
+                    # (a real donor clip, a synthesized+voice-converted render,
+                    # or a mute fallback) from word_replace.replace_track()
+                    # above - the subtitle needs to show whichever word (or
+                    # nothing, for a muted occurrence) actually ended up in
+                    # the audio, not a single fixed mask for every match.
+                    new_text, ncues, nwords = word_replace.censor_srt_with_replacements(
+                        raw_srt.read_text(encoding="utf-8-sig"), spans, matchers,
+                        per_hit_outcomes, cfg.subs_pad)
+                    action = "replaced (or removed, where muted)"
+                else:
+                    # mute: audio has no audible trace of the word left, so the
+                    # subtitle removes it entirely rather than visibly marking
+                    # it; bleep: the word is audibly replaced by a tone, so the
+                    # subtitle marks it the same way with subs_mask ("***").
+                    subs_mask = "" if cfg.method == "mute" else cfg.subs_mask
+                    new_text, ncues, nwords = censor_srt(
+                        raw_srt.read_text(encoding="utf-8-sig"), spans, matchers,
+                        subs_mask, cfg.subs_pad)
+                    action = "removed" if subs_mask == "" else f"masked ({subs_mask!r})"
                 clean_srt = tmp / "clean.srt"
                 clean_srt.write_text(new_text, encoding="utf-8")
                 subs_stats = {"cues": ncues, "words": nwords}
-                action = "removed" if subs_mask == "" else f"masked ({subs_mask!r})"
                 print(f"  subtitles: {nwords} word(s) {action} across {ncues} cue(s)")
 
         report = final_dest.parent / f"{final_dest.stem}.bleeps.json"
@@ -3045,6 +3205,7 @@ def main(argv: list[str] | None = None) -> int:
                 "lossless_splice": lossless_splice if cfg.method == "cut" else None,
                 "id3_tags": id3_info if cfg.method == "cut" else None,
                 "used_center_channel_trick": used_center,
+                "replace_outcomes": per_hit_outcomes if cfg.method == "replace" else None,
                 "spans": [{"start": round(s, 3), "end": round(e, 3),
                            "matches": sorted({h["match"] for h in hs})} for s, e, hs in spans],
             }

@@ -13,6 +13,16 @@ __pycache__/
 # README.md "Stemmer setup" to recreate
 /.venv-stem/
 
+# TTS/voice-conversion venv (Piper + RVC + pyworld, several GB) - see
+# README.md "TTS/Voice-Conversion setup" to recreate
+/.venv-tts/
+
+# per-speaker voice-conversion models trained from a specific media file's
+# own audio (see word_replace_synth.py) - cached next to the media, not
+# source
+*.vc_model.meta.json
+*.vc_model/
+
 # OpenSubtitles API key (see opensubtitles.py) - never commit this
 /opensubtitles.key
 
