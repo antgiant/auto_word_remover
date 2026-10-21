@@ -459,7 +459,7 @@ class Config:
     #                                    mode (replace_wordlist) always has SOME fixed word->word
     #                                    correspondence even if you pick silly replacements, since the
     #                                    same source word always draws from the same candidate list.
-    #                                    See wordlists/replacement_pool.txt and AGENTS.md.
+    #                                    See wordlists/blue(y)_pool.txt and AGENTS.md.
     replace_max_word_candidates: int = 2   # try at most this many replacement words per flagged
     #                                    occurrence (in replacements.txt's own priority order) before
     #                                    giving up and muting it
@@ -2565,7 +2565,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "candidates drawn randomly from this one shared bucket instead of a "
                         "fixed per-word mapping, so a listener can't infer the original word from "
                         "the replacement. Overrides --replace-wordlist when set. See "
-                        "wordlists/replacement_pool.txt for the starter pool.")
+                        "wordlists/blue(y)_pool.txt for the starter pool.")
     p.add_argument("--replace-max-candidates", dest="replace_max_word_candidates", type=int,
                    help="'replace' only: try at most this many replacement words per flagged "
                         "occurrence (in replacements.txt's own priority order) before muting it")

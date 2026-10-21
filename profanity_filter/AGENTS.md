@@ -1170,12 +1170,12 @@ closest to the original matched text's own length sorts first, ties broken
 by the file's own left-to-right order - a rough, reproducible proxy for
 duration fit, re-verified for real later via the scoring pass.
 
-**Pool mode** (`--replace-pool PATH`, e.g. `wordlists/replacement_pool.txt`):
+**Pool mode** (`--replace-pool PATH`, e.g. `wordlists/blue(y)_pool.txt`):
 an alternative to the mapped mode above, for when you deliberately don't
 want any fixed word→replacement correspondence a listener could infer
 (added 2026-10-21 at the user's request - they wanted a Bluey-style
 random grab-bag of family-friendly exclamations, with NO guessable link
-back to which specific word was originally flagged). `replacement_pool.txt`
+back to which specific word was originally flagged). `blue(y)_pool.txt`
 is a flat list - one word/phrase per line, no `=>` mapping at all
 (`word_replace.load_replacement_pool()`). Every flagged occurrence in the
 file, regardless of which word it actually was, draws
@@ -1189,10 +1189,9 @@ rather than needlessly invalidating the rerun-dedup skip-rebuild check.
 `--replace-pool` overrides `--replace-wordlist` entirely when set; donor
 search, scoring, prosody, and blending all work identically either way,
 since none of them care whether the candidate word came from a mapping or
-a random draw. `wordlists/replacement_pool.txt`'s starter content is a
-small, directly-sourced set of Bluey's own exclamations (confirmed via
-web search 2026-10-21, not exhaustively fact-checked against every
-episode) - expand it freely, same as `replacements.txt`'s own seed
+a random draw. `wordlists/blue(y)_pool.txt`'s content (expanded to the
+user's own full list 2026-10-21) is Bluey's family-friendly exclamations/
+euphemisms - expand it freely, same as `replacements.txt`'s own seed
 content.
 
 **Diarization is forced on, unconditionally**, the moment `--method
