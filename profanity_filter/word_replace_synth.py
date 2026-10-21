@@ -72,12 +72,18 @@ def _run_driver(driver_py: Path, job: dict, out_wav: Path, tmp: Path, tag: str) 
 
 
 def synthesize_text(text: str, target_duration_s: float, voice_model_path: Path | None,
-                    driver_py: Path, tmp: Path, tag: str) -> Path | None:
+                    driver_py: Path, tmp: Path, tag: str,
+                    target_f0_hz: float | None = None) -> Path | None:
     """Neutral (or voice-converted, if voice_model_path is given) TTS
     rendering of `text`, roughly duration-matched to target_duration_s
     (the driver applies one length_scale pass plus a single corrective
     re-run - final exact fitting still happens via word_replace.fit_duration
-    afterward, same as a donor clip gets). None on any failure."""
+    afterward, same as a donor clip gets). None on any failure.
+
+    target_f0_hz: the original word's own median pitch, if known - lets the
+    driver pick a same-sex neutral voice instead of one fixed voice
+    regardless of the actual speaker (see word_replace.render_synth_candidate's
+    docstring; real per-speaker voice conversion isn't available yet)."""
     out_wav = tmp / f"synth_{tag}_raw.wav"
     mode = "tts_plus_vc" if voice_model_path is not None else "tts_only"
     job = {
@@ -85,6 +91,7 @@ def synthesize_text(text: str, target_duration_s: float, voice_model_path: Path 
         "text": text,
         "target_duration_s": target_duration_s,
         "voice_model_path": str(voice_model_path) if voice_model_path else None,
+        "target_f0_hz": target_f0_hz,
     }
     status = _run_driver(driver_py, job, out_wav, tmp, tag)
     if status is None or not out_wav.is_file():

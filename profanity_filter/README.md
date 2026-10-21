@@ -194,9 +194,7 @@ into the venv `clean.py` itself runs under.
 
 ```powershell
 python -m venv .venv-tts
-.venv-tts\Scripts\pip install piper-tts pyworld numpy scipy soundfile
-.venv-tts\Scripts\pip install rvc-python   # verify the current package name/license first - this
-#                                            ecosystem moves fast; a maintained fork may be current
+.venv-tts\Scripts\pip install piper-tts pyworld numpy scipy soundfile rvc-python
 
 # same CPU-only-by-default caveat as step 4's stemmer - install a matching
 # CUDA build of torch explicitly:
@@ -208,10 +206,36 @@ python -m venv .venv-tts
 # should print True
 ```
 
-You'll also need at least one Piper voice model (an `.onnx` file) under
-`.venv-tts\piper_voices\` - see Piper's own documentation for downloading
-one. `word_replace.py` degrades to muting every occurrence if `.venv-tts\`
-or a voice model isn't found - it never hard-fails the whole run over it.
+You'll also need Piper voice models for both the male and female default
+voices - download them with Piper's own downloader (this writes each
+`<name>.onnx` + its `.onnx.json` into the current directory, so `cd` into
+`piper_voices\` first). `en_US-lessac-medium` and two other candidates
+(`en_US-john-medium`, `en_US-joe-medium`) were tried and rejected after a
+direct listening test (2026-10-21) - lessac read as female, the other two
+had audible crackling/distortion; `en_US-hfc_male-medium` is the one that
+actually sounded right, and is this project's current default:
+
+```powershell
+mkdir .venv-tts\piper_voices
+cd .venv-tts\piper_voices
+..\Scripts\python.exe -m piper.download_voices en_US-hfc_male-medium
+..\Scripts\python.exe -m piper.download_voices en_US-amy-medium
+cd ..\..
+```
+
+`word_replace.py` degrades to muting every occurrence if `.venv-tts\` or
+a voice model isn't found - it never hard-fails the whole run over it.
+
+**Known limitation, as of this writing**: `rvc-python` (the voice-
+conversion half of this stack) only loads and runs a pre-existing trained
+model - it has no API for TRAINING a new per-speaker voice from a short
+sample, which is what this feature needs to actually match a character's
+voice. Until that's wired up (a different tool, or a heavier training
+pipeline), `--method replace` synthesizes every word in one neutral Piper
+voice rather than the speaker's own - still useful for testing the rest
+of the pipeline (donor-word reuse, prosody, scene blending, scoring,
+fallback-to-mute), just not voice-matched yet. See AGENTS.md's "Word
+replacement" known limitations.
 
 ### Install checklist
 

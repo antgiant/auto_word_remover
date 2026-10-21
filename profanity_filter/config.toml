@@ -107,6 +107,10 @@ dialog_track_default = false  # true = make it the default audio track (like "(C
 # not set here since a relative path here would resolve against the
 # current working directory, not this file's folder (--replace-wordlist on
 # the CLI takes an absolute path if you need a different file)
+# replace_pool: unset by default (mapped mode). Point --replace-pool at
+# wordlists/replacement_pool.txt (or your own flat list) for randomized
+# pool mode instead - see AGENTS.md's "Word replacement" section. Overrides
+# replace_wordlist entirely when set.
 replace_max_word_candidates = 2       # try at most this many replacement words per occurrence
 replace_min_donor_isolation_s = 0.12  # shorter real donor clips are too likely to be alignment noise
 replace_donor_search_window_s = 0.0   # 0 = search the whole file for a donor clip

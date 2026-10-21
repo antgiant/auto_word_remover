@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -100,6 +101,52 @@ def select_replacement_words(hit: dict, repl_map: dict[str, list[str]],
     order = sorted(range(len(candidates)),
                    key=lambda i: (abs(len(candidates[i]) - original_len), i))
     return [candidates[i] for i in order[:max_candidates]]
+
+
+# ---------------------------------------------------------------------------
+# Step 1b: pool mode - a flat, un-mapped bucket of replacement words/phrases,
+# randomly assigned to EVERY hit regardless of which word was actually
+# flagged there. This is a deliberately different shape from
+# load_replacement_map/select_replacement_words above (mapped mode): mapped
+# mode is reproducible and inspectable (you can always tell which
+# replacement a given flagged word will get, which is exactly the property
+# pool mode exists to NOT have - see cfg.replace_pool's docstring in
+# clean.py's Config and AGENTS.md's "Word replacement" section).
+# ---------------------------------------------------------------------------
+def load_replacement_pool(path: Path | str) -> list[str]:
+    """One replacement candidate (word or phrase) per line - no '=>'
+    mapping, unlike load_replacement_map's format; '#' comments and blank
+    lines are ignored the same way. Order in the file doesn't matter -
+    pool mode draws from it randomly (see select_pool_candidates)."""
+    path = Path(path)
+    out: list[str] = []
+    if not path.is_file():
+        print(f"[warn] replacement pool not found: {path}", file=sys.stderr)
+        return out
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def select_pool_candidates(hit: dict, pool: list[str], max_candidates: int,
+                           seed_key: str) -> list[str]:
+    """Randomly samples from the WHOLE pool, deliberately ignoring the
+    matched word's own identity/length - the entire point of pool mode is
+    that a listener can't infer anything about the original word from the
+    replacement, so there is no length-closeness bias to apply here (that
+    would itself be a faint signal: a longer replacement would correlate
+    with a longer original word). Deterministic per (file, hit) via
+    seed_key, not per-process-random - a rerun on unchanged input should
+    still make the exact same picks rather than thrashing the rerun-dedup
+    cache (see clean.py's already_cleaned word-set comparison) with a
+    different output every time nothing actually changed."""
+    if not pool:
+        return []
+    rng = random.Random(seed_key)
+    k = min(max_candidates, len(pool))
+    return rng.sample(pool, k)
 
 
 # ---------------------------------------------------------------------------
@@ -353,9 +400,16 @@ def _speaker_training_wav(speaker_key: str, speaker_segments: dict[str, list[tup
 
 def render_synth_candidate(word: str, target_duration_s: float, speaker_key: str,
                            speaker_segments: dict, vocals_wav: Path | None, media: Path,
-                           cfg, ffmpeg: str, ffprobe: str, tmp: Path, tag: str) -> Path | None:
+                           cfg, ffmpeg: str, ffprobe: str, tmp: Path, tag: str,
+                           target_f0_hz: float | None = None) -> Path | None:
     """None on any failure (no .venv-tts, not enough speaker audio, driver
-    error, ...) - callers treat that exactly like "no candidate produced"."""
+    error, ...) - callers treat that exactly like "no candidate produced".
+
+    target_f0_hz: the ORIGINAL word's own median pitch, if it could be read -
+    real per-speaker voice conversion isn't available yet (see
+    ensure_voice_model's docstring), but the driver can at least pick a
+    same-sex neutral voice instead of one fixed voice for every speaker in
+    the file. None leaves the driver's own default voice untouched."""
     import word_replace_synth as synth
 
     driver_py = synth.locate_tts_driver()
@@ -369,7 +423,8 @@ def render_synth_candidate(word: str, target_duration_s: float, speaker_key: str
     # that case; it's just less likely to match the speaker's timbre, which
     # the scoring pass downstream will naturally penalize via intelligibility
     # if it's bad enough, same as any other candidate.
-    raw = synth.synthesize_text(word, target_duration_s, voice_model, driver_py, tmp, tag)
+    raw = synth.synthesize_text(word, target_duration_s, voice_model, driver_py, tmp, tag,
+                                target_f0_hz=target_f0_hz)
     if raw is None:
         return None
     fitted = tmp / f"synth_{tag}_fit.wav"
@@ -437,8 +492,17 @@ def _build_candidates_for_hit(hit_idx: int, hit_time: float, hit_end: float, hit
                               words: list[str], word_timeline: list[dict], all_spans,
                               speaker_intervals, speaker_segments, vocals_wav: Path | None,
                               media: Path, cfg, ffmpeg: str, ffprobe: str, audio_pos: int,
-                              tmp: Path) -> list[CandidateRender]:
-    target_duration_s = max(0.05, hit_end - hit_time)
+                              tmp: Path, span_start: float, span_end: float) -> list[CandidateRender]:
+    # Must match _splice_spans' own hs_/he_ clamp exactly - a candidate is
+    # spliced into THAT padded, span-clamped slot, not the bare [hit_time,
+    # hit_end] match window, so fitting it to the narrower unpadded window
+    # left the final concat short by pad_start+pad_end every time a hit
+    # was actually replaced - confirmed live 2026-10-21 (a delivered clip
+    # came back 0.195s shorter than its source, matching pad_start=0.1 +
+    # pad_end=0.1 almost exactly).
+    hs_ = max(span_start, min(span_end, hit_time - cfg.pad_start))
+    he_ = max(span_start, min(span_end, hit_end + cfg.pad_end))
+    target_duration_s = max(0.05, he_ - hs_)
     original_clip = tmp / f"hit{hit_idx}_original.wav"
     try:
         _extract_clip(ffmpeg, media, audio_pos, hit_time, hit_end, original_clip)
@@ -451,6 +515,17 @@ def _build_candidates_for_hit(hit_idx: int, hit_time: float, hit_end: float, hit
         _extract_clip(ffmpeg, media, audio_pos, hit_end, hit_end + 1.0, neighbor_after)
     except subprocess.CalledProcessError:
         neighbor_before = neighbor_after = None
+
+    # Crude but real: a neutral single-voice TTS can't match the speaker's
+    # actual timbre without voice conversion (see ensure_voice_model's
+    # docstring - rvc-python has no training API, so that path is dead for
+    # now), but it CAN at least pick a plausible same-sex voice rather than
+    # one fixed voice for everyone - confirmed live 2026-10-21 that using a
+    # single male voice regardless of the original speaker reads as a real,
+    # noticeable mismatch, not just a quality nitpick. speaker_target_f0_hz
+    # feeds word_replace_tts_driver's voice pick; None if pitch couldn't be
+    # read from the original clip, which just leaves the driver's own default.
+    speaker_target_f0_hz = _median_f0(original_clip) if original_clip is not None else None
 
     renders: list[CandidateRender] = []
     speaker_key = hit_speaker or "_default"
@@ -475,7 +550,7 @@ def _build_candidates_for_hit(hit_idx: int, hit_time: float, hit_end: float, hit
         try:
             raw = render_synth_candidate(word, target_duration_s, speaker_key, speaker_segments,
                                          vocals_wav, media, cfg, ffmpeg, ffprobe, tmp,
-                                         f"{tag}_synth")
+                                         f"{tag}_synth", target_f0_hz=speaker_target_f0_hz)
             if raw is not None:
                 renders.append(_finish_candidate(hit_idx, word, "synth", raw, target_duration_s,
                                                  original_clip, neighbor_before, neighbor_after,
@@ -524,6 +599,9 @@ def _score_all_candidates(all_renders: list[CandidateRender], cfg, ffprobe: str,
         actual = _probe_duration(ffprobe, r.wav_path) or r.target_duration_s
         sc = score_mod.score_candidate(asr_text, r.word, actual, r.target_duration_s)
         r.score = sc.combined
+        print(f"    replace: candidate {r.word!r} ({r.kind}) heard as {asr_text!r} "
+              f"-> intelligibility={sc.intelligibility:.2f} duration_fit={sc.duration_fit:.2f} "
+              f"combined={sc.combined:.2f}")
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +637,8 @@ def replace_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans,
             capture_output=True, text=True, check=True).stdout.strip() or None
     total_dur = probe_duration(ffprobe, media)
 
-    repl_map = load_replacement_map(cfg.replace_wordlist)
+    repl_map = {} if cfg.replace_pool else load_replacement_map(cfg.replace_wordlist)
+    pool = load_replacement_pool(cfg.replace_pool) if cfg.replace_pool else []
     word_timeline = flag_language.load_word_timeline(js)
     _fmt, units = flag_language.parse_transcript(js)
     speaker_intervals = build_speaker_intervals(units)
@@ -584,14 +663,18 @@ def replace_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans,
         hit_end = h["end"] if h["end"] is not None else hit_time + 0.6
         hit_meta.append({"time": hit_time, "end": hit_end, "match": h["match"],
                          "speaker": h.get("speaker")})
-        words = select_replacement_words(h, repl_map, cfg.replace_max_word_candidates)
+        if cfg.replace_pool:
+            seed_key = f"{media}::{hit_time:.3f}::{h['match']}"
+            words = select_pool_candidates(h, pool, cfg.replace_max_word_candidates, seed_key)
+        else:
+            words = select_replacement_words(h, repl_map, cfg.replace_max_word_candidates)
         start_i = len(all_renders)
         if words:
             try:
                 renders = _build_candidates_for_hit(
                     idx, hit_time, hit_end, h.get("speaker"), words, word_timeline, spans,
                     speaker_intervals, speaker_segments, vocals_wav, media, cfg, ffmpeg,
-                    ffprobe, audio_pos, tmp)
+                    ffprobe, audio_pos, tmp, s, e)
                 all_renders.extend(renders)
             except Exception as exc:
                 print(f"  [warn] replace: candidate generation failed for "
@@ -616,11 +699,17 @@ def replace_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans,
         })
 
     n_muted = sum(1 for o in per_hit_outcomes if o["outcome"] == "mute")
-    n_missed = sum(1 for h in flat_hits
-                   if not select_replacement_words(h[2], repl_map, cfg.replace_max_word_candidates))
-    if n_missed:
-        print(f"  replace: {n_missed} of {len(flat_hits)} word(s) had no replacement authored "
-              f"in {Path(cfg.replace_wordlist).name} - muted instead")
+    if cfg.replace_pool:
+        n_missed = len(flat_hits) if not pool else 0
+        if n_missed:
+            print(f"  replace: {n_missed} of {len(flat_hits)} word(s) had no replacement - "
+                  f"{Path(cfg.replace_pool).name} is empty - muted instead")
+    else:
+        n_missed = sum(1 for h in flat_hits
+                       if not select_replacement_words(h[2], repl_map, cfg.replace_max_word_candidates))
+        if n_missed:
+            print(f"  replace: {n_missed} of {len(flat_hits)} word(s) had no replacement authored "
+                  f"in {Path(cfg.replace_wordlist).name} - muted instead")
     if n_muted - n_missed > 0:
         print(f"  replace: {n_muted - n_missed} more word(s) fell back to mute "
               f"(no usable donor/synthesis, or every candidate scored below "
@@ -731,6 +820,41 @@ def _splice_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans,
                       check=True, capture_output=True)
         return out
 
+    def background_for_span(hs_: float, he_: float, tag: str) -> Path | None:
+        """The stemmed-out ambient/music bed for exactly [hs_, he_] - the
+        SAME thing mute_fill="stems" plays through a muted span, which a
+        winning replace candidate must ALSO be mixed over, or the
+        replacement word plays in dead silence while the mute fallback
+        right next to it keeps the scene's music/ambience going (confirmed
+        live 2026-10-21: a real delivered clip went fully silent under the
+        replaced word - this was the missing step). None if there's no
+        stemmer available; the caller then uses the dry candidate as-is,
+        same posture as mute_fill="stems" falling back to silence."""
+        if cached_whole_instrumental is not None:
+            out = seg_dir / f"bg_cached_{tag}.wav"
+            subprocess.run([ffmpeg, "-hide_banner", "-y", "-ss", f"{hs_:.6f}", "-to", f"{he_:.6f}",
+                           "-i", str(cached_whole_instrumental), *fmt_args, str(out)],
+                          check=True, capture_output=True)
+            return out
+        if stem_tool is None or stem_clip_fn is None:
+            return None
+        try:
+            raw = extract_original(hs_, he_)
+            span_tmp = tmp / f"replace_bg_{tag}"
+            span_tmp.mkdir(exist_ok=True)
+            return stem_clip_fn(ffmpeg, stem_tool, raw, n_ch, sr, span_tmp, cfg, layout_name)
+        except subprocess.CalledProcessError as exc:
+            print(f"  [warn] replace: couldn't stem a background bed for the replaced word "
+                  f"({exc!r}) - it will play without scene ambience under it", file=sys.stderr)
+            return None
+
+    def mix_with_background(candidate_wav: Path, bg_wav: Path, tag: str) -> Path:
+        out = seg_dir / f"mixed_{tag}.wav"
+        subprocess.run([ffmpeg, "-hide_banner", "-y", "-i", str(candidate_wav), "-i", str(bg_wav),
+                       "-filter_complex", "amix=inputs=2:duration=first:dropout_transition=0",
+                       *fmt_args, str(out)], check=True, capture_output=True)
+        return out
+
     hit_i = 0
     for s, e, hs in spans:
         span_hits = [(flat_hits[hit_i + j][2]["time"], flat_hits[hit_i + j][2],
@@ -749,7 +873,10 @@ def _splice_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans,
             if hs_ > inner_cursor:
                 segments.append(extract_original(inner_cursor, hs_))
             if winner is not None:
-                segments.append(conform(winner.wav_path))
+                conformed = conform(winner.wav_path)
+                bg = background_for_span(hs_, he_, tag=f"{hit_i + j}")
+                segments.append(mix_with_background(conformed, bg, tag=f"{hit_i + j}")
+                                if bg is not None else conformed)
             elif cached_whole_instrumental is not None:
                 # Already-stemmed whole-track Instrumental available for free
                 # (same cached_instrumental mute_track() itself prefers) -

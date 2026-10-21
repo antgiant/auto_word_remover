@@ -449,6 +449,17 @@ class Config:
     # word_replace.py. Falls back to the normal mute behaviour, per flagged
     # occurrence, whenever a step below can't produce a confident result.
     replace_wordlist: str = str(HERE / "wordlists" / "replacements.txt")  # hand-authored word -> replacement(s) map
+    replace_pool: str | None = None        # path to a FLAT replacement pool (one word/phrase per
+    #                                    line, no "=>" mapping) - when set, overrides replace_wordlist
+    #                                    entirely and switches to pool mode: every flagged occurrence,
+    #                                    regardless of which word it actually was, gets a few candidates
+    #                                    drawn RANDOMLY (deterministically per hit, not per mapped word)
+    #                                    from this one shared bucket. Exists so a listener can't infer
+    #                                    anything about the original word from the replacement - mapped
+    #                                    mode (replace_wordlist) always has SOME fixed word->word
+    #                                    correspondence even if you pick silly replacements, since the
+    #                                    same source word always draws from the same candidate list.
+    #                                    See wordlists/replacement_pool.txt and AGENTS.md.
     replace_max_word_candidates: int = 2   # try at most this many replacement words per flagged
     #                                    occurrence (in replacements.txt's own priority order) before
     #                                    giving up and muting it
@@ -2547,7 +2558,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "it's a real extra GPU cost; --method replace forces this on regardless)")
     p.add_argument("--replace-wordlist", dest="replace_wordlist",
                    help="'replace' only: path to the word -> replacement-word(s) map "
-                        "(default wordlists/replacements.txt)")
+                        "(default wordlists/replacements.txt) - ignored if --replace-pool is set")
+    p.add_argument("--replace-pool", dest="replace_pool",
+                   help="'replace' only: path to a flat replacement pool (one word/phrase per "
+                        "line, no mapping) - switches to pool mode: every flagged occurrence gets "
+                        "candidates drawn randomly from this one shared bucket instead of a "
+                        "fixed per-word mapping, so a listener can't infer the original word from "
+                        "the replacement. Overrides --replace-wordlist when set. See "
+                        "wordlists/replacement_pool.txt for the starter pool.")
     p.add_argument("--replace-max-candidates", dest="replace_max_word_candidates", type=int,
                    help="'replace' only: try at most this many replacement words per flagged "
                         "occurrence (in replacements.txt's own priority order) before muting it")
@@ -2660,7 +2678,7 @@ def main(argv: list[str] | None = None) -> int:
                  "faith_detection", "tmdb_query",
                  "stem_retranscribe", "output_dir", "retranscribe", "overwrite",
                  "stt_only", "transcript_formats", "transcript_diarize",
-                 "replace_wordlist", "replace_max_word_candidates", "replace_donor_search_window_s",
+                 "replace_wordlist", "replace_pool", "replace_max_word_candidates", "replace_donor_search_window_s",
                  "replace_min_speaker_audio_s", "replace_prosody", "replace_scene_blend",
                  "replace_quality_threshold", "replace_num_speakers", "replace_min_speakers",
                  "replace_max_speakers", "retrain_voice_model"]:
@@ -2776,10 +2794,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  [note] {len(stale_ids)} pre-existing (Cleaned)/(Wordless) track(s) found - "
               f"re-detecting from the original source; a fresh build only replaces them if the "
               f"flagged words differ (--force to always replace)")
-    chosen, audio_pos = choose_audio(tracks, cfg.source_track)
+    chosen, _filtered_audio_pos = choose_audio(tracks, cfg.source_track)
     if chosen is None:
         print(f"  [warn] {media.name} has no audio track - skipping clean")
         return 0
+    # choose_audio()'s own index is computed within the STALE-FILTERED
+    # `tracks` list, which is correct for picking WHICH track but wrong for
+    # -map 0:a:{audio_pos}: every caller maps that number against the real,
+    # unfiltered file (ffmpeg has no notion of "stale" tracks), so on a
+    # rerun where a stale (Cleaned)/(Wordless) track sits BEFORE the real
+    # one in the container's own track order, the filtered-list index
+    # under-counts and silently points at the wrong physical audio stream -
+    # confirmed live 2026-10-21 (a --force rerun on a once-cleaned file fed
+    # the stemmer/transcript pipeline the stale track's own audio instead of
+    # the original, producing a bogus detection at an unrelated timestamp
+    # while leaving the real flagged word completely untouched). Recompute
+    # against tracks_all (every audio track, stale ones included) instead.
+    audio_pos = [t["id"] for t in tracks_all if t["type"] == "audio"].index(chosen["id"])
     cp = chosen["properties"]
     print(f"  cleaning audio #{audio_pos}: "
           f"{cp.get('language', 'und')} / {cp.get('track_name') or '<no name>'} / "
@@ -2974,6 +3005,17 @@ def main(argv: list[str] | None = None) -> int:
                   "and re-run the missed spots.")
 
             n_ch = int(cp.get("audio_channels") or 2)
+            # Tried extending this to cfg.method == "replace" too (2026-10-21) on the
+            # theory that replace's own per-hit background bed could reuse this whole-
+            # track stem for free instead of re-stemming each span - reverted the same
+            # day: _run_separator_pair's dual-stem invocation (single_stem=None) is a
+            # DIFFERENT audio-separator call than the dedicated single_stem="Vocals"
+            # pass replace's own detection transcript depends on, and switching to it
+            # measurably changed the Vocals stem - enough to make Whisper's VAD miss a
+            # real, borderline-quiet flagged word on two consecutive runs that had
+            # caught it fine before. The background-bed RMS was already confirmed
+            # identical either way (see word_replace.py / AGENTS.md), so there was no
+            # real quality upside being bought - not worth risking a missed word for.
             also_instrumental = cfg.method == "mute" and cfg.mute_fill == "stems" and n_ch <= 2
 
             if not cfg.stem_retranscribe:

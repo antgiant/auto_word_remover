@@ -33,7 +33,30 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 GPU_LOCK_DIR = HERE.parent / "gpu_lock"
-PIPER_VOICE_PATH = HERE / ".venv-tts" / "piper_voices" / "en_US-amy-medium.onnx"
+PIPER_VOICES_DIR = HERE / ".venv-tts" / "piper_voices"
+# No real per-speaker voice conversion yet (rvc-python has no training API -
+# see word_replace_synth.ensure_voice_model's docstring), but picking a
+# same-sex neutral voice instead of one fixed voice for every speaker is a
+# real, available improvement - confirmed live 2026-10-21 that using a
+# single male voice regardless of the actual speaker read as a plain wrong
+# answer, not just an acceptable approximation. Threshold is the
+# conventional rough midpoint between typical adult male/female speaking F0
+# ranges - a coarse heuristic, not a real classifier.
+PIPER_VOICE_MALE = PIPER_VOICES_DIR / "en_US-hfc_male-medium.onnx"
+# en_US-lessac-medium was the original default - dropped after a direct
+# listening test (2026-10-21) came back "sounds female", and two other
+# alternatives (en_US-john-medium, en_US-joe-medium) had audible
+# crackling/distortion; hfc_male was the one that sounded right.
+PIPER_VOICE_FEMALE = PIPER_VOICES_DIR / "en_US-amy-medium.onnx"
+PIPER_VOICE_DEFAULT = PIPER_VOICE_MALE
+_F0_GENDER_THRESHOLD_HZ = 165.0
+
+
+def _pick_piper_voice(target_f0_hz: float | None) -> Path:
+    if target_f0_hz is None:
+        return PIPER_VOICE_DEFAULT if PIPER_VOICE_DEFAULT.is_file() else PIPER_VOICE_MALE
+    voice = PIPER_VOICE_FEMALE if target_f0_hz >= _F0_GENDER_THRESHOLD_HZ else PIPER_VOICE_MALE
+    return voice if voice.is_file() else PIPER_VOICE_DEFAULT
 
 
 def _gpu_lock_ctx(reason: str):
@@ -51,61 +74,106 @@ def _wav_duration(path: Path) -> float:
         return w.getnframes() / float(w.getframerate())
 
 
-def _synthesize_piper(text: str, out_wav: Path, length_scale: float = 1.0) -> None:
-    """Targets the documented piper-tts Python API
-    (PiperVoice.load(...).synthesize(text, wav_file, ...)) - verify this
-    against the actually-installed version, which may have shifted."""
-    from piper import PiperVoice
+def _synthesize_piper(text: str, out_wav: Path, length_scale: float = 1.0,
+                      target_f0_hz: float | None = None) -> None:
+    """Confirmed against piper-tts's real, current docs
+    (github.com/OHF-Voice/piper1-gpl/blob/main/docs/API_PYTHON.md, read
+    2026-10-20): `PiperVoice.load(path)`, then
+    `.synthesize_wav(text, wav_file, syn_config=SynthesisConfig(...))` -
+    NOT a bare `.synthesize(text, wav_file, length_scale=...)` call, which
+    is what an earlier, unverified pass at this function assumed."""
+    from piper import PiperVoice, SynthesisConfig
 
-    if not PIPER_VOICE_PATH.is_file():
-        raise RuntimeError(f"no Piper voice model at {PIPER_VOICE_PATH} - download one per "
-                           f"README.md's TTS setup section")
-    voice = PiperVoice.load(str(PIPER_VOICE_PATH))
+    voice_path = _pick_piper_voice(target_f0_hz)
+    if not voice_path.is_file():
+        raise RuntimeError(f"no Piper voice model at {voice_path} - download one with "
+                           f"'python -m piper.download_voices <name>' per README.md's TTS setup")
+    voice = PiperVoice.load(str(voice_path))
+    syn_config = SynthesisConfig(length_scale=length_scale)
     with wave.open(str(out_wav), "wb") as wav_file:
-        voice.synthesize(text, wav_file, length_scale=length_scale)
+        voice.synthesize_wav(text, wav_file, syn_config=syn_config)
 
 
 def _convert_voice_rvc(src_wav: Path, voice_model_dir: Path, out_wav: Path) -> None:
-    """Targets a documented single-file RVC inference call - verify
-    against the actually-installed rvc-python (or Applio-style) package;
-    its exact import path/API has moved before and may move again."""
+    """rvc-python's real, confirmed API (pypi.org/project/rvc-python, read
+    2026-10-20): `RVCInference(device=...).load_model(path/to/model.pth)`,
+    then `.infer_file(src, dst)`. voice_model_dir is expected to hold
+    exactly one `*.pth` file (see _train_rvc_model's docstring on why that
+    directory is currently always empty in practice)."""
     from rvc_python.infer import RVCInference
 
-    rvc = RVCInference()
-    rvc.load_model(str(voice_model_dir))
+    pth_files = sorted(Path(voice_model_dir).glob("*.pth"))
+    if not pth_files:
+        raise RuntimeError(f"no .pth model file in {voice_model_dir}")
+    device = "cuda:0" if _cuda_available() else "cpu"
+    rvc = RVCInference(device=device)
+    rvc.load_model(str(pth_files[0]))
     rvc.infer_file(str(src_wav), str(out_wav))
 
 
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
 def _train_rvc_model(speaker_wav: Path, model_dir: Path) -> None:
-    """Targets a documented RVC training/fitting entry point for a small
-    per-speaker model from one source wav - verify against the installed
-    package; this is the least standardized part of the RVC ecosystem."""
-    from rvc_python.train import train_from_wav
+    """**Not currently implemented** - confirmed by reading rvc-python's
+    actual PyPI README (2026-10-20): that package is INFERENCE ONLY. It
+    loads a pre-existing `.pth` model file; it has no training/fitting
+    entry point of any kind. Real RVC model training (fitting a NEW voice
+    from a short sample) needs the full RVC-WebUI-style pipeline (feature
+    extraction + many-epoch training - typically real minutes-to-hours,
+    not something that fits this per-file automated flow without a lot
+    more infrastructure) or a different, zero-shot-capable voice-conversion
+    tool chosen specifically for that property.
 
-    train_from_wav(str(speaker_wav), str(model_dir))
+    Deliberately raises rather than silently pretending to train something -
+    the caller (ensure_voice_model) catches this exactly like any other
+    training failure and falls back to a neutral, un-converted voice for
+    that speaker's synthesis candidates, which is a real and useful
+    degraded mode, not a crash. See AGENTS.md's "Word replacement" known
+    limitations for the honest status of this piece."""
+    raise NotImplementedError(
+        "rvc-python has no training API - per-speaker voice-conversion model "
+        "training is not implemented; synthesis falls back to a neutral voice")
 
 
-def do_tts(text: str, target_duration_s: float, out_wav: Path) -> dict:
+def do_tts(text: str, target_duration_s: float, out_wav: Path,
+          target_f0_hz: float | None = None) -> dict:
     with _gpu_lock_ctx(f"TTS synth: {text[:40]!r}"):
-        _synthesize_piper(text, out_wav)
+        _synthesize_piper(text, out_wav, target_f0_hz=target_f0_hz)
     actual = _wav_duration(out_wav)
     if target_duration_s > 0 and actual > 0:
         ratio = actual / target_duration_s
         if ratio < 0.8 or ratio > 1.2:
             # One corrective re-run with an adjusted length_scale (Piper's
-            # own duration-control knob) - a single retry, not a search
-            # loop; residual error beyond this is closed by the final
-            # ffmpeg atempo fit word_replace.fit_duration() always applies
-            # regardless of candidate source.
+            # own duration-control knob: "< 1 is faster, > 1 is slower" per
+            # piper/config.py). ratio > 1 means the FIRST pass came out too
+            # LONG, which calls for a SHORTER (length_scale < 1) retry - i.e.
+            # the correction factor is 1/ratio, not ratio itself. Passing
+            # ratio directly (as an earlier version of this function did)
+            # pushed the retry in the wrong direction every time - too long
+            # got rendered even longer, too short even shorter - leaving the
+            # final ffmpeg atempo fit (word_replace.fit_duration, which
+            # always runs regardless of candidate source) to close a much
+            # larger gap than necessary; confirmed live 2026-10-21 as a
+            # likely source of an unnaturally pitched-sounding replacement
+            # word (atempo preserves true pitch, but very large compression
+            # ratios still degrade voice quality in a way that reads as
+            # "pitched up" to a listener). A single retry, not a search loop.
             with _gpu_lock_ctx(f"TTS synth (retry): {text[:40]!r}"):
-                _synthesize_piper(text, out_wav, length_scale=ratio)
+                _synthesize_piper(text, out_wav, length_scale=1.0 / ratio, target_f0_hz=target_f0_hz)
             actual = _wav_duration(out_wav)
     return {"actual_duration_s": actual}
 
 
 def do_tts_plus_vc(job: dict, out_wav: Path, tmp_dir: Path) -> dict:
     raw = tmp_dir / f"{out_wav.stem}_pretrain.wav"
-    do_tts(job["text"], float(job.get("target_duration_s") or 0.0), raw)
+    do_tts(job["text"], float(job.get("target_duration_s") or 0.0), raw,
+          target_f0_hz=job.get("target_f0_hz"))
     voice_model_path = job.get("voice_model_path")
     if not voice_model_path:
         out_wav.write_bytes(raw.read_bytes())
@@ -137,7 +205,8 @@ def main(argv: list[str] | None = None) -> int:
         job = json.loads(Path(args.job).read_text(encoding="utf-8"))
         mode = job.get("mode")
         if mode == "tts_only":
-            extra = do_tts(job["text"], float(job.get("target_duration_s") or 0.0), out_wav)
+            extra = do_tts(job["text"], float(job.get("target_duration_s") or 0.0), out_wav,
+                          target_f0_hz=job.get("target_f0_hz"))
         elif mode == "tts_plus_vc":
             extra = do_tts_plus_vc(job, out_wav, out_wav.parent)
         elif mode == "train_voice_model":

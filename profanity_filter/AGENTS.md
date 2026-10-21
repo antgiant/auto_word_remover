@@ -1170,6 +1170,31 @@ closest to the original matched text's own length sorts first, ties broken
 by the file's own left-to-right order - a rough, reproducible proxy for
 duration fit, re-verified for real later via the scoring pass.
 
+**Pool mode** (`--replace-pool PATH`, e.g. `wordlists/replacement_pool.txt`):
+an alternative to the mapped mode above, for when you deliberately don't
+want any fixed word→replacement correspondence a listener could infer
+(added 2026-10-21 at the user's request - they wanted a Bluey-style
+random grab-bag of family-friendly exclamations, with NO guessable link
+back to which specific word was originally flagged). `replacement_pool.txt`
+is a flat list - one word/phrase per line, no `=>` mapping at all
+(`word_replace.load_replacement_pool()`). Every flagged occurrence in the
+file, regardless of which word it actually was, draws
+`replace_max_word_candidates` picks at random from the WHOLE pool
+(`select_pool_candidates()`) - deliberately with no length-closeness bias
+toward the original (that would itself leak a faint signal: a longer
+replacement correlating with a longer original word). The random pick is
+seeded from `(media path, hit time, matched text)`, not real process
+randomness, so a rerun on unchanged input makes the identical picks
+rather than needlessly invalidating the rerun-dedup skip-rebuild check.
+`--replace-pool` overrides `--replace-wordlist` entirely when set; donor
+search, scoring, prosody, and blending all work identically either way,
+since none of them care whether the candidate word came from a mapping or
+a random draw. `wordlists/replacement_pool.txt`'s starter content is a
+small, directly-sourced set of Bluey's own exclamations (confirmed via
+web search 2026-10-21, not exhaustively fact-checked against every
+episode) - expand it freely, same as `replacements.txt`'s own seed
+content.
+
 **Diarization is forced on, unconditionally**, the moment `--method
 replace` is selected (`main()`, right after `cfg` is loaded) - regardless
 of `transcript_diarize`/`--diarize-transcript`:
@@ -1309,9 +1334,108 @@ practically enumerates. A multi-word phrase candidate's internal rhythm
 is time-fitted as one uniform stretch, not per-word within the phrase - a
 replacement with a very different word count than the original can sound
 slightly off in internal cadence even once the total duration matches.
-Reverb blending is implemented but not live-wired (see above). Tool
-choices (Piper, RVC, pyworld) are this project's current recommendation,
-not a guarantee - verify availability/API/license before installing.
+Reverb blending is implemented but not live-wired (see above). **Confirmed
+2026-10-20 against the real, installed package**: `rvc-python` is
+INFERENCE ONLY - it loads a pre-existing `.pth` model file
+(`RVCInference(device=...).load_model(...)`/`.infer_file(...)`, both used
+exactly as documented) but has no training/fitting entry point at all.
+Real per-speaker RVC model training needs the full RVC-WebUI-style
+pipeline (feature extraction + many-epoch training) or a different,
+zero-shot-capable voice-conversion tool chosen specifically for that
+property - out of scope for now. `word_replace_tts_driver.py`'s
+`_train_rvc_model()` raises `NotImplementedError` rather than pretending
+to train something; `ensure_voice_model()` catches this like any other
+training failure, so **every synthesized candidate currently uses a
+neutral (un-converted) Piper voice, never the actual speaker's timbre** -
+donor-word reuse is the only path that gets the real voice right today.
+Piper's own API was NOT independently re-verified against the installed
+version the same way RVC's was - treat `word_replace_tts_driver.py`'s
+`_synthesize_piper()` as the more likely of the two to still need a fix
+once actually exercised against real output.
+
+**Validated 2026-10-20** against a real local run (`.venv-tts` set up per
+README, Piper + `en_US-lessac-medium`, RVC installed but unreachable - see
+above): a synthetic test clip's one flagged word was correctly detected,
+candidates were generated (donor + two synthesized words), scored, and on
+one run the best-scoring synthesized candidate was accepted and spliced in
+(`outcome: "synth"` in `.bleeps.json`) - confirms the full chain works
+end to end, not just in isolation. **Also observed, worth flagging
+honestly**: candidate scoring is noticeably run-to-run variable on a
+clip this short, and not always in the donor's favor the way design intent
+expected - a real re-run of the identical input scored a perfectly
+intelligible real donor clip (independently verified to transcribe
+correctly on its own) as Whisper hallucinating "Thank you for watching."
+instead, a well-known Whisper failure mode on very short/quiet audio,
+while a neutral-voice synthesized candidate for the same word scored well
+enough to win. The prosody-transplant and loudness-matching steps likely
+push a donor clip's level/spectral shape into territory more prone to
+this than the raw clip was (both steps are easy to disable per-run via
+`--no-replace-prosody`/`--no-replace-scene-blend` if a real file shows
+this pattern often). Net effect: the fallback-to-mute safety net is doing
+real work, not just a theoretical backstop - expect a meaningful fraction
+of occurrences to mute rather than replace even when a decent candidate
+exists, and don't read one muted occurrence as the feature being broken.
+
+**Four real bugs found and fixed 2026-10-20/21, against a real clip from
+a real film** (not the synthetic test clip above) - each one confirmed
+live before being called fixed, not just reasoned about:
+1. **`clean.py`'s `choose_audio()` call site computed `audio_pos` against
+   the STALE-FILTERED track list, not the real unfiltered one** - on a
+   rerun where a stale prior output track sorted before the real track in
+   the container, every method (not just `replace`) could silently map
+   `-ss`/stemming/transcription against the WRONG physical audio stream.
+   Fixed by recomputing `audio_pos` against the full, unfiltered track list.
+2. **`word_replace._build_candidates_for_hit`'s `target_duration_s` was
+   computed from the bare `[hit_time, hit_end]` match window, not the
+   padded `[hit_time - pad_start, hit_end + pad_end]` slot `_splice_spans`
+   actually splices the winning candidate into** - every ACTUAL
+   replacement (not a mute fallback) shortened the whole output by
+   `pad_start + pad_end` (confirmed: a real delivered clip measured
+   19.805s against a 20.000s source). Fixed by computing the target from
+   the same padded, span-clamped window `_splice_spans` uses.
+3. **`word_replace_tts_driver.do_tts`'s one-shot corrective retry set
+   Piper's `length_scale` to `ratio` (`actual/target`) instead of
+   `1/ratio`** - backwards, per Piper's own doc ("< 1 is faster, > 1 is
+   slower"): a too-long first pass got asked to render even LONGER, a
+   too-short one even SHORTER, pushing the final `atempo` fit to close a
+   much larger gap than necessary. A likely contributor to an
+   unnatural-sounding replacement word the user flagged directly ("pitched
+   up"), though not confirmed as the sole cause - see the voice notes
+   below. Fixed to `length_scale=1.0/ratio`.
+4. **Tried, then reverted, extending `clean.py`'s `also_instrumental`
+   reuse (originally mute-only) to `replace`** - the idea was a free
+   whole-track Instrumental stem for `replace`'s own background-bed
+   mixing, same as `mute` already gets. Reverted the same day:
+   `_run_separator_pair`'s dual-stem invocation (`single_stem=None`) is a
+   DIFFERENT `audio-separator` call than the dedicated
+   `single_stem="Vocals"` pass `replace`'s own detection transcript
+   depends on, and switching to it measurably changed the Vocals stem -
+   enough that Whisper's VAD missed a real, borderline-quiet flagged word
+   on two consecutive runs that had caught it fine before. A direct RMS
+   comparison had already shown the background-bed itself identical
+   either way, so there was no real quality upside being traded for that
+   detection risk. **Lesson for next time touching this area**: any
+   change to HOW the Vocals stem for `replace`'s own detection pass gets
+   produced needs to be tested against actual word detection, not just
+   against the background-bed's own audio quality.
+
+**Voice default changed 2026-10-21** after a direct listening test (not
+just engineering reasoning): the original default, `en_US-lessac-medium`,
+read as female to the user. Two alternatives tried next -
+`en_US-john-medium`, `en_US-joe-medium` - had audible crackling/distortion.
+`en_US-hfc_male-medium` was the one that actually sounded right and is
+now the default (`word_replace_tts_driver.PIPER_VOICE_MALE`). **This is
+still just "best available neutral voice," not real per-speaker
+matching** - the fundamental limitation above (no RVC training API)
+is unchanged; a better default voice doesn't change the fact that every
+synthesized candidate uses ONE voice per gender for the entire film,
+regardless of which character is actually speaking.
+
+**Pool mode added 2026-10-21** - see the "Pool mode" paragraph above for
+the mechanism. Validated end-to-end on a real clip: correctly picked a
+random multi-word phrase ("beans on toast") for a flagged word with no
+donor available, spliced it at the correct timestamp, and a full
+re-transcription of the output found zero remaining flagged terms.
 
 ### Center-channel-only removal (`--method dialog`, explicit opt-in only)
 
