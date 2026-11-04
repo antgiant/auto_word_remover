@@ -91,7 +91,8 @@ Three tools that work together, each usable on its own:
 ## Setup difficulty — the honest version
 
 This is a self-hosted, power-user tool, not a one-click installer. Budget
-real setup time, especially on the first pass:
+real setup time, especially on the first pass — though `install.ps1` (see
+below) handles most of it for you.
 
 - **Windows only for now.** All launchers are `.ps1`/`.cmd`; the Python
   itself is cross-platform but only Windows has actually been tested.
@@ -118,6 +119,30 @@ Net honest take: it works smoothly for a straightforward stereo/mono source
 with the core setup alone, and takes real additional time if you want every
 fallback (surround-aware smart muting, bitmap subtitle OCR, TV-recording
 subtitle matching) wired up too.
+
+### Installing it
+
+`install.ps1` in this folder automates the core setup above — Python venv +
+WhisperX for `voice_to_text`, ffmpeg, and MKVToolNix for `profanity_filter` —
+installing whatever's missing via `winget` where it can and printing the
+manual step otherwise. Double-click `install.cmd`, or from PowerShell:
+
+```powershell
+.\install.ps1
+```
+
+The three optional extras (stemmer, TTS/voice-conversion, OCR) are each
+several GB, so they're off by default — opt in with a flag:
+
+```powershell
+.\install.ps1 -IncludeStemmer -IncludeOcr -IncludeTts
+.\install.ps1 -Cpu              # no NVIDIA GPU - install CPU-only builds instead
+.\install.ps1 -Force             # rebuild a venv that's already set up
+```
+
+An OpenSubtitles API key and a TMDB API key (both free, both optional) each
+need a personal account, so those two stay manual — see
+[`profanity_filter/README.md`](profanity_filter/README.md) steps 5 and 6.
 
 ## Why these three, together
 
@@ -149,7 +174,9 @@ engineering notes. This file just covers how they fit together.
   cross-platform but the setup instructions assume Windows).
 - An NVIDIA GPU with CUDA for `voice_to_text` (falls back to CPU, slower).
 - Python 3.11+, `ffmpeg`/`ffprobe` on PATH, and (for `profanity_filter`)
-  MKVToolNix. See each project's own README for exact setup steps.
+  MKVToolNix. Run [`install.ps1`](install.ps1) (or `install.cmd`) to set all
+  of this up automatically; see each project's own README for exact manual
+  steps and the optional extras.
 
 ## License
 
