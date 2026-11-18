@@ -633,6 +633,55 @@ def find_shared_prefix_cutoff(segs_a: list[dict], segs_b: list[dict],
     return cutoff
 
 
+def find_local_alignment_offset(segs_a: list[dict], segs_b: list[dict], target_b_idx: int,
+                                max_block_distance: int = 20, min_blocks: int = 2,
+                                max_offset_stddev: float = 3.0) -> float | None:
+    """Returns a reliable local time offset (segs_a's time - segs_b's time) for mapping a
+    timestamp in `segs_b` (e.g. a hallucination hit in an edition's own transcript) onto the
+    corresponding point in `segs_a` (e.g. a sibling edition's transcript), for use past
+    find_shared_prefix_cutoff's point - i.e. once the two cuts have already diverged and a
+    single global offset no longer applies, but short stretches may still be genuinely
+    unedited between the two cuts, just shifted by whatever's been added/removed before them.
+
+    Derived from TEXT-matching blocks (difflib.SequenceMatcher on segment text) near
+    `target_b_idx`, deliberately EXCLUDING any block that contains target_b_idx itself. That
+    exclusion is the whole point, not an optimization: confirmed 2026-11-18 on Elemental (2023)
+    {edition-Wooley Cut} segment 725 ("Oh my gosh", a confirmed hallucination at t=3119.4) -
+    its own text happens to exactly match a GENUINELY REAL "Oh, my gosh!" line in the main cut
+    at t=3135.3, an unrelated story moment the two cuts' edits have drifted apart from. Using
+    that coincidental match's own offset (~16.4s) would silently validate the wrong position.
+    The blocks immediately before and after it (not containing it) agree on a quite different,
+    mutually consistent ~8.3s offset - which the coincidental match's own offset disagrees with
+    enough that requiring low variance across surrounding blocks protects against exactly this
+    trap. A WhisperX decoder can hallucinate a phrase that also occurs for real elsewhere in
+    the same film, so text equality AT the hit itself is never trustworthy alignment evidence.
+
+    Returns None - the safe, request-nothing-happen default - unless at least `min_blocks`
+    qualifying blocks exist within `max_block_distance` list positions of `target_b_idx` and
+    their offsets agree within `max_offset_stddev` of each other. A caller only uses the
+    returned offset to look for ADDITIONAL exclusion evidence (see exclude_via_cc_absence /
+    exclude_via_cc_word_absence) - never to protect or confirm a hit - so the worst case of a
+    missing or wrong offset is simply failing to catch something, not a new false exclusion."""
+    a_texts = [s.get("text") for s in segs_a]
+    b_texts = [s.get("text") for s in segs_b]
+    sm = difflib.SequenceMatcher(None, a_texts, b_texts, autojunk=False)
+    offsets = []
+    for blk in sm.get_matching_blocks():
+        if blk.size == 0 or (blk.b <= target_b_idx < blk.b + blk.size):
+            continue
+        if abs((blk.b + blk.size // 2) - target_b_idx) > max_block_distance:
+            continue
+        a_t = segs_a[blk.a].get("start")
+        b_t = segs_b[blk.b].get("start")
+        if a_t is not None and b_t is not None:
+            offsets.append(a_t - b_t)
+    if len(offsets) < min_blocks:
+        return None
+    if statistics.pstdev(offsets) > max_offset_stddev:
+        return None
+    return statistics.mean(offsets)
+
+
 def _is_full_cc(sub_units: list[Unit]) -> bool:
     """True if `sub_units` looks like a full SDH-style closed-caption track that transcribes
     non-dialogue audio (sound effects, music cues) as well as speech, not just a dialogue-only
@@ -682,6 +731,66 @@ def exclude_via_cc_absence(hits: list[dict], sub_units: list[Unit], reason: str 
             for u in sub_units
         )
         if not nearby:
+            h["suspected_hallucination"] = {
+                "reason": reason,
+                "matched_locator": None,
+                "gap_s": None,
+                "avg_logprob": None,
+                "median_avg_logprob": None,
+            }
+
+
+def exclude_via_cc_word_absence(hits: list[dict], sub_units: list[Unit],
+                                reason: str = "no-cc-word-match") -> None:
+    """A stronger sibling of exclude_via_cc_absence for the case that one can't catch: a busy,
+    well-covered scene (lots of CC cues nearby - a crowd cheering, music, other dialogue) where
+    none of those cues contain the matched word itself. exclude_via_cc_absence requires total
+    silence, so it correctly does nothing here - there IS plenty of CC activity nearby, just not
+    this word - but that's exactly the situation a full SDH track is positioned to adjudicate:
+    captioners transcribe profanity/exclamations verbatim (accessibility standards require
+    capturing meaningful dialogue regardless of volume, unlike an automated VAD/ASR system),
+    so if the scene is confirmed covered but this specific word never appears anywhere nearby,
+    that's real evidence against it, not just an absence of evidence.
+
+    Confirmed 2026-11-18 on Elemental (2023): the main cut's hallucinated "What the hell is
+    that?" at 1765s sits inside a loudly-captioned celebration scene ("We love you, Lutz!",
+    "(CHEERING)", "Yay! Yeah! Way to go, Lutz!", "(WHISTLE BLOWS)") - exclude_via_cc_absence
+    can't touch it (the window is full of other cues) but none of those cues contain "hell"
+    anywhere nearby, and the Wooley Cut edition hallucinates the exact same line at the
+    aligned position in its own cut (see find_shared_prefix_cutoff's docstring and
+    find_local_alignment_offset) - two independent cuts agreeing on a fabrication is itself
+    further evidence it's a shared decoder artifact, not real dialogue either cut's captioners
+    ever had reason to transcribe.
+
+    Reuses the exact same word-match logic as rescue_via_subtitle (same
+    _HALLUCINATION_RESCUE_WINDOW_S), just inverted and applied to hits the caller hasn't
+    already flagged - a hit this WOULD rescue if it were already flagged is, by construction,
+    never caught here, so the two functions can't contradict each other on the same hit.
+    Gated on _is_full_cc like exclude_via_cc_absence, for the same reason: a dialogue-only
+    source saying nothing about a word doesn't mean nothing was said, just that this track
+    was never trying to catch everything.
+
+    Carries real risk a plain silence check doesn't: even a thorough SDH track can occasionally
+    paraphrase a quick exclamation into a generic cue ("(EXCLAIMS)") rather than transcribing it
+    verbatim, which would make this wrongly treat a real line as absent. Verify the blast radius
+    broadly (not just on one already-confirmed file) before trusting this at library scale -
+    see the 2026-11-18 commit message for how this was checked before shipping."""
+    if not _is_full_cc(sub_units):
+        return
+    for h in hits:
+        if h.get("suspected_hallucination"):
+            continue
+        t = h.get("time")
+        if t is None:
+            continue
+        word = _norm_tok(h["match"].split()[-1])
+        confirmed = any(
+            u.start is not None and u.start - _HALLUCINATION_RESCUE_WINDOW_S <= t
+            <= (u.end if u.end is not None else u.start) + _HALLUCINATION_RESCUE_WINDOW_S
+            and any(_norm_tok(tok) == word for tok in u.text.split())
+            for u in sub_units
+        )
+        if not confirmed:
             h["suspected_hallucination"] = {
                 "reason": reason,
                 "matched_locator": None,

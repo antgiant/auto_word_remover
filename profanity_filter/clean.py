@@ -841,17 +841,21 @@ def find_sibling_edition_cc(media: Path, js: Path, tools: dict, tmp: Path):
     the film's first ~10.5 minutes) - the main cut's own official CC track, confirmed full-SDH,
     is just as valid evidence for the Wooley Cut edition's own hits in that same range.
 
-    Returns (sibling_sub_units, cutoff_s) for the first sibling found that qualifies, or
-    (None, None) if no sibling helps. Only ever used to ADD corroborating absence-of-coverage
-    evidence (see flag_language.exclude_via_cc_absence) restricted to t <= cutoff_s - never
-    trusted past the point the two cuts are confirmed to diverge."""
+    Returns (sibling_sub_units, cutoff_s, own_segs, sibling_segs) for the first sibling found
+    that qualifies, or (None, None, None, None) if no sibling helps. `own_segs`/`sibling_segs`
+    are returned alongside so a caller can ALSO try flag_language.find_local_alignment_offset
+    per-hit for anything past cutoff_s, where the two cuts have diverged but short stretches
+    may still be genuinely unedited, just shifted - see that function's own docstring for why
+    this needs the full segment lists, not just the cutoff. Only ever used to ADD corroborating
+    absence-of-coverage evidence (see flag_language.exclude_via_cc_absence /
+    exclude_via_cc_word_absence) - never to protect/confirm a hit."""
     import flag_language
     try:
         own_segs = json.loads(js.read_text(encoding="utf-8-sig")).get("segments")
     except (OSError, json.JSONDecodeError):
-        return None, None
+        return None, None, None, None
     if not own_segs:
-        return None, None
+        return None, None, None, None
 
     for cand_json in media.parent.glob("*.json"):
         if cand_json == js or cand_json.name.endswith((".words.json", ".speakers.json", ".vocals.json")):
@@ -892,8 +896,8 @@ def find_sibling_edition_cc(media: Path, js: Path, tools: dict, tmp: Path):
             print(f"  [note] borrowing {cand_media.name!r}'s CC track as a cross-reference for "
                   f"the t<={cutoff:.0f}s window this file's own transcript matches it "
                   f"exactly - see flag_language.find_shared_prefix_cutoff")
-            return sub_units, cutoff
-    return None, None
+            return sub_units, cutoff, own_segs, cand_segs
+    return None, None, None, None
 
 
 def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = None,
@@ -927,14 +931,16 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
         try:
             not_yet_flagged = [h for h in hits if not h.get("suspected_hallucination")]
             flag_language.exclude_via_cc_absence(not_yet_flagged, sub_units)
+            flag_language.exclude_via_cc_word_absence(not_yet_flagged, sub_units)
             new_cc_excluded = [h for h in not_yet_flagged if h.get("suspected_hallucination")]
             if new_cc_excluded:
-                print(f"  [note] {len(new_cc_excluded)} additional hit(s) excluded - no "
-                      f"subtitle/CC cue of any kind (dialogue or sound-effect) near the "
-                      f"timestamp, in a full SDH-style CC track (see "
-                      f"flag_language.exclude_via_cc_absence):")
+                print(f"  [note] {len(new_cc_excluded)} additional hit(s) excluded - a full "
+                      f"SDH-style CC track has no cue, or no cue containing the matched word, "
+                      f"near the timestamp (see flag_language.exclude_via_cc_absence / "
+                      f"exclude_via_cc_word_absence):")
                 for h in new_cc_excluded:
-                    print(f"    {h['time_hms']} {h['match']!r}")
+                    print(f"    {h['time_hms']} {h['match']!r} "
+                          f"({h['suspected_hallucination']['reason']})")
                 hallucinated = hallucinated + new_cc_excluded
         except Exception as exc:
             print(f"  [warn] no-cc-coverage check failed ({exc!r})", file=sys.stderr)
@@ -942,21 +948,50 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
     own_cc_is_full = sub_units is not None and flag_language._is_full_cc(sub_units)
     if not own_cc_is_full and media is not None and tools is not None and tmp is not None:
         try:
-            sibling_sub_units, cutoff = find_sibling_edition_cc(media, js, tools, tmp)
+            sibling_sub_units, cutoff, own_segs, sibling_segs = find_sibling_edition_cc(media, js, tools, tmp)
             if sibling_sub_units is not None:
-                not_yet_flagged = [h for h in hits
-                                  if not h.get("suspected_hallucination")
-                                  and h.get("time") is not None and h["time"] <= cutoff]
-                flag_language.exclude_via_cc_absence(not_yet_flagged, sibling_sub_units,
+                new_sibling_excluded = []
+
+                in_prefix = [h for h in hits
+                            if not h.get("suspected_hallucination")
+                            and h.get("time") is not None and h["time"] <= cutoff]
+                flag_language.exclude_via_cc_absence(in_prefix, sibling_sub_units,
                                                      reason="no-cc-coverage-via-sibling-edition")
-                new_sibling_excluded = [h for h in not_yet_flagged if h.get("suspected_hallucination")]
+                flag_language.exclude_via_cc_word_absence(in_prefix, sibling_sub_units,
+                                                          reason="no-cc-word-match-via-sibling-edition")
+                new_sibling_excluded += [h for h in in_prefix if h.get("suspected_hallucination")]
+
+                # Past the confirmed-identical prefix, the two cuts have diverged, but short
+                # stretches between edits may still be genuinely unedited - just shifted. Try a
+                # PER-HIT local alignment (see find_local_alignment_offset) for each remaining
+                # hit instead of assuming one global offset applies.
+                past_prefix = [h for h in hits
+                              if not h.get("suspected_hallucination")
+                              and h.get("time") is not None and h["time"] > cutoff
+                              and isinstance(h.get("locator"), str)
+                              and h["locator"].startswith("segment ")]
+                for h in past_prefix:
+                    target_idx = int(h["locator"].split()[1])
+                    offset = flag_language.find_local_alignment_offset(
+                        sibling_segs, own_segs, target_idx)
+                    if offset is None:
+                        continue
+                    shifted = dict(h, time=h["time"] + offset)
+                    flag_language.exclude_via_cc_absence(
+                        [shifted], sibling_sub_units, reason="no-cc-coverage-via-sibling-edition")
+                    flag_language.exclude_via_cc_word_absence(
+                        [shifted], sibling_sub_units, reason="no-cc-word-match-via-sibling-edition")
+                    if shifted.get("suspected_hallucination"):
+                        h["suspected_hallucination"] = shifted["suspected_hallucination"]
+                        new_sibling_excluded.append(h)
+
                 if new_sibling_excluded:
                     print(f"  [note] {len(new_sibling_excluded)} additional hit(s) excluded via "
-                          f"a SIBLING edition's CC track (no cue of any kind within the "
-                          f"confirmed shared t<={cutoff:.0f}s window - see "
-                          f"find_sibling_edition_cc):")
+                          f"a SIBLING edition's CC track (see find_sibling_edition_cc / "
+                          f"find_local_alignment_offset):")
                     for h in new_sibling_excluded:
-                        print(f"    {h['time_hms']} {h['match']!r}")
+                        print(f"    {h['time_hms']} {h['match']!r} "
+                              f"({h['suspected_hallucination']['reason']})")
                     hallucinated = hallucinated + new_sibling_excluded
         except Exception as exc:
             print(f"  [warn] sibling-edition CC check failed ({exc!r})", file=sys.stderr)
@@ -971,7 +1006,8 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
                   f"timestamp, overriding the repetition/confidence suspicion:")
             for h in rescued:
                 print(f"    {h['time_hms']} {h['match']!r}")
-        _cc_reasons = ("no-cc-coverage", "no-cc-coverage-via-sibling-edition")
+        _cc_reasons = ("no-cc-coverage", "no-cc-coverage-via-sibling-edition",
+                      "no-cc-word-match", "no-cc-word-match-via-sibling-edition")
         repetition_based = [h for h in hallucinated if h["suspected_hallucination"]["reason"] not in _cc_reasons]
         if repetition_based:
             print(f"  [note] {len(repetition_based)} hit(s) excluded as suspected transcription "
