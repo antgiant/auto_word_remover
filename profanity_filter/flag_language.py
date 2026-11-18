@@ -495,18 +495,20 @@ def detect_repeated_segments(path: str | Path) -> dict[str, dict]:
     # segments scored -0.37 to -0.42, worse than the file's typical dialogue but still above
     # this threshold).
     #
-    # One segment needs protecting from this extension even though it would otherwise qualify:
-    # whichever segment a LATER one's repeated-text match points back to as the original
-    # (every suspect's own matched_locator, when set) is - by construction - the first, real
-    # occurrence of that line, not a hallucination; the fact that something later repeats it
-    # is itself evidence it was real enough to get "remembered" for the decoder to latch onto.
-    # Confirmed live on the same file: segment 983 ("Holy shit, stop being such a dick.") is
-    # what 1218/1224 both repeat - matching the SAME real argument scene confirmed by manual
-    # review in the main (non-Wooley-Cut) file - yet scored low enough, and sat close enough to
-    # an unrelated hallucinated neighbor (segment 982), that the sweep below would otherwise
-    # have swallowed it too.
-    protected_originals = {int(info["matched_locator"].split()[1]) for info in suspects.values()
-                           if info.get("matched_locator")}
+    # NOTE: a segment that a LATER one's repeated-text match points back to as the "original"
+    # (every suspect's own matched_locator) is NOT assumed real and is NOT exempted from this
+    # extension - that assumption was tried and directly disproved 2026-11-18: "Holy shit, stop
+    # being such a dick." was treated as confirmed-real in the main (non-Wooley-Cut) file
+    # (segment 991, matched_locator for 1226/1229/1230) specifically BECAUSE it repeated later,
+    # on the theory that repetition is evidence something was real enough for the decoder to
+    # latch onto - manual listening confirmed this exact line is ALSO fake there. Proof it's a
+    # pure decoder artifact, not scene-dependent: segments 0 ("What the hell is wrong with
+    # you?") and 402/393 ("What the hell is that?") score within 0.002 of each other between
+    # the main file and Wooley Cut (-0.840/-0.840 and -1.066/-1.068) at nearly the same relative
+    # position in both cuts - the model hallucinates this same cluster of lines the same way
+    # regardless of which edit it's fed, with no real occurrence in either one. So a
+    # matched_locator segment is evaluated purely on its own confidence/adjacency like anything
+    # else below - if something qualifies it for this extension, it gets flagged too.
     frontier = set(suspects)
     while frontier:
         new_frontier = set()
@@ -517,7 +519,7 @@ def detect_repeated_segments(path: str | Path) -> dict[str, dict]:
                 if not (0 <= ni < len(segs)):
                     continue
                 nloc = f"segment {ni}"
-                if nloc in suspects or ni in protected_originals:
+                if nloc in suspects:
                     continue
                 lp_n = segs[ni].get("avg_logprob")
                 t_n = segs[ni].get("start")
