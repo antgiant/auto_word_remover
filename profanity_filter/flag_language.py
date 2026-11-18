@@ -587,6 +587,110 @@ def rescue_via_subtitle(hallucinated_hits: list[dict], sub_units: list[Unit]) ->
     return still_bad
 
 
+_CC_SFX_CUE_RE = re.compile(r"^\([^)]*\)$")
+_CC_MIN_CUES = 50   # minimum total cues before trusting a "full CC" classification below - a
+#   tiny forced/partial subtitle track could spuriously look SFX-heavy by fraction alone from
+#   just a handful of cues.
+_CC_MIN_SFX_FRACTION = 0.02   # share of cues that are a PURE bracketed sound-effect
+#   description ("(WAVES LAPPING)", "(HORN BLOWS)") before treating a subtitle source as a
+#   full SDH-style closed-caption track - one that transcribes non-dialogue audio too, not
+#   just speech - rather than a dialogue-only one. Measured 2026-11-18 on Elemental (2023): the
+#   main cut's embedded SRT is 24.5% pure-SFX cues (482/1965) - a real SDH track; the Wooley
+#   Cut edition's OpenSubtitles-sourced SRT is 0% (0/1159) - dialogue only, as expected from a
+#   fan-resynced third-party source that was never trying to describe non-speech audio. 2%
+#   leaves wide margin below the real case while still requiring more than an occasional
+#   one-off bracketed aside ("(laughs)") in an otherwise dialogue-only track.
+_HALLUCINATION_NO_CC_WINDOW_S = 12.0   # how far from a hit's own timestamp to look for ANY cue
+#   (dialogue or sound-effect) before treating total silence in a full CC track as independent
+#   confirmation nothing was said there at all. Wider than _HALLUCINATION_RESCUE_WINDOW_S
+#   because this makes the OPPOSITE claim (absence proves nothing was said, not presence
+#   confirms something was) - it should tolerate more CC timing slop before concluding
+#   "nothing's there" rather than risk wrongly excluding real dialogue over a sync offset.
+
+
+def find_shared_prefix_cutoff(segs_a: list[dict], segs_b: list[dict],
+                              tol: float = 0.1) -> float | None:
+    """Returns the timestamp through which two WhisperX segment lists - typically different
+    editions/cuts of the same title - are text-AND-timing identical, or None if they diverge
+    on their very first segment. Confirmed 2026-11-18: Elemental (2023) and its Wooley Cut
+    edition share an exact (same text, start time within 0.05s) prefix through segment 118 /
+    t=633.3s before the fan edit's first actual change (segment 119: "I'm doing a reading."
+    vs. "Sorry, gotta grab some stuff.") - meaning the opening ~10.5 minutes, including the
+    entire Disney+Pixar logo sequence, is bit-identical audio in both cuts, despite the fan
+    edit's own subtitle track being too sparse/unreliable to help on its own.
+
+    A confirmed-identical prefix like this means evidence gathered against ONE cut in that
+    range (e.g. a full SDH CC track that only exists on the other cut - see
+    exclude_via_cc_absence) is just as valid for the other cut's own hits in the same range,
+    without needing full cross-edit realignment past the point where they actually diverge."""
+    n = min(len(segs_a), len(segs_b))
+    cutoff = None
+    for i in range(n):
+        a, b = segs_a[i], segs_b[i]
+        if a.get("text") != b.get("text") or abs((a.get("start") or 0) - (b.get("start") or 0)) > tol:
+            break
+        cutoff = a.get("start")
+    return cutoff
+
+
+def _is_full_cc(sub_units: list[Unit]) -> bool:
+    """True if `sub_units` looks like a full SDH-style closed-caption track that transcribes
+    non-dialogue audio (sound effects, music cues) as well as speech, not just a dialogue-only
+    subtitle - see _CC_MIN_SFX_FRACTION's docstring for how this was calibrated. Only a track
+    like this makes silence itself meaningful evidence (see exclude_via_cc_absence); a
+    dialogue-only source says nothing about a pure-music/silent stretch even when it has no
+    cue there, since it was never trying to describe non-speech audio in the first place."""
+    if len(sub_units) < _CC_MIN_CUES:
+        return False
+    sfx = sum(1 for u in sub_units if _CC_SFX_CUE_RE.match((u.text or "").strip()))
+    return sfx / len(sub_units) >= _CC_MIN_SFX_FRACTION
+
+
+def exclude_via_cc_absence(hits: list[dict], sub_units: list[Unit], reason: str = "no-cc-coverage") -> None:
+    """Flags a wordlist hit as a suspected hallucination - independent of, and a different
+    mechanism from, detect_repeated_segments' repetition/confidence check - when a full
+    SDH-style CC track (see _is_full_cc) has NO cue of any kind, dialogue or sound-effect,
+    anywhere near its timestamp. This catches exactly what repetition-based detection
+    structurally cannot: a hallucination that occurs only ONCE in the file with nothing earlier
+    to repeat-match against. Confirmed 2026-11-18 on Elemental (2023): "What the hell is wrong
+    with you?" at 0:06 falls inside the main cut's own CC track's completely silent 0:00-1:01
+    opening (the Disney + Pixar logo sequence - music only, not even a sound-effect cue) yet
+    was invisible to the repeated-text detector since it's the first, not a later, occurrence
+    of that exact line.
+
+    Does nothing when `sub_units` doesn't look like a full CC - silence in a dialogue-only
+    subtitle proves nothing about a pure-music stretch, since such a track was never attempting
+    to describe non-speech audio at all (see _is_full_cc).
+
+    Mutates `hits` in place (sets suspected_hallucination on the ones newly caught) and returns
+    None - mirrors detect_repeated_segments/scan_file's own already-in-place hit mutation
+    pattern, unlike rescue_via_subtitle's filter-and-return-a-new-list shape, since this is
+    ADDING markers rather than removing hits from a list. Only evaluates hits NOT already
+    flagged by the caller - this is a second, independent path onto the same
+    suspected_hallucination marker, not a replacement for the repetition-based one."""
+    if not _is_full_cc(sub_units):
+        return
+    for h in hits:
+        if h.get("suspected_hallucination"):
+            continue
+        t = h.get("time")
+        if t is None:
+            continue
+        nearby = any(
+            u.start is not None and u.start - _HALLUCINATION_NO_CC_WINDOW_S <= t
+            <= (u.end if u.end is not None else u.start) + _HALLUCINATION_NO_CC_WINDOW_S
+            for u in sub_units
+        )
+        if not nearby:
+            h["suspected_hallucination"] = {
+                "reason": reason,
+                "matched_locator": None,
+                "gap_s": None,
+                "avg_logprob": None,
+                "median_avg_logprob": None,
+            }
+
+
 def scan_file(path: str | Path, matchers: dict[str, re.Pattern | None],
               ctx: int = 48) -> tuple[list[dict], str]:
     fmt, units = parse_transcript(Path(path))

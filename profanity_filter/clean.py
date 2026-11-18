@@ -824,8 +824,81 @@ def _dedupe_vocals_hits(primary_hits: list[dict], vocals_hits: list[dict],
     return kept
 
 
+_SIBLING_VIDEO_EXTS = (".mkv", ".mp4", ".m4v", ".avi")
+
+
+def find_sibling_edition_cc(media: Path, js: Path, tools: dict, tmp: Path):
+    """Looks for ANOTHER edition/cut of the same title in `media`'s own directory (Plex-style
+    "{edition-X}" naming is common in this library, but this only relies on having its OWN
+    cached transcript next to it, not on parsing the naming convention) that (a) shares a
+    text-AND-timing-identical PREFIX with this file's own transcript (see
+    find_shared_prefix_cutoff) and (b) has a full SDH-style CC track of its own (see
+    flag_language._is_full_cc) that THIS file lacks.
+
+    Confirmed 2026-11-18: Elemental (2023) {edition-Wooley Cut} has no usable CC of its own
+    (its only subtitle is a dialogue-only, fan-resynced OpenSubtitles track), but shares an
+    exact prefix with the main cut through t=633s (the entire Disney+Pixar logo sequence and
+    the film's first ~10.5 minutes) - the main cut's own official CC track, confirmed full-SDH,
+    is just as valid evidence for the Wooley Cut edition's own hits in that same range.
+
+    Returns (sibling_sub_units, cutoff_s) for the first sibling found that qualifies, or
+    (None, None) if no sibling helps. Only ever used to ADD corroborating absence-of-coverage
+    evidence (see flag_language.exclude_via_cc_absence) restricted to t <= cutoff_s - never
+    trusted past the point the two cuts are confirmed to diverge."""
+    import flag_language
+    try:
+        own_segs = json.loads(js.read_text(encoding="utf-8-sig")).get("segments")
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not own_segs:
+        return None, None
+
+    for cand_json in media.parent.glob("*.json"):
+        if cand_json == js or cand_json.name.endswith((".words.json", ".speakers.json", ".vocals.json")):
+            continue
+        cand_media = next((cand_json.with_suffix(ext) for ext in _SIBLING_VIDEO_EXTS
+                           if cand_json.with_suffix(ext).is_file()), None)
+        if cand_media is None:
+            continue
+        try:
+            cand_segs = json.loads(cand_json.read_text(encoding="utf-8-sig")).get("segments")
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not cand_segs:
+            continue
+        cutoff = flag_language.find_shared_prefix_cutoff(own_segs, cand_segs)
+        if not cutoff or cutoff < 5.0:   # too little shared material to be worth the probe below
+            continue
+        try:
+            tracks_all = run_json([tools["mkvmerge"], "-J", str(cand_media)])["tracks"]
+        except Exception:
+            continue
+        sub_track = next((t for t in tracks_all if t["type"] == "subtitles"
+                          and t["codec"] == "SubRip/SRT"
+                          and "cleaned" not in (t["properties"].get("track_name") or "").lower()),
+                         None)
+        if sub_track is None:
+            continue
+        cand_srt = tmp / "sibling_cc.srt"
+        try:
+            run([tools["mkvextract"], "tracks", str(cand_media), f"{sub_track['id']}:{cand_srt}"],
+                capture_output=True, text=True)
+        except Exception:
+            continue
+        if not cand_srt.is_file():
+            continue
+        sub_units = flag_language.parse_srt(cand_srt)
+        if flag_language._is_full_cc(sub_units):
+            print(f"  [note] borrowing {cand_media.name!r}'s CC track as a cross-reference for "
+                  f"the t<={cutoff:.0f}s window this file's own transcript matches it "
+                  f"exactly - see flag_language.find_shared_prefix_cutoff")
+            return sub_units, cutoff
+    return None, None
+
+
 def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = None,
-               extra_hits: list[dict] | None = None, vocals_hits: list[dict] | None = None):
+               extra_hits: list[dict] | None = None, vocals_hits: list[dict] | None = None,
+               media: Path | None = None, tools: dict | None = None, tmp: Path | None = None):
     if str(HERE) not in sys.path:
         sys.path.insert(0, str(HERE))
     import flag_language
@@ -833,16 +906,62 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
     cats = set(cfg.categories)
     hits, _fmt = flag_language.scan_file(js, matchers)
 
+    sub_units = None
+    if srt_path is not None and srt_path.is_file():
+        try:
+            sub_units = flag_language.parse_srt(srt_path)
+        except Exception as exc:
+            print(f"  [warn] subtitle/CC parse failed ({exc!r}) - skipping both the "
+                  f"hallucination-rescue and no-coverage checks", file=sys.stderr)
+
     hallucinated = [h for h in hits if h.get("suspected_hallucination")]
+    if hallucinated and sub_units is not None:
+        try:
+            hallucinated = flag_language.rescue_via_subtitle(hallucinated, sub_units)
+        except Exception as exc:
+            print(f"  [warn] hallucination-rescue subtitle check failed ({exc!r}) - "
+                  f"keeping every suspected hit excluded rather than risk trusting an "
+                  f"unparsed source", file=sys.stderr)
+
+    if sub_units is not None:
+        try:
+            not_yet_flagged = [h for h in hits if not h.get("suspected_hallucination")]
+            flag_language.exclude_via_cc_absence(not_yet_flagged, sub_units)
+            new_cc_excluded = [h for h in not_yet_flagged if h.get("suspected_hallucination")]
+            if new_cc_excluded:
+                print(f"  [note] {len(new_cc_excluded)} additional hit(s) excluded - no "
+                      f"subtitle/CC cue of any kind (dialogue or sound-effect) near the "
+                      f"timestamp, in a full SDH-style CC track (see "
+                      f"flag_language.exclude_via_cc_absence):")
+                for h in new_cc_excluded:
+                    print(f"    {h['time_hms']} {h['match']!r}")
+                hallucinated = hallucinated + new_cc_excluded
+        except Exception as exc:
+            print(f"  [warn] no-cc-coverage check failed ({exc!r})", file=sys.stderr)
+
+    own_cc_is_full = sub_units is not None and flag_language._is_full_cc(sub_units)
+    if not own_cc_is_full and media is not None and tools is not None and tmp is not None:
+        try:
+            sibling_sub_units, cutoff = find_sibling_edition_cc(media, js, tools, tmp)
+            if sibling_sub_units is not None:
+                not_yet_flagged = [h for h in hits
+                                  if not h.get("suspected_hallucination")
+                                  and h.get("time") is not None and h["time"] <= cutoff]
+                flag_language.exclude_via_cc_absence(not_yet_flagged, sibling_sub_units,
+                                                     reason="no-cc-coverage-via-sibling-edition")
+                new_sibling_excluded = [h for h in not_yet_flagged if h.get("suspected_hallucination")]
+                if new_sibling_excluded:
+                    print(f"  [note] {len(new_sibling_excluded)} additional hit(s) excluded via "
+                          f"a SIBLING edition's CC track (no cue of any kind within the "
+                          f"confirmed shared t<={cutoff:.0f}s window - see "
+                          f"find_sibling_edition_cc):")
+                    for h in new_sibling_excluded:
+                        print(f"    {h['time_hms']} {h['match']!r}")
+                    hallucinated = hallucinated + new_sibling_excluded
+        except Exception as exc:
+            print(f"  [warn] sibling-edition CC check failed ({exc!r})", file=sys.stderr)
+
     if hallucinated:
-        if srt_path is not None and srt_path.is_file():
-            try:
-                sub_units = flag_language.parse_srt(srt_path)
-                hallucinated = flag_language.rescue_via_subtitle(hallucinated, sub_units)
-            except Exception as exc:
-                print(f"  [warn] hallucination-rescue subtitle check failed ({exc!r}) - "
-                      f"keeping every suspected hit excluded rather than risk trusting an "
-                      f"unparsed source", file=sys.stderr)
         rescued = [h for h in hits if h.get("suspected_hallucination", {}).get("rescued_by_subtitle")]
         still_bad_ids = {id(h) for h in hallucinated}
         hits = [h for h in hits if id(h) not in still_bad_ids]
@@ -852,12 +971,14 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
                   f"timestamp, overriding the repetition/confidence suspicion:")
             for h in rescued:
                 print(f"    {h['time_hms']} {h['match']!r}")
-        if hallucinated:
-            print(f"  [note] {len(hallucinated)} hit(s) excluded as suspected transcription "
+        _cc_reasons = ("no-cc-coverage", "no-cc-coverage-via-sibling-edition")
+        repetition_based = [h for h in hallucinated if h["suspected_hallucination"]["reason"] not in _cc_reasons]
+        if repetition_based:
+            print(f"  [note] {len(repetition_based)} hit(s) excluded as suspected transcription "
                   f"hallucination(s) - a near-verbatim repeat of an earlier line, scored well "
                   f"below this file's own confidence, during a stretch with no matching real "
                   f"speech (see flag_language.detect_repeated_segments):")
-            for h in hallucinated:
+            for h in repetition_based:
                 info = h["suspected_hallucination"]
                 if info["matched_locator"] is not None:
                     reason = f"repeats {info['matched_locator']} from {info['gap_s']:.0f}s earlier"
@@ -3122,7 +3243,8 @@ def main(argv: list[str] | None = None) -> int:
             clean_srt = None
         else:
             extra_hits = load_extra_spans(args.extra_spans) if args.extra_spans else None
-            spans, all_hits = find_spans(js, cfg, matchers, raw_srt, extra_hits, vocals_hits)
+            spans, all_hits = find_spans(js, cfg, matchers, raw_srt, extra_hits, vocals_hits,
+                                         media=media, tools=tools, tmp=tmp)
             total = sum(e - s for s, e, _ in spans)
             print(f"  flagged: {len(all_hits)} hit(s) -> {len(spans)} span(s) to {cfg.method}, {total:.1f}s")
             for s, e, hs in spans:
