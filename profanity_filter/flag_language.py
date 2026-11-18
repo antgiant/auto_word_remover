@@ -387,6 +387,15 @@ _HALLUCINATION_LOGPROB_GAP = 0.35   # how much worse than the file's own median 
 #   context. 0.35 was picked to sit cleanly between the worst genuine repeat found (-0.29) and
 #   the best confirmed hallucination (-0.52) on that file - see AGENTS.md for the full
 #   before/after segment dump this was tuned against.
+_HALLUCINATION_EPISODE_MAX_GAP_S = 120.0  # max elapsed time between two ADJACENT segments (by
+#   list position) for the low-confidence-run extension below to treat them as part of the
+#   same hallucination episode - keeps a real scene change/pause from bridging two unrelated
+#   low-confidence moments into one. The confirmed 12-segment episode (Elemental (2023)
+#   {edition-Wooley Cut}, 2026-11-17) had gaps up to 87s BETWEEN its own scattered hallucinated
+#   lines (each one a short fabricated utterance dropped into an otherwise silent/musical
+#   stretch, not literally back-to-back) - an earlier 20s cap missed most of that same episode
+#   entirely. 120s gives real margin above the worst gap actually seen while still well under
+#   a genuine scene-to-scene jump.
 
 
 def _normalize_for_repeat_check(text: str) -> str:
@@ -469,7 +478,111 @@ def detect_repeated_segments(path: str | Path) -> dict[str, dict]:
             "avg_logprob": segs[i].get("avg_logprob"),
             "median_avg_logprob": median_lp,
         }
+
+    # A hallucination EPISODE often isn't just one repeated line - once the decoder is stuck,
+    # it can keep producing a whole cascade of VARIED fabricated lines, not just verbatim
+    # repeats of one phrase. Confirmed live 2026-11-17 on Elemental (2023) {edition-Wooley
+    # Cut}: a 12-segment run (5685s-6073s+) was uniformly far below the confidence threshold,
+    # but exact-repeat matching above only caught 2 of those 12 - the other 10 ("I love you,
+    # you stupid bastard.", "I'm not a bitch, stop being such a dick.", "Get your ass over
+    # here.", ...) were each the FIRST time their specific wording appeared in this file,
+    # despite scoring just as badly as their already-anchored neighbors. Extend every anchor
+    # found above through any IMMEDIATELY ADJACENT segment (by list position, not elapsed
+    # time) that's ALSO below the confidence threshold, capped at
+    # _HALLUCINATION_EPISODE_MAX_GAP_S between consecutive segments so a real scene change or
+    # pause can't bridge two unrelated low-confidence moments into one episode - confirmed this
+    # correctly stops at the boundary of a legitimate reprised song in the same file (whose
+    # segments scored -0.37 to -0.42, worse than the file's typical dialogue but still above
+    # this threshold).
+    #
+    # One segment needs protecting from this extension even though it would otherwise qualify:
+    # whichever segment a LATER one's repeated-text match points back to as the original
+    # (every suspect's own matched_locator, when set) is - by construction - the first, real
+    # occurrence of that line, not a hallucination; the fact that something later repeats it
+    # is itself evidence it was real enough to get "remembered" for the decoder to latch onto.
+    # Confirmed live on the same file: segment 983 ("Holy shit, stop being such a dick.") is
+    # what 1218/1224 both repeat - matching the SAME real argument scene confirmed by manual
+    # review in the main (non-Wooley-Cut) file - yet scored low enough, and sat close enough to
+    # an unrelated hallucinated neighbor (segment 982), that the sweep below would otherwise
+    # have swallowed it too.
+    protected_originals = {int(info["matched_locator"].split()[1]) for info in suspects.values()
+                           if info.get("matched_locator")}
+    frontier = set(suspects)
+    while frontier:
+        new_frontier = set()
+        for loc in frontier:
+            i = int(loc.split()[1])
+            t_i = segs[i].get("start")
+            for ni in (i - 1, i + 1):
+                if not (0 <= ni < len(segs)):
+                    continue
+                nloc = f"segment {ni}"
+                if nloc in suspects or ni in protected_originals:
+                    continue
+                lp_n = segs[ni].get("avg_logprob")
+                t_n = segs[ni].get("start")
+                if lp_n is None or lp_n > threshold_lp or t_i is None or t_n is None \
+                        or abs(t_n - t_i) > _HALLUCINATION_EPISODE_MAX_GAP_S:
+                    continue
+                suspects[nloc] = {
+                    "reason": "contiguous-low-confidence-run",
+                    "matched_locator": None,
+                    "gap_s": None,
+                    "avg_logprob": lp_n,
+                    "median_avg_logprob": median_lp,
+                }
+                new_frontier.add(nloc)
+        frontier = new_frontier
     return suspects
+
+
+_HALLUCINATION_RESCUE_WINDOW_S = 8.0  # how far from a suspected-hallucination hit's own
+#   timestamp to look for a confirming subtitle/CC cue - generous enough to absorb the
+#   transcript's own small timing slop (and the coarser cue-level timing a sidecar/OpenSubtitles
+#   source carries after resync) without being so wide it risks matching an unrelated,
+#   coincidental use of the same word elsewhere in a busy scene.
+
+
+def rescue_via_subtitle(hallucinated_hits: list[dict], sub_units: list[Unit]) -> list[dict]:
+    """Un-flags a suspected-hallucination hit when an INDEPENDENTLY-authored subtitle/CC cue
+    near its timestamp actually contains the matched word. A hallucination filter trades real
+    risk in both directions - the whole point is cutting false positives (muting audio that was
+    never profanity), but being too aggressive about it reintroduces false negatives (missing
+    real profanity) instead, which is just as real a failure for this tool. The embedded
+    subtitle/CC track (or a sidecar/OpenSubtitles one, already resynced to this recording's own
+    timeline by the time a caller has one to pass in - see resync_external_srt()) was never
+    generated by the same ASR decoder that's doing the hallucinating, so if IT independently
+    confirms the word was said near that moment, the word really was there regardless of how
+    suspicious the transcript's own repetition/confidence signals looked on their own -
+    overriding the filter is the more conservative choice in that specific case.
+
+    `sub_units` is whatever parse_srt() (or any other Unit-producing parser) already returned -
+    this function doesn't parse anything itself, so a caller that already has units in hand
+    (e.g. clean.py's find_spans(), which already extracts/parses a subtitle source for
+    backfill_from_srt()) doesn't pay to re-read the file.
+
+    Returns the hits that are STILL considered hallucinated after this check (i.e. the ones
+    NOT found in `sub_units` are passed through unchanged; a rescued hit is removed from the
+    returned list and the caller's own `hits` is expected to already have it available by
+    identity if it wants to report what got rescued - this function itself only filters)."""
+    still_bad = []
+    for h in hallucinated_hits:
+        t = h["time"]
+        if t is None:
+            still_bad.append(h)
+            continue
+        word = _norm_tok(h["match"].split()[-1])
+        confirmed = any(
+            u.start is not None and u.start - _HALLUCINATION_RESCUE_WINDOW_S <= t
+            <= (u.end if u.end is not None else u.start) + _HALLUCINATION_RESCUE_WINDOW_S
+            and any(_norm_tok(tok) == word for tok in u.text.split())
+            for u in sub_units
+        )
+        if confirmed:
+            h["suspected_hallucination"]["rescued_by_subtitle"] = True
+        else:
+            still_bad.append(h)
+    return still_bad
 
 
 def scan_file(path: str | Path, matchers: dict[str, re.Pattern | None],

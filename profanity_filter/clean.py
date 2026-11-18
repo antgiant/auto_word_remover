@@ -835,17 +835,37 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
 
     hallucinated = [h for h in hits if h.get("suspected_hallucination")]
     if hallucinated:
-        hits = [h for h in hits if not h.get("suspected_hallucination")]
-        print(f"  [note] {len(hallucinated)} hit(s) excluded as suspected transcription "
-              f"hallucination(s) - a near-verbatim repeat of an earlier line, scored well "
-              f"below this file's own confidence, during a stretch with no matching real "
-              f"speech (see flag_language.detect_repeated_segments):")
-        for h in hallucinated:
-            info = h["suspected_hallucination"]
-            print(f"    {h['time_hms']} {h['match']!r} - repeats "
-                  f"{info['matched_locator']} from {info['gap_s']:.0f}s earlier "
-                  f"(avg_logprob {info['avg_logprob']:.2f} vs file median "
-                  f"{info['median_avg_logprob']:.2f})")
+        if srt_path is not None and srt_path.is_file():
+            try:
+                sub_units = flag_language.parse_srt(srt_path)
+                hallucinated = flag_language.rescue_via_subtitle(hallucinated, sub_units)
+            except Exception as exc:
+                print(f"  [warn] hallucination-rescue subtitle check failed ({exc!r}) - "
+                      f"keeping every suspected hit excluded rather than risk trusting an "
+                      f"unparsed source", file=sys.stderr)
+        rescued = [h for h in hits if h.get("suspected_hallucination", {}).get("rescued_by_subtitle")]
+        still_bad_ids = {id(h) for h in hallucinated}
+        hits = [h for h in hits if id(h) not in still_bad_ids]
+        if rescued:
+            print(f"  [note] {len(rescued)} suspected-hallucination hit(s) RESCUED - an "
+                  f"independent subtitle/CC cue confirms the word was actually said near that "
+                  f"timestamp, overriding the repetition/confidence suspicion:")
+            for h in rescued:
+                print(f"    {h['time_hms']} {h['match']!r}")
+        if hallucinated:
+            print(f"  [note] {len(hallucinated)} hit(s) excluded as suspected transcription "
+                  f"hallucination(s) - a near-verbatim repeat of an earlier line, scored well "
+                  f"below this file's own confidence, during a stretch with no matching real "
+                  f"speech (see flag_language.detect_repeated_segments):")
+            for h in hallucinated:
+                info = h["suspected_hallucination"]
+                if info["matched_locator"] is not None:
+                    reason = f"repeats {info['matched_locator']} from {info['gap_s']:.0f}s earlier"
+                else:
+                    reason = "part of a contiguous low-confidence run next to a repeated line"
+                print(f"    {h['time_hms']} {h['match']!r} - {reason} "
+                      f"(avg_logprob {info['avg_logprob']:.2f} vs file median "
+                      f"{info['median_avg_logprob']:.2f})")
 
     if cfg.srt_backfill and srt_path is not None and srt_path.is_file():
         try:
