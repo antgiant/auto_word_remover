@@ -1376,6 +1376,27 @@ def stem_clip_all_channels(ffmpeg: str, stem_tool: str, clip_wav: Path, n_ch: in
     return merged
 
 
+def _decode_full_track(ffmpeg: str, media: Path, audio_pos: int, fmt_args: list[str],
+                       out_path: Path) -> Path:
+    """Decode the chosen audio track to one lossless intermediate WAV, start to finish, in a
+    single continuous pass - verified exact (two independent seek methods reproduce a long AAC
+    track byte-for-byte with zero internal drift at any point). Every extract_original()
+    bridging-segment slice (splice_stemmed_spans/splice_whole_track_stem) is taken from THIS
+    file via a second, cheap seek, rather than re-seeking the ORIGINAL COMPRESSED media fresh
+    for every gap between flagged spans - doing that (one independent decode-from-scratch per
+    gap, at arbitrary sub-second timestamps, found 2026-11-17 on two real AAC-sourced movies
+    with dozens of flagged spans each) silently lost anywhere from a few ms to several hundred
+    ms per cut, with no self-cancellation between adjacent segments since each is a brand-new
+    decode rather than a trimmed continuation of the one before it - accumulating into tens to
+    hundreds of ms of one-directional, ever-growing desync between the rebuilt "(Cleaned)" track
+    and the real original by the end of a movie. Slicing from an already-decoded PCM file is
+    exact no matter how many times it's resliced - there's no compressed-codec frame boundary
+    left to round to."""
+    run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
+         "-map", f"0:a:{audio_pos}", *fmt_args, str(out_path)])
+    return out_path
+
+
 def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, n_ch: int,
                          sample_rate: int, layout_name: str | None, stem_tool: str, cfg: Config,
                          tmp: Path, context: float = SPLICE_CONTEXT_S) -> Path:
@@ -1395,13 +1416,14 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
     seg_dir = tmp / "splice_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
     fmt_args = ["-ar", str(sample_rate), "-ac", str(n_ch)]
+    full_orig = _decode_full_track(ffmpeg, media, audio_pos, fmt_args, seg_dir / "full_orig.wav")
     segments: list[Path] = []
     cursor = 0.0
 
     def extract_original(s: float, e: float) -> Path:
         out = seg_dir / f"orig_{len(segments)}.wav"
         run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
-             "-i", str(media), "-map", f"0:a:{audio_pos}", *fmt_args, str(out)])
+             "-i", str(full_orig), *fmt_args, str(out)])
         return out
 
     for i, (s, e, hits) in enumerate(spans):
@@ -1412,7 +1434,7 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
         clip_e = min(total_dur, e + context)
         raw_clip = seg_dir / f"span{i}_raw.wav"
         run([ffmpeg, "-hide_banner", "-y", "-ss", f"{clip_s:.6f}", "-to", f"{clip_e:.6f}",
-             "-i", str(media), "-map", f"0:a:{audio_pos}", *fmt_args, str(raw_clip)])
+             "-i", str(full_orig), *fmt_args, str(raw_clip)])
 
         span_tmp = seg_dir / f"span{i}_stem"
         span_tmp.mkdir(exist_ok=True)
@@ -1465,13 +1487,14 @@ def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: i
     seg_dir = tmp / "splice_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
     fmt_args = ["-ar", str(sample_rate), "-ac", str(n_ch)]
+    full_orig = _decode_full_track(ffmpeg, media, audio_pos, fmt_args, seg_dir / "full_orig.wav")
     segments: list[Path] = []
     cursor = 0.0
 
     def extract_original(s: float, e: float) -> Path:
         out = seg_dir / f"orig_{len(segments)}.wav"
         run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
-             "-i", str(media), "-map", f"0:a:{audio_pos}", *fmt_args, str(out)])
+             "-i", str(full_orig), *fmt_args, str(out)])
         return out
 
     def extract_instrumental(s: float, e: float) -> Path:
