@@ -42,6 +42,7 @@ import bisect
 import difflib
 import json
 import re
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -364,6 +365,113 @@ def _scan_unit(unit: Unit, matchers: dict[str, re.Pattern | None], ctx: int) -> 
     return hits
 
 
+_HALLUCINATION_MIN_GAP_S = 15.0  # minimum time between two occurrences of the same line before
+#   treating the later one as a suspected repetition-loop hallucination rather than real
+#   dialogue - a quick stutter or call-and-response repeat happens within a few seconds; every
+#   confirmed hallucination found so far (Elemental (2023), 2026-11-17 - WhisperX repeating an
+#   earlier real line of dialogue verbatim 7 times during a musical/emotional climax scene with
+#   no actual speech) recurred 28-270s after the real line. Comfortably below that smallest real
+#   gap while still well clear of any quick genuine repeat.
+_HALLUCINATION_MIN_CHARS = 20   # ignore short/common lines ("No!", "I love you.") that
+#   legitimately recur throughout any film on their own - only a longer, more specific line
+#   repeating verbatim is a meaningful signal.
+_HALLUCINATION_LOGPROB_GAP = 0.35   # how much worse than the file's own median avg_logprob a
+#   repeated segment must score before it's treated as a hallucination rather than real
+#   repeated dialogue - repetition ALONE is not a safe signal on its own: validated live
+#   2026-11-17 on Elemental (2023), where plain repeated-text detection (no confidence check)
+#   flagged 25 segments, but 17 of those were GENUINE repeats with ordinary confidence
+#   (median -0.165) - a song's chorus reprised later in the film, a story narrated twice, a
+#   generic question ("What are you doing here?") asked in two different scenes. Only the 8
+#   segments that were BOTH a repeat AND scored markedly worse (-0.52 to -1.20, i.e. at least
+#   this far below the file's median) were confirmed actual hallucinations by listening to
+#   context. 0.35 was picked to sit cleanly between the worst genuine repeat found (-0.29) and
+#   the best confirmed hallucination (-0.52) on that file - see AGENTS.md for the full
+#   before/after segment dump this was tuned against.
+
+
+def _normalize_for_repeat_check(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", text.lower())).strip()
+
+
+def detect_repeated_segments(path: str | Path) -> dict[str, dict]:
+    """Flags WhisperX repetition-loop hallucinations: segments whose text is a near-verbatim
+    repeat of an EARLIER segment's text, well separated in time, AND scored notably less
+    confidently than the file's own typical segment - a known Whisper-family failure mode
+    where, during a stretch of audio with no real matching speech (silence, music, sound
+    effects), the decoder gets stuck replaying a line from its own prior context instead of
+    transcribing what's actually there. condition_on_previous_text=False and a
+    repetition_penalty are already set in voice_to_text/transcribe.py specifically to reduce
+    this, but neither eliminates it outright - confirmed live 2026-11-17 on Elemental (2023): a
+    real, contextually-coherent line ("Holy shit, stop being such a dick.") legitimately spoken
+    once during an argument scene at 4284s was then repeated near-verbatim 7 more times between
+    5761s-6052s during the film's musical/emotional climax, muting ambient score/dialogue that
+    was never profanity at all. 8 of that file's 29 total wordlist hits (28%) were this
+    artifact.
+
+    Repeated text ALONE is not a safe signal - see _HALLUCINATION_LOGPROB_GAP's docstring for
+    why a confidence check is REQUIRED, not just recorded for visibility. Confirmed the forced-
+    aligner's per-word "score" is NOT a usable substitute for that confidence check (statistically
+    indistinguishable between hallucinated and real words - see transcribe.py's own 2026-10-01
+    finding) - this uses the ASR decoder's own avg_logprob instead, captured separately for
+    exactly this reason (see transcribe.py's CONFIDENCE_KEYS).
+
+    Only meaningful for a `.json` transcript with WhisperX-style `segments` carrying
+    avg_logprob (this is the only format with both full segment text AND that field) - returns
+    {} for anything else, including a `.words.json`/flat-word file (no segment-level text to
+    compare) or a file with no avg_logprob recorded at all (an older transcript, or one from a
+    pipeline run that dropped it - see transcribe.py's own pre_align_meta fallback warning).
+
+    Returns {locator: {reason, matched_locator, gap_s, avg_logprob, median_avg_logprob}} for
+    every segment identified as a hallucination - the locator format ("segment N") matches what
+    parse_json()/scan_file() already uses, so a caller can filter scan_file()'s own hits by
+    `hit["locator"] in detect_repeated_segments(path)` with no further plumbing needed. The
+    FIRST occurrence of a repeated line is never flagged - only the later one(s), since that's
+    the real line and the later ones are the hallucinated copies."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    segs = data.get("segments") if isinstance(data, dict) else None
+    if not segs:
+        return {}
+
+    logprobs = [s.get("avg_logprob") for s in segs if s.get("avg_logprob") is not None]
+    if not logprobs:
+        return {}  # no confidence data at all - repeated text alone isn't trustworthy enough
+    median_lp = statistics.median(logprobs)
+    threshold_lp = median_lp - _HALLUCINATION_LOGPROB_GAP
+
+    normalized = [_normalize_for_repeat_check(s.get("text") or "") for s in segs]
+    first_seen: dict[str, int] = {}
+    suspects: dict[str, dict] = {}
+    for i, norm in enumerate(normalized):
+        if len(norm) < _HALLUCINATION_MIN_CHARS:
+            continue
+        start_i = segs[i].get("start")
+        if start_i is None:
+            continue
+        j = first_seen.get(norm)
+        if j is None:
+            first_seen[norm] = i
+            continue
+        start_j = segs[j].get("start")
+        if start_j is None or start_i - start_j < _HALLUCINATION_MIN_GAP_S:
+            continue  # too close together to be a repetition-loop rather than real repeated dialogue
+        lp_i = segs[i].get("avg_logprob")
+        if lp_i is None or lp_i > threshold_lp:
+            continue  # repeated, but ordinary confidence - a genuine repeat (reprised song
+            #   lyrics, a story told twice, a generic line reused in a different scene), not a
+            #   hallucination - see _HALLUCINATION_LOGPROB_GAP
+        suspects[f"segment {i}"] = {
+            "reason": "repeated-text",
+            "matched_locator": f"segment {j}",
+            "gap_s": round(start_i - start_j, 1),
+            "avg_logprob": segs[i].get("avg_logprob"),
+            "median_avg_logprob": median_lp,
+        }
+    return suspects
+
+
 def scan_file(path: str | Path, matchers: dict[str, re.Pattern | None],
               ctx: int = 48) -> tuple[list[dict], str]:
     fmt, units = parse_transcript(Path(path))
@@ -372,6 +480,12 @@ def scan_file(path: str | Path, matchers: dict[str, re.Pattern | None],
         hits.extend(_scan_unit(u, matchers, ctx))
     for h in hits:
         h["source"] = fmt
+    if fmt == "json":
+        suspects = detect_repeated_segments(path)
+        for h in hits:
+            info = suspects.get(h["locator"])
+            if info is not None:
+                h["suspected_hallucination"] = info
     hits.sort(key=lambda h: (h["time"] is None, h["time"] or 0.0, str(h["locator"])))
     return hits, fmt
 

@@ -833,6 +833,20 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
     cats = set(cfg.categories)
     hits, _fmt = flag_language.scan_file(js, matchers)
 
+    hallucinated = [h for h in hits if h.get("suspected_hallucination")]
+    if hallucinated:
+        hits = [h for h in hits if not h.get("suspected_hallucination")]
+        print(f"  [note] {len(hallucinated)} hit(s) excluded as suspected transcription "
+              f"hallucination(s) - a near-verbatim repeat of an earlier line, scored well "
+              f"below this file's own confidence, during a stretch with no matching real "
+              f"speech (see flag_language.detect_repeated_segments):")
+        for h in hallucinated:
+            info = h["suspected_hallucination"]
+            print(f"    {h['time_hms']} {h['match']!r} - repeats "
+                  f"{info['matched_locator']} from {info['gap_s']:.0f}s earlier "
+                  f"(avg_logprob {info['avg_logprob']:.2f} vs file median "
+                  f"{info['median_avg_logprob']:.2f})")
+
     if cfg.srt_backfill and srt_path is not None and srt_path.is_file():
         try:
             words = flag_language.load_word_timeline(js)
