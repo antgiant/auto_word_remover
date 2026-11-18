@@ -538,6 +538,90 @@ def detect_repeated_segments(path: str | Path) -> dict[str, dict]:
     return suspects
 
 
+_KNOWN_HALLUCINATION_PHRASES = (
+    # Confirmed recurring VERBATIM-OR-NEAR-VERBATIM across wildly unrelated films - a dead
+    # giveaway of a stable decoder bias (something in this specific WhisperX model's training
+    # data it reaches for during ambiguous/low-signal audio), not real dialogue from any one
+    # film. Matched as case-insensitive SUBSTRINGS of the normalized segment text, not exact
+    # lines, since the model varies the exact wording around a stable "favorite" core phrase.
+    #
+    # Deliberately narrower than first attempted: "what the hell is wrong with you" and "what
+    # the hell is that" were ALSO tried and had to be dropped - a full-library sweep
+    # (2026-11-18) found them matching ordinary, plausibly-real dialogue in films like The
+    # Truth About Charlie (2002), City of Ember (2008), and Babe: Pig in the City (1998) - both
+    # are just common enough reactive lines that real characters legitimately say them too
+    # often to trust alone, even confidence-gated. The phrases kept below are different in
+    # kind: compound, unusual insult pairings distinctive enough that their cross-film spread
+    # is implausible as real dialogue - confirmed appearing (all confidence-gated, i.e. each
+    # one ALSO scored notably below its own file's median) in The Wizard of Oz (1939), The
+    # General (1926, a Buster Keaton SILENT film - no spoken dialogue track exists for it to
+    # transcribe at all), Animal Crackers (1930), Horse Feathers (1932), The Jungle Book
+    # (1942), Ben-Hur (1959), Charlotte's Web (1973), Chitty Chitty Bang Bang (1968), Big Hero
+    # 6 (2014), multiple Christian documentaries (Revelation, God of Wonders, Noah, Samson),
+    # and Elemental (2023)/Aladdin (1992) {edition-No Jafar Cut}, where this was first
+    # confirmed - no genre, era, or content rating in common, which real dialogue would need.
+    "stupid bastard",
+    "stop being such a dick",
+    "holy shit, stop being",
+    "get your ass over here",
+    "not a bitch",
+)
+
+
+def detect_known_hallucination_phrases(path: str | Path) -> dict[str, dict]:
+    """Flags a segment as a suspected hallucination when its text contains one of
+    _KNOWN_HALLUCINATION_PHRASES AND it scores notably below this file's own median
+    avg_logprob (the same _HALLUCINATION_LOGPROB_GAP threshold detect_repeated_segments uses) -
+    independent of repetition entirely, unlike every other check in this module. This is the
+    ONLY check here that needs no subtitle/CC and no earlier repeat within the SAME file to
+    work from, which makes it the one signal that still helps a file with no safety net at all
+    (no usable CC on the file itself or any sibling edition - see Aladdin (1992) {edition-No
+    Jafar Cut}, which has neither, confirmed live 2026-11-18: 8 of its hits that the
+    repetition-based detector left untouched - lone, non-repeated lines like "Holy shit, stop
+    being such a dick.", "...you stupid bastard?", "Get your ass over here right now." - are
+    now caught by phrase match alone).
+
+    Deliberately requires the confidence gate on top of the phrase match: a real film COULD
+    legitimately contain one of these common insults in a real, well-transcribed scene, and
+    the phrase match alone isn't enough to rule that out - only phrase match AND notably-worse-
+    than-this-file's-own-typical confidence together should be trusted. If this list ever
+    produces a confirmed false positive, that's real evidence a specific phrase here is more
+    common in genuine dialogue than assumed and should be removed, not tightened further - it
+    is NOT a substitute for the confidence gate.
+
+    Returns {locator: {reason, matched_locator, gap_s, avg_logprob, median_avg_logprob}} in the
+    same shape every other check in this module returns, for the same reason: so scan_file()'s
+    own hits can filter by `hit["locator"] in detect_known_hallucination_phrases(path)` with no
+    extra plumbing."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    segs = data.get("segments") if isinstance(data, dict) else None
+    if not segs:
+        return {}
+    logprobs = [s.get("avg_logprob") for s in segs if s.get("avg_logprob") is not None]
+    if not logprobs:
+        return {}
+    median_lp = statistics.median(logprobs)
+    threshold_lp = median_lp - _HALLUCINATION_LOGPROB_GAP
+    suspects: dict[str, dict] = {}
+    for i, s in enumerate(segs):
+        lp = s.get("avg_logprob")
+        if lp is None or lp > threshold_lp:
+            continue
+        text_norm = (s.get("text") or "").lower()
+        if any(phrase in text_norm for phrase in _KNOWN_HALLUCINATION_PHRASES):
+            suspects[f"segment {i}"] = {
+                "reason": "known-hallucination-phrase",
+                "matched_locator": None,
+                "gap_s": None,
+                "avg_logprob": lp,
+                "median_avg_logprob": median_lp,
+            }
+    return suspects
+
+
 _HALLUCINATION_RESCUE_WINDOW_S = 8.0  # how far from a suspected-hallucination hit's own
 #   timestamp to look for a confirming subtitle/CC cue - generous enough to absorb the
 #   transcript's own small timing slop (and the coarser cue-level timing a sidecar/OpenSubtitles
@@ -587,7 +671,12 @@ def rescue_via_subtitle(hallucinated_hits: list[dict], sub_units: list[Unit]) ->
     return still_bad
 
 
-_CC_SFX_CUE_RE = re.compile(r"^\([^)]*\)$")
+_CC_SFX_CUE_RE = re.compile(r"^(\([^)]*\)|\[[^\]]*\])$")   # SDH sound-effect cues use either
+#   bracket style depending on the source - "(WAVES LAPPING)" (Elemental (2023)'s embedded
+#   SRT) vs. "[LIGHT SWITCH CLICKS]" (Home Alone (1990)'s) - confirmed 2026-11-18 the square-
+#   bracket style is just as real an SDH track (3.5% of Home Alone's 1752 cues, well above
+#   _CC_MIN_SFX_FRACTION) and was being wrongly classified as dialogue-only by only matching
+#   parens, which would have silently refused a perfectly good absence-of-coverage signal.
 _CC_MIN_CUES = 50   # minimum total cues before trusting a "full CC" classification below - a
 #   tiny forced/partial subtitle track could spuriously look SFX-heavy by fraction alone from
 #   just a handful of cues.
@@ -812,6 +901,13 @@ def scan_file(path: str | Path, matchers: dict[str, re.Pattern | None],
         suspects = detect_repeated_segments(path)
         for h in hits:
             info = suspects.get(h["locator"])
+            if info is not None:
+                h["suspected_hallucination"] = info
+        phrase_suspects = detect_known_hallucination_phrases(path)
+        for h in hits:
+            if h.get("suspected_hallucination"):
+                continue
+            info = phrase_suspects.get(h["locator"])
             if info is not None:
                 h["suspected_hallucination"] = info
     hits.sort(key=lambda h: (h["time"] is None, h["time"] or 0.0, str(h["locator"])))

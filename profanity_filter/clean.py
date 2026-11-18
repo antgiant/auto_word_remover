@@ -1008,7 +1008,9 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
                 print(f"    {h['time_hms']} {h['match']!r}")
         _cc_reasons = ("no-cc-coverage", "no-cc-coverage-via-sibling-edition",
                       "no-cc-word-match", "no-cc-word-match-via-sibling-edition")
-        repetition_based = [h for h in hallucinated if h["suspected_hallucination"]["reason"] not in _cc_reasons]
+        repetition_based = [h for h in hallucinated
+                            if h["suspected_hallucination"]["reason"] not in _cc_reasons
+                            and h["suspected_hallucination"]["reason"] != "known-hallucination-phrase"]
         if repetition_based:
             print(f"  [note] {len(repetition_based)} hit(s) excluded as suspected transcription "
                   f"hallucination(s) - a near-verbatim repeat of an earlier line, scored well "
@@ -1021,6 +1023,19 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
                 else:
                     reason = "part of a contiguous low-confidence run next to a repeated line"
                 print(f"    {h['time_hms']} {h['match']!r} - {reason} "
+                      f"(avg_logprob {info['avg_logprob']:.2f} vs file median "
+                      f"{info['median_avg_logprob']:.2f})")
+
+        phrase_based = [h for h in hallucinated
+                       if h["suspected_hallucination"]["reason"] == "known-hallucination-phrase"]
+        if phrase_based:
+            print(f"  [note] {len(phrase_based)} hit(s) excluded - text matches a known "
+                  f"decoder-hallucination phrase confirmed recurring across multiple unrelated "
+                  f"films (see flag_language._KNOWN_HALLUCINATION_PHRASES), scored well below "
+                  f"this file's own confidence:")
+            for h in phrase_based:
+                info = h["suspected_hallucination"]
+                print(f"    {h['time_hms']} {h['match']!r} "
                       f"(avg_logprob {info['avg_logprob']:.2f} vs file median "
                       f"{info['median_avg_logprob']:.2f})")
 
