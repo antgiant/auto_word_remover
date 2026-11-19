@@ -2141,7 +2141,7 @@ def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: i
     if whole_inst is None:
         print(f"  stemming the whole track once (~{total_dur / 60:.0f} min, {n_ch}ch)...")
         whole_inst = build_instrumental_stem(ffmpeg, stem_tool, media, audio_pos, n_ch, sample_rate,
-                                             tmp, cfg, layout_name)
+                                             tmp, cfg, layout_name, ckpt_dir=ckpt_dir)
 
     seg_dir = ckpt_dir if ckpt_dir is not None else tmp / "splice_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
@@ -2387,7 +2387,7 @@ def _stereo_instrumental_to_mono(ffmpeg: str, stereo_wav: Path, out_wav: Path) -
 
 def build_instrumental_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos: int, n_ch: int,
                             sample_rate: int, tmp: Path, cfg: Config,
-                            layout_name: str | None) -> Path:
+                            layout_name: str | None, ckpt_dir: Path | None = None) -> Path:
     """A wav with the SAME channel count as the source audio track, holding
     only its non-dialogue content ("everything else" - music/effects/room
     tone) with the dialogue stemmed out.
@@ -2400,41 +2400,69 @@ def build_instrumental_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos:
     faked up to stereo, stemmed, and folded back to mono ON ITS OWN - then all
     of them are rejoined into one file with the original layout. Slower (one
     separator pass per channel) but it's the only way to keep the channel
-    count the caller asked for."""
+    count the caller asked for.
+
+    `ckpt_dir`, when given (splice_whole_track_stem's own ckpt_dir - the same
+    one splice_stemmed_spans checkpoints into, see _mute_checkpoint_dir),
+    makes each channel's separator pass individually resumable: this is the
+    single most expensive GPU step on the whole-track path (one full-length
+    separator invocation per channel, picked by _predict_stem_seconds()
+    specifically because per-channel beats per-span on a heavily-flagged
+    file) - losing it whole to a kill was the main gap left after the
+    per-span checkpoint work (2026-11-19)."""
+    work_dir = ckpt_dir if ckpt_dir is not None else tmp
     if n_ch <= 2:
-        src_wav = tmp / "stem_src.wav"
+        final = work_dir / "instrumental.wav"
+        if final.is_file() and final.stat().st_size > 0:
+            return final
+        src_wav = work_dir / "stem_src.wav"
         run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
              "-map", f"0:a:{audio_pos}", str(src_wav)])
         if n_ch == 1:
-            fake = tmp / "stem_src_stereo.wav"
+            fake = work_dir / "stem_src_stereo.wav"
             _mono_to_fake_stereo(ffmpeg, src_wav, fake)
-            inst = _run_separator(stem_tool, fake, tmp / "stem_out", cfg)
-            mono_out = tmp / "instrumental.wav"
-            _stereo_instrumental_to_mono(ffmpeg, inst, mono_out)
-            return mono_out
-        return _run_separator(stem_tool, src_wav, tmp / "stem_out", cfg)
+            inst = _run_separator(stem_tool, fake, work_dir / "stem_out", cfg)
+            part = final.with_name(final.name + ".part")
+            _stereo_instrumental_to_mono(ffmpeg, inst, part)
+            os.replace(part, final)
+            return final
+        inst = _run_separator(stem_tool, src_wav, work_dir / "stem_out", cfg)
+        os.replace(inst, final)
+        return final
 
-    ch_dir = tmp / "stem_channels"
+    ch_dir = work_dir / "stem_channels"
     ch_dir.mkdir(exist_ok=True)
     inst_paths = []
+    resumed_channels = 0
     for i in range(n_ch):
+        mono_inst = ch_dir / f"ch{i}_inst.wav"
+        if mono_inst.is_file() and mono_inst.stat().st_size > 0:
+            inst_paths.append(mono_inst)
+            resumed_channels += 1
+            continue
         mono = ch_dir / f"ch{i}.wav"
         run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
              "-map", f"0:a:{audio_pos}", "-af", f"pan=mono|c0=c{i}", str(mono)])
         fake = ch_dir / f"ch{i}_stereo.wav"
         _mono_to_fake_stereo(ffmpeg, mono, fake)
         inst = _run_separator(stem_tool, fake, ch_dir / f"out{i}", cfg)
-        mono_inst = ch_dir / f"ch{i}_inst.wav"
-        _stereo_instrumental_to_mono(ffmpeg, inst, mono_inst)
+        part = mono_inst.with_name(mono_inst.name + ".part")
+        _stereo_instrumental_to_mono(ffmpeg, inst, part)
+        os.replace(part, mono_inst)
         inst_paths.append(mono_inst)
 
+    if ckpt_dir is not None and resumed_channels:
+        print(f"  resume: reused {resumed_channels}/{n_ch} already-stemmed channel(s) from a "
+              f"previous interrupted attempt ({ch_dir.name})")
+
     layout = layout_name if layout_name in CHANNEL_LAYOUTS else f"{n_ch}c"
-    merged = tmp / "instrumental.wav"
-    inputs = [a for p in inst_paths for a in ("-i", str(p))]
-    pads = "".join(f"[{i}:a]" for i in range(n_ch))
-    graph = f"{pads}join=inputs={n_ch}:channel_layout={layout}[out]"
-    run([ffmpeg, "-hide_banner", "-y", *inputs,
-         "-filter_complex", graph, "-map", "[out]", "-ar", str(sample_rate), str(merged)])
+    merged = work_dir / "instrumental.wav"
+    if not (merged.is_file() and merged.stat().st_size > 0):
+        inputs = [a for p in inst_paths for a in ("-i", str(p))]
+        pads = "".join(f"[{i}:a]" for i in range(n_ch))
+        graph = f"{pads}join=inputs={n_ch}:channel_layout={layout}[out]"
+        run([ffmpeg, "-hide_banner", "-y", *inputs,
+             "-filter_complex", graph, "-map", "[out]", "-ar", str(sample_rate), str(merged)])
     return merged
 
 

@@ -1284,19 +1284,33 @@ now checkpoints, since it's both the default and the GPU-bound one:
   (`resume: reused N/M already-stemmed span(s)...`). An abandoned checkpoint
   that nothing ever retries ages out via `_sweep_stale_temp_dirs()` exactly
   like any other orphaned `pf_*` dir (same glob, same age threshold).
-- **Scoped deliberately narrow** (2026-11-19): only the per-span stemming
-  loop is checkpointed. `build_instrumental_stem()`'s one-time whole-track
-  stem (the expensive step on the *whole-track* path, picked by
-  `_predict_stem_seconds()` on heavily-flagged files) is NOT checkpointed -
-  a kill mid-whole-track-stem still restarts that stem from zero. Likewise
-  every stage before `mute_track()` (subtitle extraction, transcript
-  correlation, hallucination exclusion) and everything after it (subtitle
-  mux, final remux) is unchanged - cheap/fast relative to stemming, and
-  Whisper transcription itself is already effectively checkpointed via its
-  own on-disk `.json` cache, reused across runs regardless of this feature.
-  `--method replace` isn't covered either, even though it reuses
-  `stem_clip_all_channels()` - its own per-occurrence TTS/voice-conversion
-  loop would need the same treatment separately if it turns out to need it.
+- `build_instrumental_stem()`'s whole-track stem - the *other* GPU-bound
+  unit of work on the whole-track path, and often the single most expensive
+  step in the whole file when `_predict_stem_seconds()` picks it over
+  per-span on a heavily-flagged file - is checkpointed too (added
+  2026-11-19, same day as the per-span work above, once it became clear
+  losing a whole-track stem to a kill was the bigger remaining gap). It
+  shares the SAME `ckpt_dir` as `splice_whole_track_stem`'s own
+  `orig_*.wav`/`inst_*.wav` files (no name collisions - `instrumental.wav`,
+  `stem_channels/`, `stem_src.wav` vs. `orig_{n}.wav`/`inst_{n}.wav`), so one
+  checkpoint dir covers all of a `mute_track()` run's GPU-bound work. A >2ch
+  track stems one separator pass per channel (`ch{i}_inst.wav`, final name
+  via the same `.part`-then-`os.replace` pattern); a <=2ch track is one pass
+  checkpointed as a single `instrumental.wav`. Losing at most one channel's
+  redo on a kill (rather than every channel on a 5.1/7.1 track) is the win
+  here, same shape as the per-span savings above. `cached_whole_instrumental`
+  (the Config.stem_retranscribe reuse path) bypasses this entirely, same as
+  before - that stem was never at risk since it's already a completed result
+  by the time `splice_whole_track_stem` sees it.
+- **Still not covered**: every stage before `mute_track()` (subtitle
+  extraction, transcript correlation, hallucination exclusion) and
+  everything after it (subtitle mux, final remux) - cheap/fast relative to
+  stemming, and Whisper transcription itself is already effectively
+  checkpointed via its own on-disk `.json` cache, reused across runs
+  regardless of this feature. `--method replace` isn't covered either, even
+  though it reuses `stem_clip_all_channels()` - its own per-occurrence
+  TTS/voice-conversion loop would need the same treatment separately if it
+  turns out to need it.
 
 ### Word replacement (`--method replace`, local TTS + voice conversion)
 
