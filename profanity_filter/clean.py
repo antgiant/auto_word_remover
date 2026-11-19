@@ -207,7 +207,20 @@ STEM_RATE = 0.10
 # this model is free to stay what it was always meant to be: a pure
 # compute-time prediction, uncontaminated by guesses about what else
 # happens to be sharing the GPU at the time.
-SPLICE_CONTEXT_S = 2.0  # padding added on each side of a span before stemming - see splice_stemmed_spans
+SPLICE_CONTEXT_S = 3.0  # real audio padding added on each side of a span before stemming - see
+#   splice_stemmed_spans. Raised from 2.0 (2026-11-19) when splice_stemmed_spans switched from one
+#   separator invocation per span to concatenating every pending span's padded clip into ONE file
+#   and stemming it once (see that function's docstring): the padding now does double duty as the
+#   buffer between adjacent clips in the concatenated file, not just extra material for the
+#   separator to work with. Sized to exceed roughly half the default MDX-Net overlap-blend zone
+#   (hop_length=1024, segment_size=256, overlap=0.25 -> ~5.9s analysis chunks, ~1.5s overlap
+#   region between consecutive chunks at 44.1kHz) on EACH side of a splice point, so that blend
+#   zone - wherever it happens to land relative to the splice - stays inside the discarded padding
+#   instead of bleeding into the kept span. Deliberately real audio from the span's own
+#   neighborhood, not synthetic silence or noise: a hard drop to a synthetic signal is a shape
+#   real film audio never produces and the model has no clean prior for, which risks relocating a
+#   boundary artifact rather than removing it, whereas two real (if unrelated) clips glued
+#   together are still in-distribution for a model trained on real audio.
 
 CODEC_EXT = {"flac": ".mka", "ac3": ".ac3", "eac3": ".eac3", "aac": ".m4a"}
 
@@ -2028,8 +2041,10 @@ def stem_clip_all_channels(ffmpeg: str, stem_tool: str, clip_wav: Path, n_ch: in
                            sample_rate: int, tmp: Path, cfg: Config,
                            layout_name: str | None) -> Path:
     """Same idea as build_instrumental_stem, but for an already-extracted
-    short clip file instead of the whole media file - see
-    splice_stemmed_spans, which is what actually calls this."""
+    clip file instead of the whole media file - see splice_stemmed_spans,
+    which is what actually calls this (as of 2026-11-19, on ONE concatenated
+    file covering every pending span's padded clip at once, not a short
+    single-span clip - nothing here assumes a particular duration)."""
     if n_ch <= 2:
         if n_ch == 1:
             fake = tmp / "clip_stereo.wav"
@@ -2069,8 +2084,15 @@ def _run_to_final(cmd: list[str], final_path: Path) -> Path:
     sibling first and only rename into place once the process exits 0. Used for every
     checkpointed artifact under a mute_track() ckpt_dir (see _mute_checkpoint_dir) so a killed
     or crashed run never leaves a half-written file at the final name for the next resume
-    attempt to mistake as complete - existence of the final-named file is the resume check."""
-    part = final_path.with_name(final_path.name + ".part")
+    attempt to mistake as complete - existence of the final-named file is the resume check.
+
+    The `.part` marker goes BEFORE the real suffix (foo.part.wav, never foo.wav.part) -
+    ffmpeg picks its output muxer from the trailing extension with no `-f` given, so a
+    `.wav.part` name makes it fail outright ("Unable to choose an output format"). Caught
+    2026-11-19 validating the concat-stem rework against real Apollo 13 (1995) data - this path
+    had never actually been exercised by a completed production run yet (the one real run since
+    it was added used an older in-memory copy of this file, predating it)."""
+    part = final_path.with_name(final_path.stem + ".part" + final_path.suffix)
     cmd = [*cmd[:-1], str(part)]
     run(cmd)
     os.replace(part, final_path)
@@ -2144,7 +2166,29 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
     expression limit and codec artifacts as the cause). The identical filter
     on a pre-seeked short clip is exact, so every extraction here is done
     that way - short, independently seeked, never touching the whole-file
-    timeline in one filter pass."""
+    timeline in one filter pass.
+
+    Every pending (not-yet-checkpointed) span's padded clip gets concatenated into ONE file and
+    stemmed with a SINGLE separator invocation per channel, instead of one invocation per span -
+    added 2026-11-19 after the per-span version's real cost (39 spans x 6 channels on Apollo 13
+    (1995), ~2h18m end to end) turned out to be dominated by paying the separator's fixed
+    per-invocation startup cost (STEM_STARTUP_S) hundreds of times over. Concatenating pays that
+    cost once per channel while still only processing the flagged spans' own (padded) duration,
+    not the whole film - strictly cheaper than the old per-span loop for any span count above 1,
+    and cheaper than whole-track stemming unless flagged content covers nearly the entire file;
+    see _predict_stem_seconds. `context` (SPLICE_CONTEXT_S) now does double duty as the buffer
+    between adjacent clips in the concatenated file - see that constant's own comment for why
+    it's real neighboring audio, not synthetic silence or noise, and how it's sized against the
+    separator's actual analysis-chunk geometry.
+
+    Checkpointing (ckpt_dir) is coarser than before as a result: a kill mid-stem now loses
+    progress on every STILL-PENDING span at once (they're one inference call now, not many), not
+    just the one span that happened to be running - a real tradeoff for a much shorter window to
+    be killed during in the first place. The already-finished concatenated stem result itself
+    (concat_instrumental.wav) is still checkpointed, guarded by a manifest of exactly which span
+    indices it was built from (concat_manifest.json) - a resume whose pending set has shifted
+    since (some spans finished splitting out before the kill) rebuilds from scratch rather than
+    risk misaligned offsets into a concat file that doesn't match the current pending list."""
     total_dur = probe_duration(ffprobe, media)
     seg_dir = ckpt_dir if ckpt_dir is not None else tmp / "splice_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
@@ -2160,43 +2204,75 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
                           "-i", str(full_orig), *fmt_args, str(out)], out)
         return out
 
-    resumed_spans = 0
+    # Pass 1: which spans still need stemming (checkpoint resume - a span whose trimmed.wav
+    # already exists is done, skip it entirely), and extract each one's padded (span +/- context)
+    # clip from the pristine full_orig decode.
+    pending: list[tuple[int, float, float, float, Path]] = []  # (i, s, e, clip_s, raw_clip)
     for i, (s, e, hits) in enumerate(spans):
-        if s > cursor:
-            segments.append(extract_original(cursor, s))
-
-        # a prior interrupted attempt already finished this exact span (ckpt_dir's name is a
-        # hash of the whole spans list + settings, so an existing trimmed.wav here can only be
-        # from a matching previous run of this same work) - reuse it, skip straight to the next.
         trimmed = seg_dir / f"span{i}_trimmed.wav"
         if trimmed.is_file() and trimmed.stat().st_size > 0:
-            segments.append(trimmed)
-            cursor = e
-            resumed_spans += 1
             continue
-
         clip_s = max(0.0, s - context)
         clip_e = min(total_dur, e + context)
         raw_clip = seg_dir / f"span{i}_raw.wav"
         if not (raw_clip.is_file() and raw_clip.stat().st_size > 0):
             _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{clip_s:.6f}", "-to", f"{clip_e:.6f}",
                           "-i", str(full_orig), *fmt_args, str(raw_clip)], raw_clip)
+        pending.append((i, s, e, clip_s, raw_clip))
 
-        span_tmp = seg_dir / f"span{i}_stem"
-        span_tmp.mkdir(exist_ok=True)
-        inst_clip = stem_clip_all_channels(ffmpeg, stem_tool, raw_clip, n_ch, sample_rate,
-                                           span_tmp, cfg, layout_name)
+    if ckpt_dir is not None and len(pending) < len(spans):
+        print(f"  resume: reused {len(spans) - len(pending)}/{len(spans)} already-stemmed "
+              f"span(s) from a previous interrupted attempt ({seg_dir.name})")
 
-        # the extra `context` was only so the stemmer had enough material to
-        # work with - trim back down to exactly the flagged span before splicing
-        _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{s - clip_s:.6f}", "-to", f"{e - clip_s:.6f}",
-                      "-i", str(inst_clip), *fmt_args, str(trimmed)], trimmed)
-        segments.append(trimmed)
+    # Pass 2: stem every pending span in ONE pass - concatenate their padded clips back to back
+    # (no gap/buffer file needed; `context` padding on each clip already serves that role) and
+    # run the separator once per channel over the whole concatenated file.
+    if pending:
+        concat_dir = seg_dir / "concat_stem"
+        concat_dir.mkdir(exist_ok=True)
+        pending_indices = [i for i, s, e, clip_s, raw_clip in pending]
+        manifest_path = seg_dir / "concat_manifest.json"
+        concat_inst = seg_dir / "concat_instrumental.wav"
+        cached_manifest = (json.loads(manifest_path.read_text(encoding="utf-8"))
+                           if manifest_path.is_file() else None)
+        have_cached_inst = (concat_inst.is_file() and concat_inst.stat().st_size > 0
+                           and cached_manifest == pending_indices)
+        if not have_cached_inst:
+            list_file = concat_dir / "concat_list.txt"
+            list_file.write_text(
+                "\n".join(f"file '{raw_clip.resolve().as_posix()}'"
+                         for i, s, e, clip_s, raw_clip in pending), encoding="utf-8")
+            concat_raw = concat_dir / "concat_raw.wav"
+            run([ffmpeg, "-hide_banner", "-y", "-f", "concat", "-safe", "0",
+                 "-i", str(list_file), *fmt_args, str(concat_raw)])
+            inst = stem_clip_all_channels(ffmpeg, stem_tool, concat_raw, n_ch, sample_rate,
+                                          concat_dir, cfg, layout_name)
+            # inst is already a complete file (stem_clip_all_channels only returns after every
+            # ffmpeg/separator step inside it has finished) - a plain same-filesystem rename is
+            # enough, same as build_instrumental_stem's identical adopt-the-result-as-checkpoint
+            # step.
+            os.replace(inst, concat_inst)
+            manifest_path.write_text(json.dumps(pending_indices), encoding="utf-8")
+
+        # offsets within the concatenated file are deterministic from each clip's own duration -
+        # safe to (re)compute fresh every time, whether or not concat_inst was just rebuilt
+        cursor_t = 0.0
+        for i, s, e, clip_s, raw_clip in pending:
+            dur = probe_duration(ffprobe, raw_clip)
+            trimmed = seg_dir / f"span{i}_trimmed.wav"
+            if not (trimmed.is_file() and trimmed.stat().st_size > 0):
+                abs_s = cursor_t + (s - clip_s)
+                abs_e = cursor_t + (e - clip_s)
+                _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{abs_s:.6f}",
+                              "-to", f"{abs_e:.6f}", "-i", str(concat_inst), *fmt_args,
+                              str(trimmed)], trimmed)
+            cursor_t += dur
+
+    for i, (s, e, hits) in enumerate(spans):
+        if s > cursor:
+            segments.append(extract_original(cursor, s))
+        segments.append(seg_dir / f"span{i}_trimmed.wav")
         cursor = e
-
-    if ckpt_dir is not None and resumed_spans:
-        print(f"  resume: reused {resumed_spans}/{len(spans)} already-stemmed span(s) from a "
-              f"previous interrupted attempt ({seg_dir.name})")
 
     if cursor < total_dur:
         segments.append(extract_original(cursor, total_dur))
@@ -2274,19 +2350,21 @@ def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: i
 
 
 def _predict_stem_seconds(n_ch: int, spans, total_dur: float) -> tuple[float, float]:
-    """Predict total separator wall-clock time for the per-span approach
-    (splice_stemmed_spans: n_ch invocations per span, one per padded clip)
-    vs. the whole-track approach (splice_whole_track_stem: n_ch invocations
-    total, one per channel, covering the whole file) using the
-    STEM_STARTUP_S/STEM_RATE cost model. mute_track() picks whichever comes
-    out lower - see that model's derivation above."""
-    per_span = 0.0
-    for s, e, _ in spans:
-        clip_s = max(0.0, s - SPLICE_CONTEXT_S)
-        clip_e = min(total_dur, e + SPLICE_CONTEXT_S)
-        per_span += n_ch * (STEM_STARTUP_S + STEM_RATE * (clip_e - clip_s))
+    """Predict total separator wall-clock time for the concatenated-spans approach
+    (splice_stemmed_spans: n_ch invocations TOTAL, one per channel, over every pending span's
+    padded clip concatenated into one file) vs. the whole-track approach
+    (splice_whole_track_stem: also n_ch invocations total, but covering the whole file) using the
+    STEM_STARTUP_S/STEM_RATE cost model. mute_track() picks whichever comes out lower - see that
+    model's derivation above. Both options now pay the fixed per-invocation startup cost exactly
+    once per channel - the old per-span version of this model (one invocation per span per
+    channel) was replaced 2026-11-19 once splice_stemmed_spans stopped doing that; concatenating
+    is strictly cheaper than the old per-span loop ever was for any span count above 1, so this
+    model's only real remaining choice is concat vs. whole-track, by total duration processed."""
+    concat_span_dur = sum(min(total_dur, e + SPLICE_CONTEXT_S) - max(0.0, s - SPLICE_CONTEXT_S)
+                          for s, e, _ in spans)
+    concat_s = n_ch * (STEM_STARTUP_S + STEM_RATE * concat_span_dur)
     whole_track = n_ch * (STEM_STARTUP_S + STEM_RATE * total_dur)
-    return per_span, whole_track
+    return concat_s, whole_track
 
 
 def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cfg: Config,
@@ -2336,20 +2414,20 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
                 names = CHANNEL_LAYOUTS.get(raw)
                 layout_name = raw if names and len(names) == n_ch else None
             total_dur = probe_duration(ffprobe, media)
-            per_span_s, whole_track_s = _predict_stem_seconds(n_ch, spans, total_dur)
-            if whole_track_s < per_span_s:
+            concat_s, whole_track_s = _predict_stem_seconds(n_ch, spans, total_dur)
+            if whole_track_s < concat_s:
                 print(f"  fill: predicted {whole_track_s / 60:.1f} min whole-track vs "
-                      f"{per_span_s / 60:.1f} min per-span ({len(spans)} span(s)) - stemming the "
-                      f"whole track once (mute_fill=stems, model={cfg.stem_model})")
+                      f"{concat_s / 60:.1f} min concatenated-spans ({len(spans)} span(s)) - "
+                      f"stemming the whole track once (mute_fill=stems, model={cfg.stem_model})")
                 spliced = splice_whole_track_stem(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
                                                   layout_name, stem_tool, cfg, tmp,
                                                   ckpt_dir=ckpt_dir)
             else:
-                print(f"  fill: predicted {per_span_s / 60:.1f} min per-span vs "
-                      f"{whole_track_s / 60:.1f} min whole-track - stemming vocals out of every "
-                      f"channel for just the {len(spans)} flagged span(s) (mute_fill=stems, "
-                      f"model={cfg.stem_model}) - ambient noise/music keeps playing throughout, "
-                      f"nothing is ever fully silenced")
+                print(f"  fill: predicted {concat_s / 60:.1f} min concatenated-spans vs "
+                      f"{whole_track_s / 60:.1f} min whole-track - concatenating the "
+                      f"{len(spans)} flagged span(s) into one clip and stemming every channel "
+                      f"once (mute_fill=stems, model={cfg.stem_model}) - ambient noise/music "
+                      f"keeps playing throughout, nothing is ever fully silenced")
                 spliced = splice_stemmed_spans(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
                                                layout_name, stem_tool, cfg, tmp,
                                                ckpt_dir=ckpt_dir)
@@ -2513,7 +2591,10 @@ def build_instrumental_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos:
             fake = work_dir / "stem_src_stereo.wav"
             _mono_to_fake_stereo(ffmpeg, src_wav, fake)
             inst = _run_separator(stem_tool, fake, work_dir / "stem_out", cfg)
-            part = final.with_name(final.name + ".part")
+            # .part goes before the suffix (foo.part.wav) - ffmpeg infers its output muxer from
+            # the trailing extension with no -f given, so foo.wav.part fails outright. See
+            # _run_to_final's docstring for the same fix/story, found the same day.
+            part = final.with_name(final.stem + ".part" + final.suffix)
             _stereo_instrumental_to_mono(ffmpeg, inst, part)
             os.replace(part, final)
             return final
@@ -2537,7 +2618,7 @@ def build_instrumental_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos:
         fake = ch_dir / f"ch{i}_stereo.wav"
         _mono_to_fake_stereo(ffmpeg, mono, fake)
         inst = _run_separator(stem_tool, fake, ch_dir / f"out{i}", cfg)
-        part = mono_inst.with_name(mono_inst.name + ".part")
+        part = mono_inst.with_name(mono_inst.stem + ".part" + mono_inst.suffix)
         _stereo_instrumental_to_mono(ffmpeg, inst, part)
         os.replace(part, mono_inst)
         inst_paths.append(mono_inst)

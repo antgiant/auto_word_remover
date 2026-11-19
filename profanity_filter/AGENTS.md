@@ -1351,28 +1351,133 @@ whole mix dropping out.
 Two paths, picked by `_predict_stem_seconds()` - a calibrated time-cost model,
 not a word-count guess:
 
-- **Per-span** (`splice_stemmed_spans`): each flagged span (plus
-  `SPLICE_CONTEXT_S` of context for the separator to work with) is extracted,
-  stemmed, trimmed back to the exact span, and spliced into the
-  otherwise-untouched original via ffmpeg's concat demuxer. Cheap for a
-  handful of spans; the separator's model-load overhead is paid once per
-  span per channel.
+- **Concatenated spans** (`splice_stemmed_spans`): every flagged span (plus
+  `SPLICE_CONTEXT_S` of real neighboring audio on each side) is extracted,
+  then ALL of them are concatenated into ONE file and stemmed with a single
+  separator invocation per channel - not one invocation per span. Each
+  span's piece is then sliced back out of the stemmed result (by the offset
+  its own clip landed at in the concatenation) and trimmed down to the exact
+  flagged span, same as before. Was genuinely "one invocation per span"
+  until 2026-11-19 - see "Concatenated-spans stemming" below for why and how
+  that changed.
 - **Whole-track** (`splice_whole_track_stem`): the entire track is stemmed
   once (`build_instrumental_stem` - one fixed cost regardless of span count),
   then the flagged spans are sliced out of that and spliced against the
-  original the same way. Cheaper once per-span overhead adds up on a
-  heavily-flagged file.
+  original the same way. Cheaper than concatenated-spans once flagged
+  content approaches the length of the whole file.
 
 `_predict_stem_seconds()` models each separator invocation as
 `STEM_STARTUP_S + STEM_RATE * duration` (fixed per-call startup - ONNX model
 load + CUDA context init + the surrounding ffmpeg extract/fold calls - plus
-throughput once past startup) and sums that per-channel over every span
-(per-span path) vs. once over the whole file (whole-track path), picking
-whichever total is lower. `STEM_STARTUP_S`/`STEM_RATE` were empirically
-calibrated against real per-span and whole-track runs - re-measure both if
-the GPU or stemmer model changes. This replaced an earlier
-`stem_whole_track_words` word-count threshold, which was a rough proxy that
-ignored the source's own runtime.
+throughput once past startup) and sums that per-channel - once over every
+span's padded duration added together (concatenated-spans path) vs. once
+over the whole file (whole-track path) - picking whichever total is lower.
+Both paths now pay the fixed per-invocation startup cost exactly once per
+channel, so this model's only real remaining choice is by total duration
+processed. `STEM_STARTUP_S`/`STEM_RATE` were empirically calibrated against
+real per-span and whole-track runs before the concatenation change - still
+valid, since they describe the separator's own per-invocation cost, not
+which strategy calls it how many times; re-measure both if the GPU or
+stemmer model changes. This replaced an earlier `stem_whole_track_words`
+word-count threshold, which was a rough proxy that ignored the source's own
+runtime.
+
+### Concatenated-spans stemming (2026-11-19)
+
+The per-span version of this path (one separator invocation per span per
+channel) turned out to be dominated by the separator's own fixed
+per-invocation startup cost at scale: on Apollo 13 (1995) - 39 flagged
+spans, a 5.1 (6-channel) track - stemming alone predicted ~37 minutes
+(`STEM_STARTUP_S` x 39 x 6 dominating, the actual audio processed being just
+22.4s of flagged content), and the real end-to-end run (`_batch_hallucination_fix.py`'s own elapsed-time record) took 2h18m, GPU used correctly
+throughout (confirmed via `gpu_lock`'s own hold/release log lines, no
+sibling-job contention either - see the investigation that prompted this).
+
+Concatenating every pending span's padded clip into one file and stemming
+it with a single invocation per channel pays that fixed startup cost once
+per channel instead of once per span per channel, while still only
+processing the flagged spans' own (padded) duration - strictly cheaper than
+the old per-span loop for any span count above 1. Predicted cost for the
+same Apollo 13 numbers: ~3 min, roughly a 12x improvement, without changing
+what gets stemmed or how spans get trimmed/spliced back in.
+
+**Why real audio padding, not a synthetic buffer, between concatenated
+clips.** Gluing unrelated clips directly together risks the separator's own
+sliding analysis window (MDX-Net default settings: `hop_length=1024`,
+`segment_size=256`, `overlap=0.25` -> ~5.9s chunks with a ~1.5s overlap-blend
+region between consecutive chunks at 44.1kHz) landing partly on one clip and
+partly on its neighbor, producing a blended estimate for that overlap
+region. Two mitigations were considered and rejected before landing on the
+one actually used:
+
+- **Synthetic noise/silence buffer between clips** - would isolate clips
+  from each other, but introduces its own problem: a hard transition to a
+  synthetic signal (even low-level pink noise, and worse for true digital
+  silence) is a shape real film audio never produces, which a model trained
+  on real audio has no clean prior for - risks relocating the boundary
+  artifact rather than removing it. Also does nothing for a second,
+  separate concern (next point) since it only affects local windowing, not
+  file-level stats.
+- **A second concern, investigated and ruled out as already a non-issue**:
+  whether concatenating clips of very different loudness into one file
+  before stemming would distort the separator's normalization relative to
+  stemming each clip alone. Read directly from `audio_separator`'s own MDX
+  source (`architectures/mdx_separator.py`): normalization is PEAK-based,
+  computed once per input (`peak = np.abs(mix).max()`) and re-applied
+  unchanged to the output (`source = demix(mix) * peak`) - not an
+  RMS/average statistic a quiet buffer could dilute. A noise/silence buffer
+  is therefore neutral here either way; it wouldn't have helped OR hurt this
+  specific concern. (A real but separate, lower-impact residual risk this
+  doesn't address: concatenated clips of very different native loudness
+  share ONE peak reference across the whole concatenated file rather than
+  each getting its own local peak the way isolated per-span stemming would
+  - a very quiet clip sitting next to a very loud one could get a less
+  locally-appropriate normalization reference than it would alone. Not
+  mitigated by anything here; judged low-impact for this use case - the
+  stemmed result is only ever used as ambient "fill" audio under a muted
+  word, not for pristine vocal isolation - and not worth the complexity of
+  per-clip pre-normalization-and-later-reapplication for what's expected to
+  be a rare, minor effect.)
+
+**What's actually used**: `SPLICE_CONTEXT_S` was raised from 2.0 to 3.0 and
+now does double duty as the inter-clip buffer - real audio from each span's
+own neighborhood (already being extracted anyway, for the separator to have
+context to work with) rather than anything synthetic. Sized to exceed
+roughly half the overlap-blend zone on each side of a splice point, so that
+zone - wherever it lands relative to the splice - stays inside the
+discarded padding instead of bleeding into the kept span. Even where a
+chunk DOES straddle two different clips, both sides are real, in-distribution
+audio the model was trained on; the only artifact risk is a content
+mismatch (an unrelated scene cut), not an out-of-distribution signal.
+
+**Checkpointing got coarser as a result** (see the per-span checkpointing
+section below, written when stemming genuinely was one call per span): a
+kill mid-stem now loses progress on every still-pending span at once, since
+they're one inference call now, not many - a real tradeoff, accepted for a
+much shorter window to actually be killed during in the first place. The
+completed concatenated stem result itself (`concat_instrumental.wav`) is
+still checkpointed, guarded by a manifest of exactly which span indices it
+was built from (`concat_manifest.json`) - a resume whose pending set has
+shifted since (some spans already split out before the kill) rebuilds from
+scratch rather than risk misaligned offsets into a concat file that doesn't
+match the current pending list.
+
+**Validated against real Apollo 13 (1995) data** (2026-11-19, same day):
+ran the new `splice_stemmed_spans` directly against the file's own untouched
+secondary English DTS 5.1 track (same original content as the AC3 track the
+real `(Cleaned)` track was built from, just a different codec, never
+touched by any redaction) and its real 39 flagged spans from
+`Apollo 13 (1995).bleeps.json`, to compare against the already-completed
+real `(Cleaned)` track (built by the OLD per-span approach) at the same
+timestamps. Caught a real, previously-undetected bug doing this: `_run_to_final()`'s (and two copies of the same pattern in `build_instrumental_stem()`) `.part`
+marker was appended AFTER the real extension (`foo.wav.part`, not
+`foo.part.wav`) - ffmpeg can't infer an output muxer from `.part` with no
+`-f` given, so every atomic-checkpoint write would have failed outright the
+first time any of this code path actually ran under real conditions. Never
+hit by a real production run yet since the checkpoint/concat work landed:
+the one real run since (Apollo 13's base edition, 2h18m) used an
+already-running process's older in-memory copy of this file, predating all
+of it. Fixed in all three spots before this validation run completed.
 
 Every splice, in both paths, is built from short, independently-seeked
 segments rather than one filter pass across the whole file - the identical
