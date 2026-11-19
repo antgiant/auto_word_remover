@@ -1489,6 +1489,78 @@ def choose_vobsub(tracks: list, want: str, prefer_lang: str = ""):
     return t, t["id"]
 
 
+_SKIP_IMAGE_SUB_NAME_RE = re.compile(r"commentary|karaoke", re.IGNORECASE)
+#   a track NAME that means "not a dialogue track at all, don't even try OCR'ing it" - a
+#   commentary track's subtitle (when a disc has one) captions the commentary audio, not the
+#   film's own dialogue; a karaoke track is sing-along lyrics, not speech. Checked before
+#   ranking (see _rank_image_sub_candidates) since no amount of OCR coverage makes either one
+#   the right choice - these are excluded outright, not just deprioritized.
+_SDH_NAME_RE = re.compile(r"\bsdh\b|hearing.?impaired", re.IGNORECASE)
+#   a track labelled for the deaf/hard-of-hearing is usually the FULLEST one available
+#   (dialogue + sound-effect descriptions) - same reason flag_language._is_full_cc prefers a
+#   true SDH text track - so prefer it first among same-language image-subtitle candidates too.
+_FORCED_IMAGE_SUB_NAME_RE = re.compile(r"\bforced\b|\bsigns?\b", re.IGNORECASE)
+#   a forced/signs-only track deliberately captions ONLY on-screen text (street signs, letters)
+#   during otherwise-untranslated foreign dialogue - genuinely thin by design, not broken, but
+#   never the first choice when a fuller same-language candidate exists; pushed to the end of
+#   the trial order rather than excluded outright, since it's still better than nothing.
+
+
+def _rank_image_sub_candidates(tracks: list, codec_id: str, prefer_lang: str) -> list[dict]:
+    """Every subtitle track of `codec_id` ("S_HDMV/PGS" or "S_VOBSUB"), minus any whose own
+    track NAME marks it as definitely not a dialogue track (see _SKIP_IMAGE_SUB_NAME_RE),
+    ordered best-candidate-first: same language as the already-chosen audio, the container's
+    own default flag, an SDH-labelled track, then everything else, with a forced/signs-labelled
+    track pushed to the very end. A caller (see main()'s PGS/VobSub discovery blocks) tries
+    each of these in turn via OCR and keeps the first with good-enough coverage, rather than
+    trusting a single "default" pick the way choose_pgs()/choose_vobsub() do.
+
+    Confirmed needed 2026-11-19: Arthur Christmas (2011) has two unflagged English VobSub
+    tracks and no track-name signal distinguishing them at all - OCR coverage itself (see
+    clean.py's caller) is the only way to tell them apart, since even the track's own alpha/
+    contrast values looked fine on the one that OCR'd to near-total garbage."""
+    cands = [t for t in tracks if t["type"] == "subtitles"
+            and (t["properties"].get("codec_id") or "").upper() == codec_id]
+    cands = [t for t in cands
+            if not _SKIP_IMAGE_SUB_NAME_RE.search(t["properties"].get("track_name") or "")]
+
+    def rank(t: dict) -> tuple:
+        p = t["properties"]
+        name = p.get("track_name") or ""
+        lang = (p.get("language") or "").lower()
+        is_pref_lang = 0 if (not prefer_lang or lang == prefer_lang.lower()) else 1
+        is_default = 0 if p.get("default_track") else 1
+        is_sdh = 0 if _SDH_NAME_RE.search(name) else 1
+        is_forced = 1 if _FORCED_IMAGE_SUB_NAME_RE.search(name) else 0
+        return (is_pref_lang, is_default, is_sdh, is_forced)
+
+    return sorted(cands, key=rank)
+
+
+def _ocr_coverage_is_good(srt_path: Path) -> bool:
+    """True if the OCR'd `srt_path` has enough real cues to trust as a working subtitle source
+    for detection purposes - the SAME bar flag_language already uses elsewhere to decide a
+    subtitle track is usable (_is_full_cc / _is_substantial_dialogue_track), reused here so
+    "good enough to stop trying other candidate tracks" means the same thing as "good enough to
+    actually use" everywhere else in this pipeline, rather than a second, looser definition.
+
+    Confirmed needed 2026-11-19: the plain character-count check
+    (srt_text_len(...) >= _MIN_USABLE_SRT_CHARS) this call site used before was too weak to
+    catch a track that OCR'd almost entirely to garbage - Arthur Christmas (2011)'s bad VobSub
+    track still produced 60 short junk lines ("i eee", "=", "Si", ...) that likely would have
+    cleared a raw character-count bar despite being useless, while cleanly failing a cue-count-
+    based "is this a substantial dialogue track" check the way a genuinely thin forced/signs
+    track correctly does too."""
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import flag_language
+    try:
+        units = flag_language.parse_srt(srt_path)
+    except Exception:
+        return False
+    return flag_language._is_full_cc(units) or flag_language._is_substantial_dialogue_track(units)
+
+
 def find_cc608_track(ffprobe: str, media: Path, want_lang: str | None) -> dict | None:
     """mkvmerge silently drops MP4 CEA-608 closed-caption tracks (codec
     eia_608/c608) from its track list entirely - some rips (e.g. iTunes
@@ -3433,8 +3505,8 @@ def main(argv: list[str] | None = None) -> int:
         #                          censor_pgs_track() (later) needs its cached .sup/.words.json, not clean_srt
         pgs_cache = None  # {"sup_path", "json_path"} from analyze_pgs_track(), for the same reason
         if subs_enabled and chosen_subs is None and cfg.pgs_ocr:
-            pgs_track, _pgs_tid = choose_pgs(tracks, cfg.subs_track, prefer_lang=cp.get("language", ""))
-            if pgs_track is not None:
+            pgs_candidates = _rank_image_sub_candidates(tracks, "S_HDMV/PGS", cp.get("language", ""))
+            if pgs_candidates:
                 tesseract_cmd = locate_tesseract()
                 if tesseract_cmd is None:
                     print("  [warn] a PGS (Blu-ray bitmap) subtitle track exists but Tesseract "
@@ -3444,19 +3516,41 @@ def main(argv: list[str] | None = None) -> int:
                     if str(HERE) not in sys.path:
                         sys.path.insert(0, str(HERE))
                     import pgs_ocr
-                    lang3 = pgs_track["properties"].get("language") or "und"
-                    ocr_lang = cfg.pgs_ocr_lang or "eng"
-                    cache_base = media.with_name(f"{media.stem}.{lang3}.pgsocr")
-                    print(f"  subtitles: no text/sidecar track - OCR'ing PGS track id "
-                          f"{pgs_track['id']} [{lang3}] with Tesseract (this can take a "
-                          f"while on a full film; cached for reruns)...")
-                    stats = pgs_ocr.analyze_pgs_track(
-                        mkvextract, media, pgs_track["id"], cache_base,
-                        lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
-                    action = "reusing cached" if stats["cached"] else "OCR'd"
-                    print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
-                          f"image cue(s) to text ({stats['display_sets']} display sets)")
-                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                    best = None  # (stats, track, lang3) - whichever candidate tried so far OCR'd
+                    #               the most text_cues, kept in case NONE clears _ocr_coverage_is_good
+                    for i, cand in enumerate(pgs_candidates):
+                        lang3 = cand["properties"].get("language") or "und"
+                        ocr_lang = cfg.pgs_ocr_lang or "eng"
+                        # Only the FIRST (best-ranked) candidate reuses the plain per-language cache
+                        # name every prior run already used - a file with just one PGS track (the
+                        # overwhelming majority) never pays to re-OCR something already cached under
+                        # the old naming. A fallback candidate gets its own track-id-qualified cache
+                        # instead of overwriting that one.
+                        cache_base = media.with_name(
+                            f"{media.stem}.{lang3}.pgsocr" if i == 0
+                            else f"{media.stem}.{lang3}.t{cand['id']}.pgsocr")
+                        label = cand["properties"].get("track_name") or ""
+                        print(f"  subtitles: no text/sidecar track - OCR'ing PGS track id "
+                              f"{cand['id']} [{lang3}]{f' {label!r}' if label else ''} with "
+                              f"Tesseract (this can take a while on a full film; cached for "
+                              f"reruns)...")
+                        stats = pgs_ocr.analyze_pgs_track(
+                            mkvextract, media, cand["id"], cache_base,
+                            lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
+                        action = "reusing cached" if stats["cached"] else "OCR'd"
+                        print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
+                              f"image cue(s) to text ({stats['display_sets']} display sets)")
+                        if best is None or stats["text_cues"] > best[0]["text_cues"]:
+                            best = (stats, cand, lang3)
+                        if _ocr_coverage_is_good(stats["srt_path"]):
+                            break
+                        elif i + 1 < len(pgs_candidates):
+                            print(f"  [note] coverage looks too sparse to trust ({stats['text_cues']}/"
+                                  f"{stats['image_cues']} cues) - trying another candidate PGS track",
+                                  file=sys.stderr)
+                    stats, pgs_track, lang3 = best
+                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS \
+                            and _ocr_coverage_is_good(stats["srt_path"]):
                         raw_srt = stats["srt_path"]
                         chosen_subs = {"id": None, "type": "subtitles",
                                       "properties": {"language": lang3,
@@ -3469,16 +3563,16 @@ def main(argv: list[str] | None = None) -> int:
                               "the ORIGINAL bitmap with flagged words redacted in the image itself, "
                               "not a text conversion; expect occasional misreads/missed redactions")
                     else:
-                        print("  [warn] PGS OCR produced too little usable text - discarding",
-                              file=sys.stderr)
+                        print(f"  [warn] PGS OCR produced too little usable text across "
+                              f"{len(pgs_candidates)} candidate track(s) - discarding", file=sys.stderr)
 
         vobsub_source_track = None  # set below when a VobSub track is what raw_srt/chosen_subs came
         #                             from - censor_vobsub_track() (later) needs its cached
         #                             .idx/.sub/.words.json, not clean_srt
         vobsub_cache = None  # {"idx_path", "sub_path", "json_path"} from analyze_vobsub_track()
         if subs_enabled and chosen_subs is None and cfg.vobsub_ocr:
-            vobsub_track, _vobsub_tid = choose_vobsub(tracks, cfg.subs_track, prefer_lang=cp.get("language", ""))
-            if vobsub_track is not None:
+            vobsub_candidates = _rank_image_sub_candidates(tracks, "S_VOBSUB", cp.get("language", ""))
+            if vobsub_candidates:
                 tesseract_cmd = locate_tesseract()
                 if tesseract_cmd is None:
                     print("  [warn] a VobSub (DVD bitmap) subtitle track exists but Tesseract "
@@ -3488,19 +3582,35 @@ def main(argv: list[str] | None = None) -> int:
                     if str(HERE) not in sys.path:
                         sys.path.insert(0, str(HERE))
                     import vobsub_ocr
-                    lang3 = vobsub_track["properties"].get("language") or "und"
-                    ocr_lang = cfg.vobsub_ocr_lang or "eng"
-                    cache_base = media.with_name(f"{media.stem}.{lang3}.vobsubocr")
-                    print(f"  subtitles: no text/sidecar/PGS track - OCR'ing VobSub track id "
-                          f"{vobsub_track['id']} [{lang3}] with Tesseract (this can take a "
-                          f"while on a full film; cached for reruns)...")
-                    stats = vobsub_ocr.analyze_vobsub_track(
-                        mkvextract, media, vobsub_track["id"], cache_base,
-                        lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
-                    action = "reusing cached" if stats["cached"] else "OCR'd"
-                    print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
-                          f"image cue(s) to text ({stats['entries']} entries)")
-                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                    best = None  # (stats, track, lang3) - see the PGS block above for why
+                    for i, cand in enumerate(vobsub_candidates):
+                        lang3 = cand["properties"].get("language") or "und"
+                        ocr_lang = cfg.vobsub_ocr_lang or "eng"
+                        cache_base = media.with_name(
+                            f"{media.stem}.{lang3}.vobsubocr" if i == 0
+                            else f"{media.stem}.{lang3}.t{cand['id']}.vobsubocr")
+                        label = cand["properties"].get("track_name") or ""
+                        print(f"  subtitles: no text/sidecar/PGS track - OCR'ing VobSub track id "
+                              f"{cand['id']} [{lang3}]{f' {label!r}' if label else ''} with "
+                              f"Tesseract (this can take a while on a full film; cached for "
+                              f"reruns)...")
+                        stats = vobsub_ocr.analyze_vobsub_track(
+                            mkvextract, media, cand["id"], cache_base,
+                            lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
+                        action = "reusing cached" if stats["cached"] else "OCR'd"
+                        print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
+                              f"image cue(s) to text ({stats['entries']} entries)")
+                        if best is None or stats["text_cues"] > best[0]["text_cues"]:
+                            best = (stats, cand, lang3)
+                        if _ocr_coverage_is_good(stats["srt_path"]):
+                            break
+                        elif i + 1 < len(vobsub_candidates):
+                            print(f"  [note] coverage looks too sparse to trust ({stats['text_cues']}/"
+                                  f"{stats['image_cues']} cues) - trying another candidate VobSub "
+                                  f"track", file=sys.stderr)
+                    stats, vobsub_track, lang3 = best
+                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS \
+                            and _ocr_coverage_is_good(stats["srt_path"]):
                         raw_srt = stats["srt_path"]
                         chosen_subs = {"id": None, "type": "subtitles",
                                       "properties": {"language": lang3,
@@ -3514,8 +3624,8 @@ def main(argv: list[str] | None = None) -> int:
                               "the ORIGINAL bitmap with flagged words redacted in the image itself, "
                               "not a text conversion; expect occasional misreads/missed redactions")
                     else:
-                        print("  [warn] VobSub OCR produced too little usable text - discarding",
-                              file=sys.stderr)
+                        print(f"  [warn] VobSub OCR produced too little usable text across "
+                              f"{len(vobsub_candidates)} candidate track(s) - discarding", file=sys.stderr)
 
         if subs_enabled and chosen_subs is None and cfg.opensubtitles:
             if str(HERE) not in sys.path:
