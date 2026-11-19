@@ -313,7 +313,9 @@ class Config:
     #                                    channel - never inferred, opt-in per file only (same as
     #                                    --method bleep); fails loudly if the chosen track has no
     #                                    recognised center channel
-    source_track: str = "default"      # "default" | index | 3-letter language
+    source_track: str = "default"      # "default" | index | 3-letter language | "commentary" |
+    #                                    "descriptive" ("audio-description"/"ad" alias) - see
+    #                                    choose_audio()/is_commentary_or_descriptive_track()
     track_name_suffix: str = " (Cleaned)"
     faith_track_suffix: str = " (Cleaned - Christian Edition)"  # used instead of
     #                                    track_name_suffix when faith_detection (below) swaps in
@@ -1390,21 +1392,49 @@ def choose_audio(tracks: list, want: str):
     narrated = [t for t in audio if not is_no_narration_track(t)]
     candidates = narrated or audio   # only a file that's ENTIRELY no-narration tracks falls back
     if want == "default":
+        # Commentary/descriptive-audio tracks are never a valid DEFAULT/auto cleaning source -
+        # same spirit as the no-narration exclusion above - but explicit selection below (by
+        # index, language, or the "commentary"/"descriptive" keyword forms of `want`) can still
+        # reach one on purpose. Only a file that's entirely commentary/descriptive falls back to
+        # the full pool, same fallback shape as `narrated` above.
+        non_commentary = [t for t in candidates if not is_commentary_or_descriptive_track(t)]
+        pool = non_commentary or candidates
         # Don't just trust the container's default-track flag - a rip's default
         # is often an arbitrary/compatibility stereo track sitting next to a
         # real 5.1+ track of the same language that never gets touched. Prefer
         # the highest-channel-count track among whatever language the default
         # pick would have used.
-        default_t = next((t for t in candidates if t["properties"].get("default_track")), candidates[0])
+        default_t = next((t for t in pool if t["properties"].get("default_track")), pool[0])
         lang = (default_t["properties"].get("language") or "").lower()
-        same_lang = [t for t in candidates
-                     if (t["properties"].get("language") or "").lower() == lang] if lang else candidates
+        same_lang = [t for t in pool
+                     if (t["properties"].get("language") or "").lower() == lang] if lang else pool
         t = max(same_lang, key=lambda x: x["properties"].get("audio_channels") or 0)
         if (t["properties"].get("audio_channels") or 0) > (default_t["properties"].get("audio_channels") or 0):
             print(f"  [note] source_track=default: using the "
                   f"{t['properties'].get('audio_channels')}ch track (id {t['id']}) instead of the "
                   f"{default_t['properties'].get('audio_channels')}ch one flagged default (id {default_t['id']}) "
                   f"- preferring higher channel count")
+    elif str(want).lower() in ("commentary", "descriptive", "descriptive-audio", "audio-description", "ad"):
+        kind = str(want).lower()
+        is_commentary_kind = kind == "commentary"
+        matcher = COMMENTARY_NAME_RE if is_commentary_kind else DESCRIPTIVE_AUDIO_NAME_RE
+        def _matches(tr: dict) -> bool:
+            p = tr["properties"]
+            if matcher.search(p.get("track_name") or ""):
+                return True
+            return bool(p.get("flag_commentary")) if is_commentary_kind else bool(
+                p.get("flag_visual_impaired") or p.get("flag_text_descriptions"))
+        matches = [tr for tr in candidates if _matches(tr)]
+        if not matches:
+            names = ", ".join(repr(tr["properties"].get("track_name") or f"audio track {tr['id']}")
+                              for tr in candidates)
+            raise SystemExit(f"[error] no audio track name-matched source_track={want!r} - "
+                             f"tracks available: {names}")
+        if len(matches) > 1:
+            print(f"  [note] source_track={want!r}: {len(matches)} matching track(s) found - "
+                  f"using the first (id {matches[0]['id']}); pass a numeric --source-track index "
+                  f"instead to pick a different one")
+        t = matches[0]
     else:
         t = _pick(candidates, want, "audio")
     return t, audio.index(t)
@@ -1817,6 +1847,35 @@ def is_no_narration_track(t: dict) -> bool:
     name = (t.get("properties", {}) or {}).get("track_name") or ""
     nl = name.lower()
     return any(m in nl for m in NO_NARRATION_NAME_MARKERS)
+
+
+COMMENTARY_NAME_RE = re.compile(r"\bcommentary\b", re.IGNORECASE)
+#   director's/cast commentary track - same term _SKIP_IMAGE_SUB_NAME_RE already excludes a
+#   commentary track's OWN subtitle on (that's a separate, subtitle-side definition; this one is
+#   audio-side, used by choose_audio() below).
+DESCRIPTIVE_AUDIO_NAME_RE = re.compile(r"descriptive|audio.?description|described.?video", re.IGNORECASE)
+#   "Descriptive Audio"/"Audio Description"/"Described Video" are the common real-world track
+#   names for a narrated-for-the-blind track. Deliberately NOT matching a bare "AD"/"DVS"/"SAP" -
+#   too easy to false-positive on an unrelated track name (SAP in particular is ambiguous: on an
+#   older rip it often means a Spanish-dub secondary audio program, not descriptive audio at
+#   all). --source-track still accepts "ad" as a typed keyword (see choose_audio) - that's a
+#   deliberate, unambiguous user choice, nothing like matching "ad" as a name substring.
+
+
+def is_commentary_or_descriptive_track(t: dict) -> bool:
+    """True for a commentary or descriptive-audio (narrated-for-the-blind) track - matched by
+    name, the same way is_no_narration_track() is, since this project's mkvmerge version (and
+    most real-world rips) doesn't reliably set the formal Matroska FlagCommentary/
+    FlagVisualImpaired/FlagTextDescriptions elements; checked too, when present, as a free extra
+    signal mkvmerge -J would expose as flag_commentary/flag_visual_impaired/
+    flag_text_descriptions. Used by choose_audio() to keep "default" mode from ever silently
+    picking one of these as the thing to clean - same spirit as is_no_narration_track - and to
+    recognize the "commentary"/"descriptive" keyword forms of --source-track (see below)."""
+    p = (t.get("properties", {}) or {})
+    name = p.get("track_name") or ""
+    return bool(COMMENTARY_NAME_RE.search(name) or DESCRIPTIVE_AUDIO_NAME_RE.search(name)
+                or p.get("flag_commentary") or p.get("flag_visual_impaired")
+                or p.get("flag_text_descriptions"))
 
 
 def is_own_output_track(t: dict, cfg: Config) -> bool:
@@ -3217,7 +3276,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="'mute'/'bleep' only, for a >2ch source")
     p.add_argument("--cut-bitrate", dest="cut_bitrate", help="'cut' only, for a lossy source codec")
     p.add_argument("--source-track", dest="source_track",
-                   help='"default", an audio index (0,1,...), or a language (eng)')
+                   help='"default", an audio index (0,1,...), a language (eng), or '
+                        '"commentary"/"descriptive" (also "audio-description"/"ad") to '
+                        'name-match a commentary or descriptive-audio track instead - picks the '
+                        'first match if more than one exists (see Config.source_track / '
+                        'choose_audio). "default" mode never picks a commentary/descriptive '
+                        'track on its own, same as it never picks a (No Narration) one.')
     p.add_argument("--sync-ms", dest="sync_ms", type=int, help="delay the clean track by N ms")
     p.add_argument("--subs-track", dest="subs_track",
                    help='SubRip track to clean: "default", index, language, or "none"')

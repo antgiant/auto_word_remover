@@ -1032,19 +1032,55 @@ existing `Surround 5.1 (Cleaned)` one, with its own `<stem>.Commentary.bleeps.js
 sidecar, and reruns against either track independently replace only that
 one's own prior output.
 
-**Known gap, not fixed here**: `--source-track` still only accepts
-`default`/a numeric index/a 3-letter language - there's no name-based
-"commentary"/"descriptive audio" auto-detection the way subtitle-candidate
-picking already skips commentary/karaoke tracks by name
-(`_SKIP_IMAGE_SUB_NAME_RE`). Finding the right index still means reading
-`mkvmerge -i` yourself. A file whose chosen source track has no name AND no
-recognized language also still has the ambiguity this whole scheme can't
-resolve: `_own_output_base_name()` falls back to `""` for ANY such track, so
-two differently-positioned nameless/unrecognized-language tracks would
-collide on the same bare `(Cleaned)` output name and the same untagged
-`.bleeps.json` - same ambiguity a human would have looking at the container,
-not something worth solving with track-ID tracking (ids aren't stable
-across a real rebuild anyway).
+**Still a real ambiguity, not solved**: a file whose chosen source track has
+no name AND no recognized language has no lineage signal to key off at all -
+`_own_output_base_name()` falls back to `""` for ANY such track, so two
+differently-positioned nameless/unrecognized-language tracks would collide
+on the same bare `(Cleaned)` output name and the same untagged
+`.bleeps.json`. Same ambiguity a human would have looking at the container;
+not solved with track-ID tracking (ids aren't stable across a real rebuild
+anyway). In practice this is rare for a commentary/descriptive track
+specifically - see below - since those are almost always named.
+
+### Commentary/descriptive-audio detection (2026-11-19)
+
+`--source-track` now also accepts `"commentary"` and `"descriptive"` (plus
+`"audio-description"`/`"ad"` as aliases for the latter) as name-matched
+keyword forms, alongside the existing `default`/index/language options -
+`choose_audio()` picks the first track whose `track_name` matches
+`COMMENTARY_NAME_RE`/`DESCRIPTIVE_AUDIO_NAME_RE` (or, when present, the
+formal Matroska `flag_commentary`/`flag_visual_impaired`/
+`flag_text_descriptions` properties mkvmerge -J would expose - checked as a
+free extra signal, but name matching is the one that actually fires on real
+rips: this project's mkvmerge version, and most scene/personal rips, don't
+reliably set those flags even when they logically apply). More than one
+match just uses the first and prints a note suggesting a numeric
+`--source-track` index instead to pick a different one - no attempt to
+disambiguate "which commentary track" by content.
+
+`choose_audio()`'s `"default"` mode now also excludes commentary/descriptive
+tracks from auto-selection - `is_commentary_or_descriptive_track()`, same
+shape and same fallback behavior (full pool if EVERY audio track in the file
+is commentary/descriptive) as the pre-existing `is_no_narration_track`
+exclusion right above it. This matters independently of the keyword
+selection above: even run with no special flags at all, `clean.py` will
+never silently clean a commentary/AD track just because it happened to be
+flagged default in the container or had the highest channel count.
+
+`DESCRIPTIVE_AUDIO_NAME_RE` deliberately does NOT match a bare `AD`/`DVS`/
+`SAP` substring - too easy to false-positive on an unrelated track name
+(`SAP` in particular is ambiguous: on an older rip it often means a
+Spanish-dub secondary audio program, not descriptive audio at all). Typing
+`--source-track ad` explicitly is fine though - that's an unambiguous,
+deliberate user choice, nothing like matching "ad" against arbitrary track
+name substrings.
+
+Combined with the lineage-scoped stale-track handling above, this is what
+makes `clean.py "<file>" --source-track commentary` a complete, safe
+operation on a file whose main dialogue track is already cleaned: it finds
+the commentary track by name, cleans it into its own `Commentary (Cleaned)`
+track with its own tagged `.bleeps.json` sidecar, and never touches the
+existing dialogue clean.
 
 Scoped to `mute`/`bleep`/`replace` only, matching what the user actually
 asked for ("only if that would result in a different set of words"):
