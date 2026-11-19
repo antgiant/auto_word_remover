@@ -226,6 +226,37 @@ module doesn't parse) has its own equivalent module - see `vobsub_ocr.py`
 below - tried as a further fallback when there's neither a text track nor
 a PGS one.
 
+**Known limitation: no quality-based tiebreak between same-language
+candidate tracks.** `choose_pgs()`/`choose_vobsub()` pick ONE track for
+"default" mode - the container's own default flag if set, else (since
+2026-11-19) the first track matching the already-chosen audio's language,
+else just the first track of that codec in container order. When a file
+has MORE THAN ONE same-language PGS/VobSub track and neither is flagged
+default, there's no way to know in advance which one will actually OCR
+well - that would need running Tesseract on every candidate just to find
+out, which is real cost paid on every multi-candidate file to guard
+against a rare bad case.
+
+Confirmed real, not hypothetical: Arthur Christmas (2011) has two English
+VobSub tracks (ids 7 and 8, neither flagged default). Track 7 (picked,
+sitting first in container order) OCR'd to near-total garbage - 60 legible
+lines out of 1947 image cues (~3%), despite the track's own alpha/contrast
+values being strong (fully opaque text, confirmed by inspecting
+`VobSubEntry.info.contr` directly - not a contrast/scaling bug in
+vobsub_ocr.py's rendering, which already scales VobSub's 0-15 contrast
+range to 0-255 correctly). Track 8 OCR'd cleanly - 1325/1521 (~87%) -
+producing real, coherent, correctly-timed dialogue
+("Dear Santa, are you real?..."). The most likely explanation is a
+stylized/decorative font on track 7 that Tesseract's `eng` model simply
+can't read well, not a code defect - two same-content, same-language
+tracks can legitimately differ in authored style (e.g. a "deluxe edition"
+holiday-themed subtitle style bundled alongside a plain one).
+
+If OCR output for a file looks suspiciously sparse/garbled compared to its
+own image-cue count, check for another same-codec candidate track with
+`mkvmerge -J` and force it explicitly with `--subs-track <id>` rather than
+trusting "default" - there's no automatic fallback for this today.
+
 ### Sidecar subtitle files (`find_sidecar_subtitle()`, an external file next to the input)
 
 Second in the subtitle-discovery chain (text track -> CC608 -> **sidecar
