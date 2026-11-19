@@ -402,6 +402,31 @@ def analyze_vobsub_track(mkvextract: str, media: Path, track_id: int, cache_base
 # ---------------------------------------------------------------------------
 # stage 2: redact + splice (mirrors pgs_ocr.censor_pgs_track / _splice_sup)
 # ---------------------------------------------------------------------------
+def _local_background_fill(original: np.ndarray, bx: int, by: int, bw: int, bh: int,
+                            default_value: int) -> np.ndarray:
+    """One fill value per row of the [bx, by, bw, bh) box, sampled from `original` (the
+    PRISTINE, pre-redaction pixel array - entry.pixels itself, never the mutated copy) just
+    outside the box's own left or right edge. Mirrors pgs_ocr._local_background_fill's same
+    reasoning: not every cue is plain text over a flat background - some styling renders a
+    solid/translucent box behind the text, and that box's own value is the correct thing to
+    blend a redacted word into, not a single constant (`transparent_value`, VobSub's own
+    lowest-alpha palette slot) assumed to apply everywhere. Confirmed needed 2026-11-19; can
+    vary cue-to-cue even within one file. Falls back to `default_value` only for a row with no
+    neighbor pixel on either side to sample (box spans the image edge-to-edge) or past the top/
+    bottom of the image entirely."""
+    obj_h, obj_w = original.shape
+    fills = np.full(bh, default_value, dtype=original.dtype)
+    left, right = bx - 1, bx + bw
+    for i, row in enumerate(range(by, by + bh)):
+        if row < 0 or row >= obj_h:
+            continue
+        if left >= 0:
+            fills[i] = original[row, left]
+        elif right < obj_w:
+            fills[i] = original[row, right]
+    return fills
+
+
 def censor_vobsub_track(idx_path: Path, sub_path: Path, json_path: Path, spans, matchers: dict,
                          out_idx_path: Path, subs_pad: float = 0.15, mask_pad_px: int = 6) -> dict:
     """Redact every wordlist-matching word in a cue overlapping a flagged
@@ -462,7 +487,9 @@ def censor_vobsub_track(idx_path: Path, sub_path: Path, json_path: Path, spans, 
                 if pixels is None:
                     pixels = entry.pixels.copy()
                 bx, by, bw, bh = box
-                pixels[max(0, by):min(obj_h, by + bh), max(0, bx):min(obj_w, bx + bw)] = transparent_value
+                fills = _local_background_fill(entry.pixels, bx, by, bw, bh, transparent_value)
+                for row in range(max(0, by), min(obj_h, by + bh)):
+                    pixels[row, max(0, bx):min(obj_w, bx + bw)] = fills[row - by]
                 words_redacted += 1
         if pixels is not None:
             modified[idx] = pixels
