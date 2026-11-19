@@ -1440,31 +1440,51 @@ def choose_subs(tracks: list, want: str, prefer_lang: str = ""):
     return t, t["id"]
 
 
-def choose_pgs(tracks: list, want: str):
+def choose_pgs(tracks: list, want: str, prefer_lang: str = ""):
     """The image-based (PGS/Blu-ray) subtitle track to feed pgs_ocr.py, or
-    (None, None) if there isn't one - see Config.pgs_ocr."""
+    (None, None) if there isn't one - see Config.pgs_ocr. `prefer_lang` (the
+    already-chosen audio track's own language) disambiguates "default" when
+    more than one PGS track exists and none is flagged default by the
+    container - mirrors choose_subs()'s own same non-trust of the raw
+    default flag, for the same reason (a disc's default-subtitle flag
+    reflects the authoring studio's pick, routinely a dub-market language,
+    not necessarily the language actually being cleaned). Confirmed
+    2026-11-19 this was missing entirely: without it, "default" mode falls
+    through _pick() to whichever track happens to sit FIRST in the
+    container, with no language preference of any kind - previously
+    harmless by luck whenever the first track happened to already be the
+    right language, but a real risk whenever it isn't."""
     if str(want).lower() in ("none", "skip", "off", ""):
         return None, None
     pgs = [t for t in tracks if t["type"] == "subtitles"
            and (t["properties"].get("codec_id") or "").upper() == "S_HDMV/PGS"]
     if not pgs:
         return None, None
+    if want == "default" and prefer_lang:
+        same_lang = [t for t in pgs
+                    if (t["properties"].get("language", "") or "").lower() == prefer_lang.lower()]
+        pgs = same_lang or pgs
     t = _pick(pgs, want, "subtitle")
     return t, t["id"]
 
 
-def choose_vobsub(tracks: list, want: str):
+def choose_vobsub(tracks: list, want: str, prefer_lang: str = ""):
     """The image-based (VobSub/DVD) subtitle track to feed vobsub_ocr.py, or
     (None, None) if there isn't one - see Config.vobsub_ocr. Checked only
     after choose_pgs finds nothing (see main()'s subtitle-discovery order) -
     PGS is the newer, higher-resolution format, so it wins when a source
-    somehow has both."""
+    somehow has both. `prefer_lang` - see choose_pgs()'s own docstring for
+    why this exists; same reasoning applies here."""
     if str(want).lower() in ("none", "skip", "off", ""):
         return None, None
     vobsub = [t for t in tracks if t["type"] == "subtitles"
              and (t["properties"].get("codec_id") or "").upper() == "S_VOBSUB"]
     if not vobsub:
         return None, None
+    if want == "default" and prefer_lang:
+        same_lang = [t for t in vobsub
+                    if (t["properties"].get("language", "") or "").lower() == prefer_lang.lower()]
+        vobsub = same_lang or vobsub
     t = _pick(vobsub, want, "subtitle")
     return t, t["id"]
 
@@ -3413,7 +3433,7 @@ def main(argv: list[str] | None = None) -> int:
         #                          censor_pgs_track() (later) needs its cached .sup/.words.json, not clean_srt
         pgs_cache = None  # {"sup_path", "json_path"} from analyze_pgs_track(), for the same reason
         if subs_enabled and chosen_subs is None and cfg.pgs_ocr:
-            pgs_track, _pgs_tid = choose_pgs(tracks, cfg.subs_track)
+            pgs_track, _pgs_tid = choose_pgs(tracks, cfg.subs_track, prefer_lang=cp.get("language", ""))
             if pgs_track is not None:
                 tesseract_cmd = locate_tesseract()
                 if tesseract_cmd is None:
@@ -3457,7 +3477,7 @@ def main(argv: list[str] | None = None) -> int:
         #                             .idx/.sub/.words.json, not clean_srt
         vobsub_cache = None  # {"idx_path", "sub_path", "json_path"} from analyze_vobsub_track()
         if subs_enabled and chosen_subs is None and cfg.vobsub_ocr:
-            vobsub_track, _vobsub_tid = choose_vobsub(tracks, cfg.subs_track)
+            vobsub_track, _vobsub_tid = choose_vobsub(tracks, cfg.subs_track, prefer_lang=cp.get("language", ""))
             if vobsub_track is not None:
                 tesseract_cmd = locate_tesseract()
                 if tesseract_cmd is None:
