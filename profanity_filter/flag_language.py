@@ -228,10 +228,44 @@ def _units_from_flat_words(words: list[dict]) -> list[Unit]:
     return units
 
 
+def _merge_srt_fragments(blocks: list[str]) -> list[str]:
+    """Reassembles a cue that got torn into multiple pieces by parse_srt's own
+    blank-line block splitter - confirmed 2026-11-19 on a real SubDL-sourced
+    download of Star Trek V (1989): that release has an EXTRA blank line
+    between a cue's own index/timestamp/text lines, not just between cues
+    ("1\\n\\n00:01:46,907 --> 00:01:48,671\\n\\nI thought weapons were
+    forbidden\\n\\n\\n\\n2\\n\\n..." - three blank-line gaps per cue instead
+    of one), which made `\\n\\s*\\n` split a 93KB, ~1550-cue file into 4636
+    one-line fragments and parse_srt() silently return ZERO units (every
+    fragment either had no "-->" line at all, or had one with no text
+    following it in the SAME fragment - both fail parse_srt's own `ts_idx`/
+    `text.strip()` checks). A bare cue INDEX (just digits) or a bare
+    TIMESTAMP line can never be a complete, standalone cue by SRT's own
+    grammar, so either one is merged forward into the next block
+    unconditionally - a no-op on a normally-formatted file (where neither
+    ever appears as its own block to begin with), real repair on this
+    one."""
+    merged: list[str] = []
+    pending: list[str] = []
+    for block in blocks:
+        stripped = block.strip()
+        is_bare_index = stripped.isdigit()
+        is_bare_timestamp = "-->" in stripped and len(stripped.splitlines()) == 1
+        if is_bare_index or is_bare_timestamp:
+            pending.append(block)
+            continue
+        pending.append(block)
+        merged.append("\n\n".join(pending))
+        pending = []
+    if pending:
+        merged.append("\n\n".join(pending))
+    return merged
+
+
 def parse_srt(path: Path, kind: str = "srt") -> list[Unit]:
     raw = path.read_text(encoding="utf-8-sig")
     units: list[Unit] = []
-    for block in re.split(r"\n\s*\n", raw.strip()):
+    for block in _merge_srt_fragments(re.split(r"\n\s*\n", raw.strip())):
         lines = [ln for ln in block.splitlines() if ln.strip()]
         ts_idx = next((j for j, ln in enumerate(lines) if "-->" in ln), None)
         if ts_idx is None:
