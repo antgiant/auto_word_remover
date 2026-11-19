@@ -1412,6 +1412,22 @@ def stage_sidecar_srt(ffmpeg: str, sidecar: Path, tmp: Path) -> Path:
     return out
 
 
+_MIN_RESYNC_MATCH_FRACTION = 0.25   # minimum share of the external subtitle's OWN cues that
+#   must land a trustworthy anchor (see flag_language.resync_units_to_transcript) before using
+#   it at all. Confirmed 2026-11-19 this is a real, not hypothetical, gap: OpenSubtitles' search
+#   can return a WRONG film outright for an obscure/ambiguous title - "Dr. Dolittle 2 (2001)"
+#   matched to "Rush Hour 2"'s subtitle, "VeggieTales Minnesota Cuke..." matched to "The Princess
+#   and the Frog"'s - and the old length-only check (_MIN_USABLE_SRT_CHARS) was nowhere near
+#   enough to catch either: coincidental short common-phrase matches between any two
+#   sufficiently long English films accumulate well past 200 characters on their own (Rush
+#   Hour 2's wrongly-matched text alone produced 1942 characters, all genuinely from Rush Hour
+#   2, not Dr. Dolittle 2 - clean.py would have happily used Chris Tucker's dialogue as
+#   corroborating evidence for a children's movie). The match FRACTION is what actually
+#   separates real from wrong, with a huge margin either way: a confirmed-correct match (Back
+#   to the Future (1985)) resynced 94.1% of its own cues; the two wrong-film cases above landed
+#   at 4.1% and 1.8%.
+
+
 def resync_external_srt(raw_srt_path: Path, js: Path, lang3: str, track_suffix: str,
                         synced_path: Path, log_label: str) -> tuple[Path, str] | None:
     """Realign an externally-sourced subtitle - an OpenSubtitles download or
@@ -1420,17 +1436,28 @@ def resync_external_srt(raw_srt_path: Path, js: Path, lang3: str, track_suffix: 
     transcript(), since neither source is guaranteed to already match THIS
     file's exact cut/timing the way an embedded track is. Writes the
     resynced cues to `synced_path` and returns (synced_path, track_name) if
-    there's enough usable text left afterwards, else None (a warning is
-    printed either way, distinguishing "nothing lined up" from "too little
-    text").
+    enough of the source's OWN cues matched (see _MIN_RESYNC_MATCH_FRACTION)
+    AND there's enough usable text left afterwards, else None (a warning is
+    printed either way, distinguishing "nothing lined up", "wrong film
+    entirely", and "too little text").
     """
     if str(HERE) not in sys.path:
         sys.path.insert(0, str(HERE))
     import flag_language
+    try:
+        total_units = len(flag_language.strip_ad_units(flag_language.parse_srt(Path(raw_srt_path))))
+    except (OSError, ValueError):
+        total_units = 0
     cues = flag_language.resync_units_to_transcript(raw_srt_path, flag_language.load_word_timeline(js))
     if not cues:
         print(f"  [warn] {log_label}: nothing in the subtitle lined up with this recording's "
               f"transcript - discarding", file=sys.stderr)
+        return None
+    if total_units and len(cues) / total_units < _MIN_RESYNC_MATCH_FRACTION:
+        print(f"  [warn] {log_label}: only {len(cues)}/{total_units} cues "
+              f"({100 * len(cues) / total_units:.0f}%) lined up with this recording's "
+              f"transcript - too little to trust as the same film/cut (likely a wrong search "
+              f"match), discarding", file=sys.stderr)
         return None
     flag_language.write_srt_cues(cues, synced_path)
     if srt_text_len(synced_path) < _MIN_USABLE_SRT_CHARS:
