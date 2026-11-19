@@ -1022,14 +1022,16 @@ def second_opinion_rescue(hits: list[dict], media: Path, tools: dict, tmp: Path)
     uses, since find_spans treats them identically for reporting/filtering purposes - if that
     independent pass still contains the matched word.
 
-    This is the last-resort check for the "true gap" population: a file with no usable
-    subtitle of its own, no sibling edition with a CC track, and (by the time a caller reaches
-    this) no OpenSubtitles match either. Until this existed, a hit in that position was excluded
-    purely on detect_repeated_segments' own say-so - repetition plus a confidence gap against
-    that SAME ASR run - with no corroboration of any kind. See _SECOND_OPINION_MODEL's comment
-    above for the validation data and its one known blind spot (screamed/non-verbal
-    exclamations), which only ever errs toward leaving a hit muted, never toward wrongly
-    unmuting a real one."""
+find_spans() calls this for two kinds of hit, confirmed 2026-11-19: (a) the "true gap"
+    population - a file with no usable subtitle of its own, no sibling edition with a CC track,
+    and (by the time a caller reaches this) no OpenSubtitles/SubDL match either, where a hit was
+    previously excluded purely on detect_repeated_segments' own say-so with no corroboration of
+    any kind; and (b) a CC-word-absence exclusion specifically, even on a file that otherwise
+    HAS a usable subtitle - that evidence is weaker than CC-absence (one subtitle author's cue
+    not containing a word isn't the same as proof nothing was said at all). See
+    _SECOND_OPINION_MODEL's comment above for the validation data and its one known blind spot
+    (screamed/non-verbal exclamations), which only ever errs toward leaving a hit muted, never
+    toward wrongly unmuting a real one."""
     if not hits:
         return
     ffmpeg = tools.get("ffmpeg")
@@ -1224,16 +1226,30 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
         except Exception as exc:
             print(f"  [warn] sibling-edition CC check failed ({exc!r})", file=sys.stderr)
 
-    # Last resort for a file with NO corroborating evidence at all - no own subtitle, no sibling
-    # edition's CC. Every hit still in `hallucinated` at this point is excluded purely on
-    # detect_repeated_segments' own say-so (repetition + a confidence gap against this same
-    # ASR run), with nothing independent checking it. See second_opinion_rescue.
-    if hallucinated and sub_units is None and sibling_sub_units is None \
-            and media is not None and tools is not None and tmp is not None:
+    # Second-ASR-checkpoint cross-check (see second_opinion_rescue). Two trigger conditions,
+    # confirmed 2026-11-19:
+    # (a) a file with NO corroborating evidence at all - no own subtitle, no sibling edition's
+    #     CC - where every remaining hit is excluded purely on detect_repeated_segments' own
+    #     say-so (repetition + a confidence gap against this SAME ASR run), with nothing
+    #     independent checking it;
+    # (b) a CC-WORD-absence exclusion specifically (own-file or via a sibling edition),
+    #     REGARDLESS of whether (a) applies - that evidence is structurally weaker than
+    #     CC-absence ("nothing happened here at all"): it only means ONE subtitle author's cue
+    #     near the hit didn't happen to contain this exact word, a single, sometimes-incomplete
+    #     source (subtitles routinely omit or paraphrase incidental swearing), not independent
+    #     proof nothing was said.
+    # _KNOWN_HALLUCINATION_PHRASES hits are deliberately NOT widened the same way - that
+    # population already has its own extensive cross-library validation (zero counter-examples
+    # found across a full-library sweep), so a mandatory extra ASR pass there would mostly just
+    # add GPU cost for very little marginal safety gain.
+    _weak_cc_reasons = ("no-cc-word-match", "no-cc-word-match-via-sibling-edition")
+    second_opinion_candidates = [h for h in hallucinated
+                                 if not h["suspected_hallucination"].get("rescued_by_subtitle")
+                                 and (h["suspected_hallucination"]["reason"] in _weak_cc_reasons
+                                      or (sub_units is None and sibling_sub_units is None))]
+    if second_opinion_candidates and media is not None and tools is not None and tmp is not None:
         try:
-            candidates = [h for h in hallucinated
-                         if not h["suspected_hallucination"].get("rescued_by_subtitle")]
-            second_opinion_rescue(candidates, media, tools, tmp)
+            second_opinion_rescue(second_opinion_candidates, media, tools, tmp)
             hallucinated = [h for h in hallucinated
                            if not h["suspected_hallucination"].get("rescued_by_subtitle")]
         except Exception as exc:
