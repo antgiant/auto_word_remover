@@ -3059,7 +3059,8 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
           clean_srt: Path | None, chosen_subs: dict | None,
           audio_suffix: str | None = None, audio_default: bool = True,
           exclude_audio_ids=(), exclude_subs_ids=(),
-          extra_srt: tuple[Path, dict] | None = None) -> None:
+          extra_srt: tuple[Path, dict] | None = None,
+          place_before_source: bool = False) -> None:
     """`tracks` must already have any stale own-output track (see
     is_own_output_track) filtered OUT - it drives both the default-flag
     loop below and --track-order, so a stale track left in would still get
@@ -3078,7 +3079,18 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
     already passes through the container untouched), neither of those exists
     as a track in the source file at all, so their "original" (uncensored,
     resynced) counterpart has to be muxed in as a new track too, not just
-    its "(Cleaned)" one."""
+    its "(Cleaned)" one.
+
+    `place_before_source`, when `audio_default` is False, puts the new track
+    immediately before `chosen_audio`'s own position in the track order
+    instead of the pre-existing "(Secondary Audio)" no-narration-variant's
+    fixed second-slot placement below - see main()'s call site: set when
+    `chosen_audio` ISN'T the file's primary/default source track (a
+    commentary or descriptive-audio clean, say), so the new track lands
+    logically next to the thing it was cleaned FROM rather than at the front
+    of the whole audio stack (misleadingly presenting it as if it were the
+    primary audio) or wherever the no-narration-variant's own placement rule
+    would otherwise put it."""
     suffix = cfg.track_name_suffix if audio_suffix is None else audio_suffix
     a_lang = chosen_audio["properties"].get("language") or "und"
     a_name = clean_label(chosen_audio, suffix)
@@ -3181,6 +3193,18 @@ def remux(mkvmerge: str, media: Path, tracks: list, cfg: Config, out_mkv: Path,
         order += [f"0:{t['id']}" for t in orig_audio if t["id"] not in no_narr_ids]
     elif audio_default:
         order += [audio_ref] + [f"0:{t['id']}" for t in orig_audio]
+    elif place_before_source and any(t["id"] == chosen_audio["id"] for t in orig_audio):
+        # a non-default new track for a source track that ISN'T the file's primary/default audio
+        # (a commentary or descriptive-audio clean, say) - slot it in immediately BEFORE the
+        # original source track it was built from, so it reads as "the cleaned version of THIS
+        # track" in a player's track list, not as if it were the primary audio (which putting it
+        # first, like the audio_default branch above, would imply) and not at the no-narration
+        # variant's own fixed second-slot position below (which doesn't apply here - see
+        # place_before_source's docstring).
+        for t in orig_audio:
+            if t["id"] == chosen_audio["id"]:
+                order.append(audio_ref)
+            order.append(f"0:{t['id']}")
     elif orig_audio:
         # non-default new track (the "(Secondary Audio)" no-narration variant,
         # its first build) - whatever's currently the first audio track (the
@@ -4226,6 +4250,7 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             remux(mkvmerge, media, tracks, cfg, build_path,
                   clean_audio, chosen, clean_srt, chosen_subs,
+                  audio_default=is_primary_audio, place_before_source=not is_primary_audio,
                   exclude_audio_ids=stale_audio_ids, exclude_subs_ids=stale_subs_ids,
                   extra_srt=resynced_extra_srt)
             if args.keep_temp:

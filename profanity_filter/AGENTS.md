@@ -1082,6 +1082,37 @@ the commentary track by name, cleans it into its own `Commentary (Cleaned)`
 track with its own tagged `.bleeps.json` sidecar, and never touches the
 existing dialogue clean.
 
+### Track placement for a non-primary source clean (2026-11-19)
+
+Before this, `remux()` always did two things unconditionally for the
+`mute`/`bleep`/`replace` call site: made the new `(Cleaned)` track the
+container's default audio (clearing every other audio track's default
+flag), and put it at the very FRONT of the audio stack - `order +=
+[audio_ref] + [...every original audio track...]`. Correct for the normal
+case (cleaning the primary dialogue track), actively wrong for a commentary/
+descriptive-audio clean: it would silently become the new default playback
+audio, displacing the real dialogue track, and would sit first in the track
+list as if it WERE the primary audio - not next to the commentary track it
+was actually built from.
+
+Fixed in `main()` by passing `audio_default=is_primary_audio` (the same flag
+`report_tag` above already computes - `True` only when `chosen` is the exact
+track `choose_audio(tracks, "default")` would pick) and
+`place_before_source=not is_primary_audio` into `remux()`. A new
+`place_before_source` branch in the `--track-order` construction (between
+the existing `audio_default`/no-narration-variant branches) walks
+`orig_audio` and inserts `audio_ref` immediately before the entry matching
+`chosen_audio["id"]`, instead of either the front-of-stack placement above
+or the no-narration-variant's own fixed second-slot rule (which is a
+different feature with a different reason for its placement - this new
+branch is checked separately so it never interferes with that one).
+Verified via a monkeypatched `run_mkvmerge` before deploy: cleaning the
+primary track still produces `video, new-track(default), orig-dialogue,
+orig-commentary, orig-spanish`; cleaning the commentary track instead
+produces `video, orig-dialogue, new-commentary-track(non-default),
+orig-commentary, orig-spanish` - landing immediately before its own source,
+original dialogue default flag left untouched.
+
 Scoped to `mute`/`bleep`/`replace` only, matching what the user actually
 asked for ("only if that would result in a different set of words"):
 `dialog` doesn't use wordlists at all (it strips ALL dialogue, so there's
