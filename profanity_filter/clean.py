@@ -974,6 +974,110 @@ def _find_usable_sub_units(cand_media: Path, tools: dict, tmp: Path):
     return None, None
 
 
+_SECOND_OPINION_MODEL = "large-v2"   # confirmed 2026-11-17 already cached locally alongside the
+#   primary large-v3-turbo checkpoint used for the real transcript - no download needed. A
+#   deliberately DIFFERENT trained checkpoint, not a re-run of the same one, so a hallucination
+#   pattern baked into one checkpoint's weights has a real chance of not reproducing in the
+#   other. Validated against 10 ground-truth cases (7 confirmed-fake repeated-phrase
+#   hallucinations across Elemental (2023)'s two editions, 1 confirmed-real "fuck" in Big
+#   (1988), 1 confirmed-fake "fuck" in the same file, 1 confirmed-fake "fuck" in Balto (1995)):
+#   large-v2 failed to reproduce the matched word for every one of the 8 fake cases but one, and
+#   DID reproduce it for the one real case. The one exception - Balto's "Fuck! Holy shit.",
+#   independently reproduced by BOTH checkpoints during a wordless drowning-rescue scene with no
+#   corresponding line in that film's own OpenSubtitles track - shows the two checkpoints are NOT
+#   fully independent for screamed/non-verbal exclamations specifically (Whisper's architecture-
+#   wide bias toward decoding intense wordless vocalizations as shock profanity shows up in both
+#   checkpoints, not just one). That failure mode only ever pushes this function toward NOT
+#   rescuing (leaving a hit muted) when it's wrong about there being a real line there - the safe
+#   direction per this project's own priority that missing real profanity is worse than an
+#   unnecessary mute. It was never observed, across any of the 10 cases, to wrongly suppress a
+#   genuinely real word.
+_SECOND_OPINION_WINDOW_S = 60.0   # wide enough for the second pass to have real context - an
+#   earlier attempt used a 5s VOCAL-ISOLATED clip and failed (too short, separator artifacts
+#   mangled the audio). This re-transcribes a wide window of the RAW MIXED track instead,
+#   specifically to avoid stacking a second source of artifacts on top of a second model.
+
+
+def second_opinion_rescue(hits: list[dict], media: Path, tools: dict, tmp: Path) -> None:
+    """Mutates `hits` in place. For each still-suspected-hallucination hit, re-transcribes a
+    wide raw-mixed-audio window around its own timestamp with a DIFFERENT WhisperX checkpoint
+    (_SECOND_OPINION_MODEL) and rescues it - same rescued_by_subtitle flag rescue_via_subtitle
+    uses, since find_spans treats them identically for reporting/filtering purposes - if that
+    independent pass still contains the matched word.
+
+    This is the last-resort check for the "true gap" population: a file with no usable
+    subtitle of its own, no sibling edition with a CC track, and (by the time a caller reaches
+    this) no OpenSubtitles match either. Until this existed, a hit in that position was excluded
+    purely on detect_repeated_segments' own say-so - repetition plus a confidence gap against
+    that SAME ASR run - with no corroboration of any kind. See _SECOND_OPINION_MODEL's comment
+    above for the validation data and its one known blind spot (screamed/non-verbal
+    exclamations), which only ever errs toward leaving a hit muted, never toward wrongly
+    unmuting a real one."""
+    if not hits:
+        return
+    ffmpeg = tools.get("ffmpeg")
+    mkvmerge = tools.get("mkvmerge")
+    if not ffmpeg or not mkvmerge:
+        return
+    try:
+        tracks_all = run_json([mkvmerge, "-J", str(media)])["tracks"]
+        chosen, _ = choose_audio(tracks_all, "default")
+        audio = [t for t in tracks_all if t["type"] == "audio"]
+        audio_pos = audio.index(chosen)
+    except Exception as exc:
+        print(f"  [warn] second-opinion rescue: couldn't pick an audio track ({exc!r}) - "
+              f"skipping", file=sys.stderr)
+        return
+    py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
+    script = VOICE_TO_TEXT / "transcribe.py"
+    if not py.is_file() or not script.is_file():
+        return
+
+    import flag_language
+    rescued = []
+    for h in hits:
+        t = h.get("time")
+        if t is None:
+            continue
+        word = flag_language._norm_tok(h["match"].split()[-1])
+        if not word:
+            continue
+        start = max(0.0, t - _SECOND_OPINION_WINDOW_S / 2)
+        clip = tmp / f"second_opinion_{id(h)}.wav"
+        clip_out = tmp / f"second_opinion_{id(h)}_out"
+        try:
+            run([ffmpeg, "-hide_banner", "-y", "-i", str(media), "-ss", f"{start:.3f}",
+                 "-t", f"{_SECOND_OPINION_WINDOW_S:.3f}", "-map", f"0:a:{audio_pos}",
+                 "-ar", "16000", "-ac", "1", str(clip)], capture_output=True)
+            clip_out.mkdir(exist_ok=True)
+            run([str(py), "-X", "utf8", str(script), str(clip), "--model", _SECOND_OPINION_MODEL,
+                 "--no-diarize", "--formats", "json", "--output-dir", str(clip_out),
+                 "--overwrite", "--quiet"], cwd=str(VOICE_TO_TEXT), capture_output=True, text=True)
+            out_json = clip_out / (clip.stem + ".json")
+            if not out_json.is_file():
+                continue
+            data = json.loads(out_json.read_text(encoding="utf-8"))
+            tokens = [flag_language._norm_tok(tok)
+                     for seg in data.get("segments", []) for tok in seg["text"].split()]
+            if word in tokens:
+                h["suspected_hallucination"]["rescued_by_subtitle"] = True
+                h["suspected_hallucination"]["rescued_by_second_opinion"] = True
+                rescued.append(h)
+        except Exception as exc:
+            print(f"  [warn] second-opinion rescue failed for {h.get('time_hms')} ({exc!r}) - "
+                  f"leaving it excluded", file=sys.stderr)
+        finally:
+            clip.unlink(missing_ok=True)
+            shutil.rmtree(clip_out, ignore_errors=True)
+    if rescued:
+        print(f"  [note] {len(rescued)} hit(s) RESCUED by an independent second-ASR-checkpoint "
+              f"pass ({_SECOND_OPINION_MODEL}) over a wider raw-audio window - that pass still "
+              f"found the matched word with no subtitle of any kind available to check it "
+              f"against (see second_opinion_rescue):")
+        for h in rescued:
+            print(f"    {h['time_hms']} {h['match']!r}")
+
+
 def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = None,
                extra_hits: list[dict] | None = None, vocals_hits: list[dict] | None = None,
                media: Path | None = None, tools: dict | None = None, tmp: Path | None = None):
@@ -1020,10 +1124,43 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
             print(f"  [warn] no-cc-coverage check failed ({exc!r})", file=sys.stderr)
 
     own_cc_is_full = sub_units is not None and flag_language._is_full_cc(sub_units)
+    sibling_sub_units = None
     if not own_cc_is_full and media is not None and tools is not None and tmp is not None:
         try:
             sibling_sub_units, cutoff, own_segs, sibling_segs = find_sibling_edition_cc(media, js, tools, tmp)
             if sibling_sub_units is not None:
+                # A sibling edition's CC track has, until now, only ever been used to find MORE
+                # hallucinations (exclude_via_cc_absence/_word_absence below) - never to RESCUE a
+                # hit detect_repeated_segments already flagged, even though it's exactly the same
+                # kind of independent, non-ASR-generated evidence rescue_via_subtitle already
+                # trusts for an OWN subtitle. A file with no usable subtitle of its own (sub_units
+                # is None, so rescue_via_subtitle up top never ran at all) but WITH a sibling
+                # edition is exactly the gap that leaves a real repeated line at risk of being
+                # wrongly excluded with zero corroboration. Confirmed 2026-11-18: this costs
+                # nothing extra since find_sibling_edition_cc was already being called.
+                not_yet_rescued = [h for h in hallucinated
+                                   if not h["suspected_hallucination"].get("rescued_by_subtitle")]
+                rescue_in_prefix = [h for h in not_yet_rescued
+                                   if h.get("time") is not None and h["time"] <= cutoff]
+                flag_language.rescue_via_subtitle(rescue_in_prefix, sibling_sub_units)
+                rescue_past_prefix = [h for h in not_yet_rescued
+                                      if h.get("time") is not None and h["time"] > cutoff
+                                      and isinstance(h.get("locator"), str)
+                                      and h["locator"].startswith("segment ")]
+                for h in rescue_past_prefix:
+                    target_idx = int(h["locator"].split()[1])
+                    offset = flag_language.find_local_alignment_offset(
+                        sibling_segs, own_segs, target_idx)
+                    if offset is None:
+                        continue
+                    shifted = dict(h, time=h["time"] + offset,
+                                  suspected_hallucination=dict(h["suspected_hallucination"]))
+                    flag_language.rescue_via_subtitle([shifted], sibling_sub_units)
+                    if shifted["suspected_hallucination"].get("rescued_by_subtitle"):
+                        h["suspected_hallucination"]["rescued_by_subtitle"] = True
+                hallucinated = [h for h in hallucinated
+                               if not h["suspected_hallucination"].get("rescued_by_subtitle")]
+
                 new_sibling_excluded = []
 
                 in_prefix = [h for h in hits
@@ -1070,15 +1207,41 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
         except Exception as exc:
             print(f"  [warn] sibling-edition CC check failed ({exc!r})", file=sys.stderr)
 
+    # Last resort for a file with NO corroborating evidence at all - no own subtitle, no sibling
+    # edition's CC. Every hit still in `hallucinated` at this point is excluded purely on
+    # detect_repeated_segments' own say-so (repetition + a confidence gap against this same
+    # ASR run), with nothing independent checking it. See second_opinion_rescue.
+    if hallucinated and sub_units is None and sibling_sub_units is None \
+            and media is not None and tools is not None and tmp is not None:
+        try:
+            candidates = [h for h in hallucinated
+                         if not h["suspected_hallucination"].get("rescued_by_subtitle")]
+            second_opinion_rescue(candidates, media, tools, tmp)
+            hallucinated = [h for h in hallucinated
+                           if not h["suspected_hallucination"].get("rescued_by_subtitle")]
+        except Exception as exc:
+            print(f"  [warn] second-opinion rescue check failed ({exc!r})", file=sys.stderr)
+
     if hallucinated:
         rescued = [h for h in hits if h.get("suspected_hallucination", {}).get("rescued_by_subtitle")]
         still_bad_ids = {id(h) for h in hallucinated}
         hits = [h for h in hits if id(h) not in still_bad_ids]
-        if rescued:
-            print(f"  [note] {len(rescued)} suspected-hallucination hit(s) RESCUED - an "
+        rescued_cc = [h for h in rescued
+                     if not h["suspected_hallucination"].get("rescued_by_second_opinion")]
+        rescued_second_opinion = [h for h in rescued
+                                  if h["suspected_hallucination"].get("rescued_by_second_opinion")]
+        if rescued_cc:
+            print(f"  [note] {len(rescued_cc)} suspected-hallucination hit(s) RESCUED - an "
                   f"independent subtitle/CC cue confirms the word was actually said near that "
                   f"timestamp, overriding the repetition/confidence suspicion:")
-            for h in rescued:
+            for h in rescued_cc:
+                print(f"    {h['time_hms']} {h['match']!r}")
+        if rescued_second_opinion:
+            print(f"  [note] {len(rescued_second_opinion)} suspected-hallucination hit(s) "
+                  f"RESCUED by an independent second-ASR-checkpoint pass (see "
+                  f"second_opinion_rescue) - no subtitle was available at all, but a different "
+                  f"WhisperX checkpoint still heard the matched word in a wide raw-audio window:")
+            for h in rescued_second_opinion:
                 print(f"    {h['time_hms']} {h['match']!r}")
         _cc_reasons = ("no-cc-coverage", "no-cc-coverage-via-sibling-edition",
                       "no-cc-word-match", "no-cc-word-match-via-sibling-edition")
