@@ -1,0 +1,32 @@
+# blue(y)_pool.txt  --  a flat, UN-mapped bucket of replacement words/
+# phrases for --method replace's pool mode (--replace-pool)
+#
+# One entry per line. '#' starts a comment. Unlike replacements.txt (mapped
+# mode), there is NO "surface => replacement" relationship here at all -
+# every flagged occurrence in the file, regardless of which word it
+# actually was, draws a few candidates at random from this whole list (see
+# word_replace.select_pool_candidates). That's the point of pool mode: a
+# listener can't work backward from "biscuits" to "that was the f-word"
+# the way they could if biscuits only ever replaced one specific word.
+#
+# User-supplied list (2026-10-21) of Bluey's own family-friendly
+# exclamations/euphemisms. Add more of your own as you find them.
+
+Biscuits
+Duck Cake
+Cheese and Crackers
+Beans on Toast
+Cheese and Jam
+Boogerbeans
+Fluffy
+Cowboy Hat
+Chunky Chimp
+Dunny
+Unsatisfactory
+Wackadoo
+Trifficult
+Chickenrat
+Longdog
+Purple Underpants
+Didums
+Baking brownies

@@ -20,11 +20,14 @@ End-to-end from a single media file:
                  usable one wins: an embedded text/CC608 track, then a
                  sidecar subtitle FILE next to the input (e.g. "Movie.srt"),
                  then OCR'd from an embedded PGS/VobSub bitmap track, then
-                 (last resort) fetched from OpenSubtitles. A sidecar file is
-                 treated exactly like an OpenSubtitles download, not like an
-                 embedded track: it did not necessarily come from THIS
+                 (last resort) fetched from OpenSubtitles, then (if THAT
+                 didn't pan out either - no key, no match, quota exhausted,
+                 or a resync-validation rejection) SubDL, a second,
+                 independent subtitle source (see subdl.py). A sidecar file
+                 or either online source is treated the same way, not like
+                 an embedded track: it did not necessarily come from THIS
                  exact cut of the file, so its own timestamps are never
-                 trusted either - both are realigned to the transcript's own
+                 trusted either - all are realigned to the transcript's own
                  word timings via flag_language.resync_units_to_transcript
                  before use. See AGENTS.md.
 
@@ -152,6 +155,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -253,6 +257,8 @@ OPENSUBS_TRACK_SUFFIX = " (OpenSubtitles)"  # the extra uncensored track remux()
 #                                             (is_own_output_track) so it's replaced, not duplicated
 SIDECAR_TRACK_SUFFIX = " (Sidecar)"  # same idea as OPENSUBS_TRACK_SUFFIX, for a sidecar subtitle
 #                                       file next to the input - see find_sidecar_subtitle/main()
+SUBDL_TRACK_SUFFIX = " (SubDL)"  # same idea as OPENSUBS_TRACK_SUFFIX, for a subdl.com-sourced
+#                                   subtitle - see subdl.py/main()
 
 SIDECAR_SUB_EXTS = (".srt", ".vtt", ".ass", ".ssa")  # ffmpeg converts .ass/.ssa to plain SRT text
 #                                                        before resyncing; .srt/.vtt parse as-is
@@ -375,6 +381,18 @@ class Config:
     opensubtitles_query: str = ""      # override the title auto-guessed from the filename
     opensubtitles_id: str = ""         # exact OpenSubtitles file_id to download - bypasses search
 
+    subdl: bool = True                 # SECOND, independent subtitle source (subdl.com, see
+    #                                    subdl.py) - tried whenever OpenSubtitles didn't produce a
+    #                                    usable result (no key, no match, quota exhausted, or its
+    #                                    own resync validation rejected a wrong-film match), not
+    #                                    only when OpenSubtitles is unconfigured. Needs its own
+    #                                    free API key - subdl.py's docstring / sign up at
+    #                                    https://subdl.com. Same "never trust its own timestamps"
+    #                                    posture as opensubtitles above.
+    subdl_lang: str = "en"             # 2-letter language to search/download ("" = fall back to
+    #                                    opensubtitles_lang, then the chosen audio track's language)
+    subdl_query: str = ""              # override the title auto-guessed from the filename
+
     faith_detection: bool = True        # TMDB keyword/genre lookup (tmdb.py) to detect an overtly
     #                                    Christian / faith-based film (movie OR TV) - when found,
     #                                    swaps "irreverence"/"profanity" for the stricter
@@ -436,7 +454,59 @@ class Config:
     #                                    default (clean.py's own detection never needs speaker labels,
     #                                    and diarization is a real extra GPU cost); a caller building a
     #                                    generally-useful transcript library (e.g. the --stt-only sweep)
-    #                                    can turn it on
+    #                                    can turn it on. --method replace forces this on regardless -
+    #                                    see main().
+    replace_num_speakers: int | None = None     # "replace" only: hint the exact speaker count to
+    #                                    voice_to_text's diarization (forced on for this method -
+    #                                    see main()) when you already know it; None = auto-detect
+    replace_min_speakers: int | None = None     # "replace" only: same idea, a lower bound
+    replace_max_speakers: int | None = None     # "replace" only: same idea, an upper bound
+
+    # "replace" only: swap a flagged word/phrase for a different, non-profane
+    # one instead of removing it - see wordlists/replacements.txt and
+    # word_replace.py. Falls back to the normal mute behaviour, per flagged
+    # occurrence, whenever a step below can't produce a confident result.
+    replace_wordlist: str = str(HERE / "wordlists" / "replacements.txt")  # hand-authored word -> replacement(s) map
+    replace_pool: str | None = None        # path to a FLAT replacement pool (one word/phrase per
+    #                                    line, no "=>" mapping) - when set, overrides replace_wordlist
+    #                                    entirely and switches to pool mode: every flagged occurrence,
+    #                                    regardless of which word it actually was, gets a few candidates
+    #                                    drawn RANDOMLY (deterministically per hit, not per mapped word)
+    #                                    from this one shared bucket. Exists so a listener can't infer
+    #                                    anything about the original word from the replacement - mapped
+    #                                    mode (replace_wordlist) always has SOME fixed word->word
+    #                                    correspondence even if you pick silly replacements, since the
+    #                                    same source word always draws from the same candidate list.
+    #                                    See wordlists/blue(y)_pool.txt and AGENTS.md.
+    replace_max_word_candidates: int = 2   # try at most this many replacement words per flagged
+    #                                    occurrence (in replacements.txt's own priority order) before
+    #                                    giving up and muting it
+    replace_min_donor_isolation_s: float = 0.12   # a candidate donor clip (a real recorded instance
+    #                                    of the replacement word elsewhere in this same file) shorter
+    #                                    than this is too likely to be alignment noise to trust
+    replace_donor_search_window_s: float = 0.0    # restrict donor search to within this many seconds
+    #                                    of the flagged occurrence; 0 (default) searches the whole file
+    replace_min_speaker_audio_s: float = 30.0     # need at least this much isolated vocal audio for
+    #                                    a given speaker before attempting to train a voice-conversion
+    #                                    model for them - below this, synthesis is skipped for that
+    #                                    speaker's hits (falls back to donor-only / mute)
+    replace_prosody: bool = True          # transplant the original word's pitch/energy contour onto
+    #                                    the replacement audio so emotional delivery isn't flattened -
+    #                                    a human opt-out (like center_mute), not an automatic fallback
+    replace_scene_blend: bool = True      # loudness/EQ-match the replacement audio to its neighbours
+    #                                    and apply a rough reverb-decay approximation so it doesn't
+    #                                    sit dry against the scene's own ambience
+    replace_score_model: str = "small"    # WhisperX model size used to re-transcribe and score each
+    #                                    rendered candidate - deliberately smaller/cheaper than the
+    #                                    main transcript's own model, this only needs rough
+    #                                    intelligibility, not production accuracy
+    replace_quality_threshold: float = 0.55   # a candidate scoring below this (0-1, intelligibility +
+    #                                    duration fit) is rejected; if every candidate for a flagged
+    #                                    occurrence is rejected, that occurrence is muted instead
+    retrain_voice_model: bool = False     # force-retrain a speaker's cached voice-conversion model
+    #                                    even if a cached one already exists - separate from
+    #                                    --retranscribe since training cost is a different thing to
+    #                                    force
 
 
 def load_config(path: Path) -> Config:
@@ -620,16 +690,38 @@ def _transcript_is_aligned(js: Path) -> bool:
     return bool((data.get("_meta") or {}).get("aligned"))
 
 
+def _transcript_has_speakers(js: Path) -> bool:
+    """True only if `js` carries real diarized speaker labels on at least
+    one segment - parallel to _transcript_is_aligned(), same reasoning: a
+    cached "<name>.json" can be perfectly aligned but have been produced by
+    an earlier, non-diarized run (the common case before --method replace
+    existed), and silently reusing it would skip speaker labeling entirely
+    for donor-word matching / per-speaker voice models (see word_replace.py).
+    Used by ensure_transcript()/ensure_vocals_transcript() to gate cache
+    reuse specifically when cfg.transcript_diarize is True (forced on for
+    --method replace - see main())."""
+    try:
+        data = json.loads(js.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return any(seg.get("speaker") for seg in (data.get("segments") or []))
+
+
 def ensure_transcript(media: Path, cfg: Config, formats: str = "json",
                       diarize: bool = False) -> Path:
     js = media.with_suffix(".json")
     if js.is_file() and not cfg.retranscribe:
-        if _transcript_is_aligned(js):
+        if _transcript_is_aligned(js) and (not diarize or _transcript_has_speakers(js)):
             print(f"  transcript: {js.name} (reusing)")
             return js
-        print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript "
-              f"(_meta.aligned missing/false) - word timings would be too coarse to trust; "
-              f"re-transcribing instead of reusing it", file=sys.stderr)
+        if _transcript_is_aligned(js):
+            print(f"  [warn] {js.name} exists and is aligned, but carries no diarized speaker "
+                  f"labels and diarization is required this run - re-transcribing with "
+                  f"--diarize instead of reusing it", file=sys.stderr)
+        else:
+            print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript "
+                  f"(_meta.aligned missing/false) - word timings would be too coarse to trust; "
+                  f"re-transcribing instead of reusing it", file=sys.stderr)
     py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
     script = VOICE_TO_TEXT / "transcribe.py"
     if not py.is_file() or not script.is_file():
@@ -642,12 +734,23 @@ def ensure_transcript(media: Path, cfg: Config, formats: str = "json",
     # whatever stale/unaligned file is already sitting there instead of redoing the work.
     cmd = [str(py), "-X", "utf8", str(script), str(media), "--formats", formats, "--overwrite"]
     cmd.append("--diarize" if diarize else "--no-diarize")
+    if diarize:
+        if cfg.replace_num_speakers is not None:
+            cmd += ["--num-speakers", str(cfg.replace_num_speakers)]
+        if cfg.replace_min_speakers is not None:
+            cmd += ["--min-speakers", str(cfg.replace_min_speakers)]
+        if cfg.replace_max_speakers is not None:
+            cmd += ["--max-speakers", str(cfg.replace_max_speakers)]
     run(cmd, cwd=str(VOICE_TO_TEXT))
     if not js.is_file():
         raise SystemExit("[error] transcription produced no .json")
     if not _transcript_is_aligned(js):
         print(f"  [warn] {js.name}: alignment did not succeed even on this fresh pass - "
               f"word timings fall back to coarser segment-level times", file=sys.stderr)
+    if diarize and not _transcript_has_speakers(js):
+        print(f"  [warn] {js.name}: diarization produced no speaker labels on this pass - "
+              f"donor/voice-model speaker matching will fall back to its undiarized heuristic",
+              file=sys.stderr)
     return js
 
 
@@ -739,14 +842,473 @@ def _dedupe_vocals_hits(primary_hits: list[dict], vocals_hits: list[dict],
     return kept
 
 
+_SIBLING_VIDEO_EXTS = (".mkv", ".mp4", ".m4v", ".avi")
+
+
+def find_sibling_edition_cc(media: Path, js: Path, tools: dict, tmp: Path):
+    """Looks for ANOTHER edition/cut of the same title in `media`'s own directory (Plex-style
+    "{edition-X}" naming is common in this library, but this only relies on having its OWN
+    cached transcript next to it, not on parsing the naming convention) that (a) shares a
+    text-AND-timing-identical PREFIX with this file's own transcript (see
+    find_shared_prefix_cutoff) and (b) has a full SDH-style CC track of its own (see
+    flag_language._is_full_cc) that THIS file lacks.
+
+    Confirmed 2026-11-18: Elemental (2023) {edition-Wooley Cut} has no usable CC of its own
+    (its only subtitle is a dialogue-only, fan-resynced OpenSubtitles track), but shares an
+    exact prefix with the main cut through t=633s (the entire Disney+Pixar logo sequence and
+    the film's first ~10.5 minutes) - the main cut's own official CC track, confirmed full-SDH,
+    is just as valid evidence for the Wooley Cut edition's own hits in that same range.
+
+    Returns (sibling_sub_units, cutoff_s, own_segs, sibling_segs) for the first sibling found
+    that qualifies, or (None, None, None, None) if no sibling helps. `own_segs`/`sibling_segs`
+    are returned alongside so a caller can ALSO try flag_language.find_local_alignment_offset
+    per-hit for anything past cutoff_s, where the two cuts have diverged but short stretches
+    may still be genuinely unedited, just shifted - see that function's own docstring for why
+    this needs the full segment lists, not just the cutoff. Only ever used to ADD corroborating
+    absence-of-coverage evidence (see flag_language.exclude_via_cc_absence /
+    exclude_via_cc_word_absence) - never to protect/confirm a hit."""
+    import flag_language
+    try:
+        own_segs = json.loads(js.read_text(encoding="utf-8-sig")).get("segments")
+    except (OSError, json.JSONDecodeError):
+        return None, None, None, None
+    if not own_segs:
+        return None, None, None, None
+
+    for cand_json in media.parent.glob("*.json"):
+        if cand_json == js or cand_json.name.endswith((".words.json", ".speakers.json", ".vocals.json")):
+            continue
+        cand_media = next((cand_json.with_suffix(ext) for ext in _SIBLING_VIDEO_EXTS
+                           if cand_json.with_suffix(ext).is_file()), None)
+        if cand_media is None:
+            continue
+        try:
+            cand_segs = json.loads(cand_json.read_text(encoding="utf-8-sig")).get("segments")
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not cand_segs:
+            continue
+        cutoff = flag_language.find_shared_prefix_cutoff(own_segs, cand_segs) or 0.0
+        if cutoff < 5.0 and not flag_language.has_substantial_overlap(own_segs, cand_segs):
+            # No leading-prefix match AND no substantial overlap anywhere else either - not
+            # worth the OCR cost below on what's probably an unrelated file that just happens
+            # to share this directory. A real prefix match (cutoff >= 5.0) always proceeds
+            # even with 0 further overlap; a sibling that's merely SHIFTED throughout (two
+            # independent rips/encodes of the same film, not a true shared-master re-edit -
+            # confirmed 2026-11-18 on Apollo 13 (1995) vs. Apollo 13 (1995) (HD), whose very
+            # first segments don't even line up by list index) still needs this overlap check
+            # to pass, since cutoff alone would be 0 for it.
+            continue
+        sub_units, source_desc = _find_usable_sub_units(cand_media, tools, tmp)
+        if sub_units is None:
+            continue
+        if flag_language._is_full_cc(sub_units) or flag_language._is_substantial_dialogue_track(sub_units):
+            print(f"  [note] borrowing {cand_media.name!r}'s {source_desc} as a cross-reference "
+                  f"for the t<={cutoff:.0f}s window this file's own transcript matches it "
+                  f"exactly - see flag_language.find_shared_prefix_cutoff")
+            return sub_units, cutoff, own_segs, cand_segs
+    return None, None, None, None
+
+
+def _find_usable_sub_units(cand_media: Path, tools: dict, tmp: Path):
+    """The first usable (full-CC or substantial-dialogue - see flag_language._is_full_cc /
+    _is_substantial_dialogue_track) English subtitle source for `cand_media`, trying plain
+    text (SubRip) first, then falling back to OCR'ing a PGS (Blu-ray) or VobSub (DVD) bitmap
+    track with Tesseract - the same pgs_ocr.py/vobsub_ocr.py machinery main() already uses for
+    a file's OWN subtitle discovery (see Config.pgs_ocr/vobsub_ocr), just reused here for a
+    SIBLING edition's track instead. Confirmed needed, not hypothetical: Apollo 13 (1995)
+    (HD).mkv's only subtitle track is already "(Cleaned)" with no original anywhere on the
+    file itself, but its own sibling rip, "Apollo 13 (1995).mkv", carries an uncleaned English
+    PGS track - OCR is the only way to use it.
+
+    OCR output is cached next to `cand_media` (same naming convention as main()'s own OCR
+    calls) so repeated probes - e.g. from several different sibling editions pointing back at
+    the same candidate - don't pay to re-OCR it each time.
+
+    Returns (sub_units, description) or (None, None) if nothing usable is found. Never raises -
+    a missing Tesseract install, a corrupt bitmap track, or any other failure in this OPTIONAL
+    cross-reference path just means "nothing found", not a crashed clean.py run."""
+    import flag_language
+    try:
+        tracks_all = run_json([tools["mkvmerge"], "-J", str(cand_media)])["tracks"]
+    except Exception:
+        return None, None
+
+    sub_track = next((t for t in tracks_all if t["type"] == "subtitles"
+                      and t["codec"] == "SubRip/SRT"
+                      and "cleaned" not in (t["properties"].get("track_name") or "").lower()
+                      and (t["properties"].get("language") or "").lower() in ("eng", "en", "")),
+                     None)
+    if sub_track is not None:
+        cand_srt = tmp / "sibling_cc.srt"
+        try:
+            run([tools["mkvextract"], "tracks", str(cand_media), f"{sub_track['id']}:{cand_srt}"],
+                capture_output=True, text=True)
+            if cand_srt.is_file():
+                return flag_language.parse_srt(cand_srt), "text subtitle"
+        except Exception:
+            pass
+
+    tesseract_cmd = locate_tesseract()
+    if tesseract_cmd is None:
+        return None, None
+
+    pgs_track = next((t for t in tracks_all if t["type"] == "subtitles"
+                      and (t["properties"].get("codec_id") or "").upper() == "S_HDMV/PGS"
+                      and "cleaned" not in (t["properties"].get("track_name") or "").lower()
+                      and (t["properties"].get("language") or "").lower() in ("eng", "en", "")),
+                     None)
+    if pgs_track is not None:
+        try:
+            if str(HERE) not in sys.path:
+                sys.path.insert(0, str(HERE))
+            import pgs_ocr
+            cache_base = cand_media.with_name(f"{cand_media.stem}.eng.pgsocr")
+            stats = pgs_ocr.analyze_pgs_track(tools["mkvextract"], cand_media, pgs_track["id"],
+                                              cache_base, lang="eng", tesseract_cmd=tesseract_cmd)
+            if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                return flag_language.parse_srt(stats["srt_path"]), "PGS-OCR'd subtitle"
+        except Exception:
+            pass
+
+    vobsub_track = next((t for t in tracks_all if t["type"] == "subtitles"
+                         and (t["properties"].get("codec_id") or "").upper() == "S_VOBSUB"
+                         and "cleaned" not in (t["properties"].get("track_name") or "").lower()
+                         and (t["properties"].get("language") or "").lower() in ("eng", "en", "")),
+                        None)
+    if vobsub_track is not None:
+        try:
+            if str(HERE) not in sys.path:
+                sys.path.insert(0, str(HERE))
+            import vobsub_ocr
+            cache_base = cand_media.with_name(f"{cand_media.stem}.eng.vobsubocr")
+            stats = vobsub_ocr.analyze_vobsub_track(tools["mkvextract"], cand_media, vobsub_track["id"],
+                                                     cache_base, lang="eng", tesseract_cmd=tesseract_cmd)
+            if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                return flag_language.parse_srt(stats["srt_path"]), "VobSub-OCR'd subtitle"
+        except Exception:
+            pass
+
+    return None, None
+
+
+_SECOND_OPINION_MODEL = "large-v2"   # confirmed 2026-11-17 already cached locally alongside the
+#   primary large-v3-turbo checkpoint used for the real transcript - no download needed. A
+#   deliberately DIFFERENT trained checkpoint, not a re-run of the same one, so a hallucination
+#   pattern baked into one checkpoint's weights has a real chance of not reproducing in the
+#   other. Validated against 10 ground-truth cases (7 confirmed-fake repeated-phrase
+#   hallucinations across Elemental (2023)'s two editions, 1 confirmed-real "fuck" in Big
+#   (1988), 1 confirmed-fake "fuck" in the same file, 1 confirmed-fake "fuck" in Balto (1995)):
+#   large-v2 failed to reproduce the matched word for every one of the 8 fake cases but one, and
+#   DID reproduce it for the one real case. The one exception - Balto's "Fuck! Holy shit.",
+#   independently reproduced by BOTH checkpoints during a wordless drowning-rescue scene with no
+#   corresponding line in that film's own OpenSubtitles track - shows the two checkpoints are NOT
+#   fully independent for screamed/non-verbal exclamations specifically (Whisper's architecture-
+#   wide bias toward decoding intense wordless vocalizations as shock profanity shows up in both
+#   checkpoints, not just one). That failure mode only ever pushes this function toward NOT
+#   rescuing (leaving a hit muted) when it's wrong about there being a real line there - the safe
+#   direction per this project's own priority that missing real profanity is worse than an
+#   unnecessary mute. It was never observed, across any of the 10 cases, to wrongly suppress a
+#   genuinely real word.
+_SECOND_OPINION_WINDOW_S = 60.0   # wide enough for the second pass to have real context - an
+#   earlier attempt used a 5s VOCAL-ISOLATED clip and failed (too short, separator artifacts
+#   mangled the audio). This re-transcribes a wide window of the RAW MIXED track instead,
+#   specifically to avoid stacking a second source of artifacts on top of a second model.
+
+
+def second_opinion_rescue(hits: list[dict], media: Path, tools: dict, tmp: Path) -> None:
+    """Mutates `hits` in place. For each still-suspected-hallucination hit, re-transcribes a
+    wide raw-mixed-audio window around its own timestamp with a DIFFERENT WhisperX checkpoint
+    (_SECOND_OPINION_MODEL) and rescues it - same rescued_by_subtitle flag rescue_via_subtitle
+    uses, since find_spans treats them identically for reporting/filtering purposes - if that
+    independent pass still contains the matched word.
+
+find_spans() calls this for two kinds of hit, confirmed 2026-11-19: (a) the "true gap"
+    population - a file with no usable subtitle of its own, no sibling edition with a CC track,
+    and (by the time a caller reaches this) no OpenSubtitles/SubDL match either, where a hit was
+    previously excluded purely on detect_repeated_segments' own say-so with no corroboration of
+    any kind; and (b) a CC-word-absence exclusion specifically, even on a file that otherwise
+    HAS a usable subtitle - that evidence is weaker than CC-absence (one subtitle author's cue
+    not containing a word isn't the same as proof nothing was said at all). See
+    _SECOND_OPINION_MODEL's comment above for the validation data and its one known blind spot
+    (screamed/non-verbal exclamations), which only ever errs toward leaving a hit muted, never
+    toward wrongly unmuting a real one."""
+    if not hits:
+        return
+    ffmpeg = tools.get("ffmpeg")
+    mkvmerge = tools.get("mkvmerge")
+    if not ffmpeg or not mkvmerge:
+        return
+    try:
+        tracks_all = run_json([mkvmerge, "-J", str(media)])["tracks"]
+        chosen, _ = choose_audio(tracks_all, "default")
+        audio = [t for t in tracks_all if t["type"] == "audio"]
+        audio_pos = audio.index(chosen)
+    except Exception as exc:
+        print(f"  [warn] second-opinion rescue: couldn't pick an audio track ({exc!r}) - "
+              f"skipping", file=sys.stderr)
+        return
+    py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
+    script = VOICE_TO_TEXT / "transcribe.py"
+    if not py.is_file() or not script.is_file():
+        return
+
+    import flag_language
+    rescued = []
+    for h in hits:
+        t = h.get("time")
+        if t is None:
+            continue
+        word = flag_language._norm_tok(h["match"].split()[-1])
+        if not word:
+            continue
+        start = max(0.0, t - _SECOND_OPINION_WINDOW_S / 2)
+        clip = tmp / f"second_opinion_{id(h)}.wav"
+        clip_out = tmp / f"second_opinion_{id(h)}_out"
+        try:
+            run([ffmpeg, "-hide_banner", "-y", "-i", str(media), "-ss", f"{start:.3f}",
+                 "-t", f"{_SECOND_OPINION_WINDOW_S:.3f}", "-map", f"0:a:{audio_pos}",
+                 "-ar", "16000", "-ac", "1", str(clip)], capture_output=True)
+            clip_out.mkdir(exist_ok=True)
+            run([str(py), "-X", "utf8", str(script), str(clip), "--model", _SECOND_OPINION_MODEL,
+                 "--no-diarize", "--formats", "json", "--output-dir", str(clip_out),
+                 "--overwrite", "--quiet"], cwd=str(VOICE_TO_TEXT), capture_output=True, text=True)
+            out_json = clip_out / (clip.stem + ".json")
+            if not out_json.is_file():
+                continue
+            data = json.loads(out_json.read_text(encoding="utf-8"))
+            tokens = [flag_language._norm_tok(tok)
+                     for seg in data.get("segments", []) for tok in seg["text"].split()]
+            if word in tokens:
+                h["suspected_hallucination"]["rescued_by_subtitle"] = True
+                h["suspected_hallucination"]["rescued_by_second_opinion"] = True
+                rescued.append(h)
+        except Exception as exc:
+            print(f"  [warn] second-opinion rescue failed for {h.get('time_hms')} ({exc!r}) - "
+                  f"leaving it excluded", file=sys.stderr)
+        finally:
+            clip.unlink(missing_ok=True)
+            shutil.rmtree(clip_out, ignore_errors=True)
+    if rescued:
+        print(f"  [note] {len(rescued)} hit(s) RESCUED by an independent second-ASR-checkpoint "
+              f"pass ({_SECOND_OPINION_MODEL}) over a wider raw-audio window - that pass still "
+              f"found the matched word with no subtitle of any kind available to check it "
+              f"against (see second_opinion_rescue):")
+        for h in rescued:
+            print(f"    {h['time_hms']} {h['match']!r}")
+
+
 def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = None,
-               extra_hits: list[dict] | None = None, vocals_hits: list[dict] | None = None):
+               extra_hits: list[dict] | None = None, vocals_hits: list[dict] | None = None,
+               media: Path | None = None, tools: dict | None = None, tmp: Path | None = None):
     if str(HERE) not in sys.path:
         sys.path.insert(0, str(HERE))
     import flag_language
 
     cats = set(cfg.categories)
     hits, _fmt = flag_language.scan_file(js, matchers)
+
+    sub_units = None
+    if srt_path is not None and srt_path.is_file():
+        try:
+            sub_units = flag_language.parse_srt(srt_path)
+        except Exception as exc:
+            print(f"  [warn] subtitle/CC parse failed ({exc!r}) - skipping both the "
+                  f"hallucination-rescue and no-coverage checks", file=sys.stderr)
+
+    hallucinated = [h for h in hits if h.get("suspected_hallucination")]
+    if hallucinated and sub_units is not None:
+        try:
+            hallucinated = flag_language.rescue_via_subtitle(hallucinated, sub_units)
+        except Exception as exc:
+            print(f"  [warn] hallucination-rescue subtitle check failed ({exc!r}) - "
+                  f"keeping every suspected hit excluded rather than risk trusting an "
+                  f"unparsed source", file=sys.stderr)
+
+    if sub_units is not None:
+        try:
+            not_yet_flagged = [h for h in hits if not h.get("suspected_hallucination")]
+            flag_language.exclude_via_cc_absence(not_yet_flagged, sub_units)
+            flag_language.exclude_via_cc_word_absence(not_yet_flagged, sub_units)
+            new_cc_excluded = [h for h in not_yet_flagged if h.get("suspected_hallucination")]
+            if new_cc_excluded:
+                print(f"  [note] {len(new_cc_excluded)} additional hit(s) excluded - a full "
+                      f"SDH-style CC track has no cue, or no cue containing the matched word, "
+                      f"near the timestamp (see flag_language.exclude_via_cc_absence / "
+                      f"exclude_via_cc_word_absence):")
+                for h in new_cc_excluded:
+                    print(f"    {h['time_hms']} {h['match']!r} "
+                          f"({h['suspected_hallucination']['reason']})")
+                hallucinated = hallucinated + new_cc_excluded
+        except Exception as exc:
+            print(f"  [warn] no-cc-coverage check failed ({exc!r})", file=sys.stderr)
+
+    own_cc_is_full = sub_units is not None and flag_language._is_full_cc(sub_units)
+    sibling_sub_units = None
+    if not own_cc_is_full and media is not None and tools is not None and tmp is not None:
+        try:
+            sibling_sub_units, cutoff, own_segs, sibling_segs = find_sibling_edition_cc(media, js, tools, tmp)
+            if sibling_sub_units is not None:
+                # A sibling edition's CC track has, until now, only ever been used to find MORE
+                # hallucinations (exclude_via_cc_absence/_word_absence below) - never to RESCUE a
+                # hit detect_repeated_segments already flagged, even though it's exactly the same
+                # kind of independent, non-ASR-generated evidence rescue_via_subtitle already
+                # trusts for an OWN subtitle. A file with no usable subtitle of its own (sub_units
+                # is None, so rescue_via_subtitle up top never ran at all) but WITH a sibling
+                # edition is exactly the gap that leaves a real repeated line at risk of being
+                # wrongly excluded with zero corroboration. Confirmed 2026-11-18: this costs
+                # nothing extra since find_sibling_edition_cc was already being called.
+                not_yet_rescued = [h for h in hallucinated
+                                   if not h["suspected_hallucination"].get("rescued_by_subtitle")]
+                rescue_in_prefix = [h for h in not_yet_rescued
+                                   if h.get("time") is not None and h["time"] <= cutoff]
+                flag_language.rescue_via_subtitle(rescue_in_prefix, sibling_sub_units)
+                rescue_past_prefix = [h for h in not_yet_rescued
+                                      if h.get("time") is not None and h["time"] > cutoff
+                                      and isinstance(h.get("locator"), str)
+                                      and h["locator"].startswith("segment ")]
+                for h in rescue_past_prefix:
+                    target_idx = int(h["locator"].split()[1])
+                    offset = flag_language.find_local_alignment_offset(
+                        sibling_segs, own_segs, target_idx)
+                    if offset is None:
+                        continue
+                    shifted = dict(h, time=h["time"] + offset,
+                                  suspected_hallucination=dict(h["suspected_hallucination"]))
+                    flag_language.rescue_via_subtitle([shifted], sibling_sub_units)
+                    if shifted["suspected_hallucination"].get("rescued_by_subtitle"):
+                        h["suspected_hallucination"]["rescued_by_subtitle"] = True
+                hallucinated = [h for h in hallucinated
+                               if not h["suspected_hallucination"].get("rescued_by_subtitle")]
+
+                new_sibling_excluded = []
+
+                in_prefix = [h for h in hits
+                            if not h.get("suspected_hallucination")
+                            and h.get("time") is not None and h["time"] <= cutoff]
+                flag_language.exclude_via_cc_absence(in_prefix, sibling_sub_units,
+                                                     reason="no-cc-coverage-via-sibling-edition")
+                flag_language.exclude_via_cc_word_absence(in_prefix, sibling_sub_units,
+                                                          reason="no-cc-word-match-via-sibling-edition")
+                new_sibling_excluded += [h for h in in_prefix if h.get("suspected_hallucination")]
+
+                # Past the confirmed-identical prefix, the two cuts have diverged, but short
+                # stretches between edits may still be genuinely unedited - just shifted. Try a
+                # PER-HIT local alignment (see find_local_alignment_offset) for each remaining
+                # hit instead of assuming one global offset applies.
+                past_prefix = [h for h in hits
+                              if not h.get("suspected_hallucination")
+                              and h.get("time") is not None and h["time"] > cutoff
+                              and isinstance(h.get("locator"), str)
+                              and h["locator"].startswith("segment ")]
+                for h in past_prefix:
+                    target_idx = int(h["locator"].split()[1])
+                    offset = flag_language.find_local_alignment_offset(
+                        sibling_segs, own_segs, target_idx)
+                    if offset is None:
+                        continue
+                    shifted = dict(h, time=h["time"] + offset)
+                    flag_language.exclude_via_cc_absence(
+                        [shifted], sibling_sub_units, reason="no-cc-coverage-via-sibling-edition")
+                    flag_language.exclude_via_cc_word_absence(
+                        [shifted], sibling_sub_units, reason="no-cc-word-match-via-sibling-edition")
+                    if shifted.get("suspected_hallucination"):
+                        h["suspected_hallucination"] = shifted["suspected_hallucination"]
+                        new_sibling_excluded.append(h)
+
+                if new_sibling_excluded:
+                    print(f"  [note] {len(new_sibling_excluded)} additional hit(s) excluded via "
+                          f"a SIBLING edition's CC track (see find_sibling_edition_cc / "
+                          f"find_local_alignment_offset):")
+                    for h in new_sibling_excluded:
+                        print(f"    {h['time_hms']} {h['match']!r} "
+                              f"({h['suspected_hallucination']['reason']})")
+                    hallucinated = hallucinated + new_sibling_excluded
+        except Exception as exc:
+            print(f"  [warn] sibling-edition CC check failed ({exc!r})", file=sys.stderr)
+
+    # Second-ASR-checkpoint cross-check (see second_opinion_rescue). Two trigger conditions,
+    # confirmed 2026-11-19:
+    # (a) a file with NO corroborating evidence at all - no own subtitle, no sibling edition's
+    #     CC - where every remaining hit is excluded purely on detect_repeated_segments' own
+    #     say-so (repetition + a confidence gap against this SAME ASR run), with nothing
+    #     independent checking it;
+    # (b) a CC-WORD-absence exclusion specifically (own-file or via a sibling edition),
+    #     REGARDLESS of whether (a) applies - that evidence is structurally weaker than
+    #     CC-absence ("nothing happened here at all"): it only means ONE subtitle author's cue
+    #     near the hit didn't happen to contain this exact word, a single, sometimes-incomplete
+    #     source (subtitles routinely omit or paraphrase incidental swearing), not independent
+    #     proof nothing was said.
+    # _KNOWN_HALLUCINATION_PHRASES hits are deliberately NOT widened the same way - that
+    # population already has its own extensive cross-library validation (zero counter-examples
+    # found across a full-library sweep), so a mandatory extra ASR pass there would mostly just
+    # add GPU cost for very little marginal safety gain.
+    _weak_cc_reasons = ("no-cc-word-match", "no-cc-word-match-via-sibling-edition")
+    second_opinion_candidates = [h for h in hallucinated
+                                 if not h["suspected_hallucination"].get("rescued_by_subtitle")
+                                 and (h["suspected_hallucination"]["reason"] in _weak_cc_reasons
+                                      or (sub_units is None and sibling_sub_units is None))]
+    if second_opinion_candidates and media is not None and tools is not None and tmp is not None:
+        try:
+            second_opinion_rescue(second_opinion_candidates, media, tools, tmp)
+            hallucinated = [h for h in hallucinated
+                           if not h["suspected_hallucination"].get("rescued_by_subtitle")]
+        except Exception as exc:
+            print(f"  [warn] second-opinion rescue check failed ({exc!r})", file=sys.stderr)
+
+    if hallucinated:
+        rescued = [h for h in hits if h.get("suspected_hallucination", {}).get("rescued_by_subtitle")]
+        still_bad_ids = {id(h) for h in hallucinated}
+        hits = [h for h in hits if id(h) not in still_bad_ids]
+        rescued_cc = [h for h in rescued
+                     if not h["suspected_hallucination"].get("rescued_by_second_opinion")]
+        rescued_second_opinion = [h for h in rescued
+                                  if h["suspected_hallucination"].get("rescued_by_second_opinion")]
+        if rescued_cc:
+            print(f"  [note] {len(rescued_cc)} suspected-hallucination hit(s) RESCUED - an "
+                  f"independent subtitle/CC cue confirms the word was actually said near that "
+                  f"timestamp, overriding the repetition/confidence suspicion:")
+            for h in rescued_cc:
+                print(f"    {h['time_hms']} {h['match']!r}")
+        if rescued_second_opinion:
+            print(f"  [note] {len(rescued_second_opinion)} suspected-hallucination hit(s) "
+                  f"RESCUED by an independent second-ASR-checkpoint pass (see "
+                  f"second_opinion_rescue) - no subtitle was available at all, but a different "
+                  f"WhisperX checkpoint still heard the matched word in a wide raw-audio window:")
+            for h in rescued_second_opinion:
+                print(f"    {h['time_hms']} {h['match']!r}")
+        _cc_reasons = ("no-cc-coverage", "no-cc-coverage-via-sibling-edition",
+                      "no-cc-word-match", "no-cc-word-match-via-sibling-edition")
+        repetition_based = [h for h in hallucinated
+                            if h["suspected_hallucination"]["reason"] not in _cc_reasons
+                            and h["suspected_hallucination"]["reason"] != "known-hallucination-phrase"]
+        if repetition_based:
+            print(f"  [note] {len(repetition_based)} hit(s) excluded as suspected transcription "
+                  f"hallucination(s) - a near-verbatim repeat of an earlier line, scored well "
+                  f"below this file's own confidence, during a stretch with no matching real "
+                  f"speech (see flag_language.detect_repeated_segments):")
+            for h in repetition_based:
+                info = h["suspected_hallucination"]
+                if info["matched_locator"] is not None:
+                    reason = f"repeats {info['matched_locator']} from {info['gap_s']:.0f}s earlier"
+                else:
+                    reason = "part of a contiguous low-confidence run next to a repeated line"
+                print(f"    {h['time_hms']} {h['match']!r} - {reason} "
+                      f"(avg_logprob {info['avg_logprob']:.2f} vs file median "
+                      f"{info['median_avg_logprob']:.2f})")
+
+        phrase_based = [h for h in hallucinated
+                       if h["suspected_hallucination"]["reason"] == "known-hallucination-phrase"]
+        if phrase_based:
+            print(f"  [note] {len(phrase_based)} hit(s) excluded - text matches a known "
+                  f"decoder-hallucination phrase confirmed recurring across multiple unrelated "
+                  f"films (see flag_language._KNOWN_HALLUCINATION_PHRASES), scored well below "
+                  f"this file's own confidence:")
+            for h in phrase_based:
+                info = h["suspected_hallucination"]
+                print(f"    {h['time_hms']} {h['match']!r} "
+                      f"(avg_logprob {info['avg_logprob']:.2f} vs file median "
+                      f"{info['median_avg_logprob']:.2f})")
 
     if cfg.srt_backfill and srt_path is not None and srt_path.is_file():
         try:
@@ -879,33 +1441,125 @@ def choose_subs(tracks: list, want: str, prefer_lang: str = ""):
     return t, t["id"]
 
 
-def choose_pgs(tracks: list, want: str):
+def choose_pgs(tracks: list, want: str, prefer_lang: str = ""):
     """The image-based (PGS/Blu-ray) subtitle track to feed pgs_ocr.py, or
-    (None, None) if there isn't one - see Config.pgs_ocr."""
+    (None, None) if there isn't one - see Config.pgs_ocr. `prefer_lang` (the
+    already-chosen audio track's own language) disambiguates "default" when
+    more than one PGS track exists and none is flagged default by the
+    container - mirrors choose_subs()'s own same non-trust of the raw
+    default flag, for the same reason (a disc's default-subtitle flag
+    reflects the authoring studio's pick, routinely a dub-market language,
+    not necessarily the language actually being cleaned). Confirmed
+    2026-11-19 this was missing entirely: without it, "default" mode falls
+    through _pick() to whichever track happens to sit FIRST in the
+    container, with no language preference of any kind - previously
+    harmless by luck whenever the first track happened to already be the
+    right language, but a real risk whenever it isn't."""
     if str(want).lower() in ("none", "skip", "off", ""):
         return None, None
     pgs = [t for t in tracks if t["type"] == "subtitles"
            and (t["properties"].get("codec_id") or "").upper() == "S_HDMV/PGS"]
     if not pgs:
         return None, None
+    if want == "default" and prefer_lang:
+        same_lang = [t for t in pgs
+                    if (t["properties"].get("language", "") or "").lower() == prefer_lang.lower()]
+        pgs = same_lang or pgs
     t = _pick(pgs, want, "subtitle")
     return t, t["id"]
 
 
-def choose_vobsub(tracks: list, want: str):
+def choose_vobsub(tracks: list, want: str, prefer_lang: str = ""):
     """The image-based (VobSub/DVD) subtitle track to feed vobsub_ocr.py, or
     (None, None) if there isn't one - see Config.vobsub_ocr. Checked only
     after choose_pgs finds nothing (see main()'s subtitle-discovery order) -
     PGS is the newer, higher-resolution format, so it wins when a source
-    somehow has both."""
+    somehow has both. `prefer_lang` - see choose_pgs()'s own docstring for
+    why this exists; same reasoning applies here."""
     if str(want).lower() in ("none", "skip", "off", ""):
         return None, None
     vobsub = [t for t in tracks if t["type"] == "subtitles"
              and (t["properties"].get("codec_id") or "").upper() == "S_VOBSUB"]
     if not vobsub:
         return None, None
+    if want == "default" and prefer_lang:
+        same_lang = [t for t in vobsub
+                    if (t["properties"].get("language", "") or "").lower() == prefer_lang.lower()]
+        vobsub = same_lang or vobsub
     t = _pick(vobsub, want, "subtitle")
     return t, t["id"]
+
+
+_SKIP_IMAGE_SUB_NAME_RE = re.compile(r"commentary|karaoke", re.IGNORECASE)
+#   a track NAME that means "not a dialogue track at all, don't even try OCR'ing it" - a
+#   commentary track's subtitle (when a disc has one) captions the commentary audio, not the
+#   film's own dialogue; a karaoke track is sing-along lyrics, not speech. Checked before
+#   ranking (see _rank_image_sub_candidates) since no amount of OCR coverage makes either one
+#   the right choice - these are excluded outright, not just deprioritized.
+_SDH_NAME_RE = re.compile(r"\bsdh\b|hearing.?impaired", re.IGNORECASE)
+#   a track labelled for the deaf/hard-of-hearing is usually the FULLEST one available
+#   (dialogue + sound-effect descriptions) - same reason flag_language._is_full_cc prefers a
+#   true SDH text track - so prefer it first among same-language image-subtitle candidates too.
+_FORCED_IMAGE_SUB_NAME_RE = re.compile(r"\bforced\b|\bsigns?\b", re.IGNORECASE)
+#   a forced/signs-only track deliberately captions ONLY on-screen text (street signs, letters)
+#   during otherwise-untranslated foreign dialogue - genuinely thin by design, not broken, but
+#   never the first choice when a fuller same-language candidate exists; pushed to the end of
+#   the trial order rather than excluded outright, since it's still better than nothing.
+
+
+def _rank_image_sub_candidates(tracks: list, codec_id: str, prefer_lang: str) -> list[dict]:
+    """Every subtitle track of `codec_id` ("S_HDMV/PGS" or "S_VOBSUB"), minus any whose own
+    track NAME marks it as definitely not a dialogue track (see _SKIP_IMAGE_SUB_NAME_RE),
+    ordered best-candidate-first: same language as the already-chosen audio, the container's
+    own default flag, an SDH-labelled track, then everything else, with a forced/signs-labelled
+    track pushed to the very end. A caller (see main()'s PGS/VobSub discovery blocks) tries
+    each of these in turn via OCR and keeps the first with good-enough coverage, rather than
+    trusting a single "default" pick the way choose_pgs()/choose_vobsub() do.
+
+    Confirmed needed 2026-11-19: Arthur Christmas (2011) has two unflagged English VobSub
+    tracks and no track-name signal distinguishing them at all - OCR coverage itself (see
+    clean.py's caller) is the only way to tell them apart, since even the track's own alpha/
+    contrast values looked fine on the one that OCR'd to near-total garbage."""
+    cands = [t for t in tracks if t["type"] == "subtitles"
+            and (t["properties"].get("codec_id") or "").upper() == codec_id]
+    cands = [t for t in cands
+            if not _SKIP_IMAGE_SUB_NAME_RE.search(t["properties"].get("track_name") or "")]
+
+    def rank(t: dict) -> tuple:
+        p = t["properties"]
+        name = p.get("track_name") or ""
+        lang = (p.get("language") or "").lower()
+        is_pref_lang = 0 if (not prefer_lang or lang == prefer_lang.lower()) else 1
+        is_default = 0 if p.get("default_track") else 1
+        is_sdh = 0 if _SDH_NAME_RE.search(name) else 1
+        is_forced = 1 if _FORCED_IMAGE_SUB_NAME_RE.search(name) else 0
+        return (is_pref_lang, is_default, is_sdh, is_forced)
+
+    return sorted(cands, key=rank)
+
+
+def _ocr_coverage_is_good(srt_path: Path) -> bool:
+    """True if the OCR'd `srt_path` has enough real cues to trust as a working subtitle source
+    for detection purposes - the SAME bar flag_language already uses elsewhere to decide a
+    subtitle track is usable (_is_full_cc / _is_substantial_dialogue_track), reused here so
+    "good enough to stop trying other candidate tracks" means the same thing as "good enough to
+    actually use" everywhere else in this pipeline, rather than a second, looser definition.
+
+    Confirmed needed 2026-11-19: the plain character-count check
+    (srt_text_len(...) >= _MIN_USABLE_SRT_CHARS) this call site used before was too weak to
+    catch a track that OCR'd almost entirely to garbage - Arthur Christmas (2011)'s bad VobSub
+    track still produced 60 short junk lines ("i eee", "=", "Si", ...) that likely would have
+    cleared a raw character-count bar despite being useless, while cleanly failing a cue-count-
+    based "is this a substantial dialogue track" check the way a genuinely thin forced/signs
+    track correctly does too."""
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import flag_language
+    try:
+        units = flag_language.parse_srt(srt_path)
+    except Exception:
+        return False
+    return flag_language._is_full_cc(units) or flag_language._is_substantial_dialogue_track(units)
 
 
 def find_cc608_track(ffprobe: str, media: Path, want_lang: str | None) -> dict | None:
@@ -1047,6 +1701,22 @@ def stage_sidecar_srt(ffmpeg: str, sidecar: Path, tmp: Path) -> Path:
     return out
 
 
+_MIN_RESYNC_MATCH_FRACTION = 0.25   # minimum share of the external subtitle's OWN cues that
+#   must land a trustworthy anchor (see flag_language.resync_units_to_transcript) before using
+#   it at all. Confirmed 2026-11-19 this is a real, not hypothetical, gap: OpenSubtitles' search
+#   can return a WRONG film outright for an obscure/ambiguous title - "Dr. Dolittle 2 (2001)"
+#   matched to "Rush Hour 2"'s subtitle, "VeggieTales Minnesota Cuke..." matched to "The Princess
+#   and the Frog"'s - and the old length-only check (_MIN_USABLE_SRT_CHARS) was nowhere near
+#   enough to catch either: coincidental short common-phrase matches between any two
+#   sufficiently long English films accumulate well past 200 characters on their own (Rush
+#   Hour 2's wrongly-matched text alone produced 1942 characters, all genuinely from Rush Hour
+#   2, not Dr. Dolittle 2 - clean.py would have happily used Chris Tucker's dialogue as
+#   corroborating evidence for a children's movie). The match FRACTION is what actually
+#   separates real from wrong, with a huge margin either way: a confirmed-correct match (Back
+#   to the Future (1985)) resynced 94.1% of its own cues; the two wrong-film cases above landed
+#   at 4.1% and 1.8%.
+
+
 def resync_external_srt(raw_srt_path: Path, js: Path, lang3: str, track_suffix: str,
                         synced_path: Path, log_label: str) -> tuple[Path, str] | None:
     """Realign an externally-sourced subtitle - an OpenSubtitles download or
@@ -1055,17 +1725,28 @@ def resync_external_srt(raw_srt_path: Path, js: Path, lang3: str, track_suffix: 
     transcript(), since neither source is guaranteed to already match THIS
     file's exact cut/timing the way an embedded track is. Writes the
     resynced cues to `synced_path` and returns (synced_path, track_name) if
-    there's enough usable text left afterwards, else None (a warning is
-    printed either way, distinguishing "nothing lined up" from "too little
-    text").
+    enough of the source's OWN cues matched (see _MIN_RESYNC_MATCH_FRACTION)
+    AND there's enough usable text left afterwards, else None (a warning is
+    printed either way, distinguishing "nothing lined up", "wrong film
+    entirely", and "too little text").
     """
     if str(HERE) not in sys.path:
         sys.path.insert(0, str(HERE))
     import flag_language
+    try:
+        total_units = len(flag_language.strip_ad_units(flag_language.parse_srt(Path(raw_srt_path))))
+    except (OSError, ValueError):
+        total_units = 0
     cues = flag_language.resync_units_to_transcript(raw_srt_path, flag_language.load_word_timeline(js))
     if not cues:
         print(f"  [warn] {log_label}: nothing in the subtitle lined up with this recording's "
               f"transcript - discarding", file=sys.stderr)
+        return None
+    if total_units and len(cues) / total_units < _MIN_RESYNC_MATCH_FRACTION:
+        print(f"  [warn] {log_label}: only {len(cues)}/{total_units} cues "
+              f"({100 * len(cues) / total_units:.0f}%) lined up with this recording's "
+              f"transcript - too little to trust as the same film/cut (likely a wrong search "
+              f"match), discarding", file=sys.stderr)
         return None
     flag_language.write_srt_cues(cues, synced_path)
     if srt_text_len(synced_path) < _MIN_USABLE_SRT_CHARS:
@@ -1160,7 +1841,8 @@ def is_own_output_track(t: dict, cfg: Config) -> bool:
         return name == suffix.strip() or name.endswith(suffix)
 
     return (any(_matches(s) for s in audio_suffixes)
-            or _matches(OPENSUBS_TRACK_SUFFIX) or _matches(SIDECAR_TRACK_SUFFIX))
+            or _matches(OPENSUBS_TRACK_SUFFIX) or _matches(SIDECAR_TRACK_SUFFIX)
+            or _matches(SUBDL_TRACK_SUFFIX))
 
 
 def _span_expr(spans) -> str:
@@ -1291,9 +1973,75 @@ def stem_clip_all_channels(ffmpeg: str, stem_tool: str, clip_wav: Path, n_ch: in
     return merged
 
 
+def _run_to_final(cmd: list[str], final_path: Path) -> Path:
+    """Run an ffmpeg command whose last argument is its output path, but write to a `.part`
+    sibling first and only rename into place once the process exits 0. Used for every
+    checkpointed artifact under a mute_track() ckpt_dir (see _mute_checkpoint_dir) so a killed
+    or crashed run never leaves a half-written file at the final name for the next resume
+    attempt to mistake as complete - existence of the final-named file is the resume check."""
+    part = final_path.with_name(final_path.name + ".part")
+    cmd = [*cmd[:-1], str(part)]
+    run(cmd)
+    os.replace(part, final_path)
+    return final_path
+
+
+def _mute_checkpoint_dir(out_dir: Path, media: Path, audio_pos: int, spans, cfg: Config) -> tuple[Path, bool]:
+    """Stable, content-addressed scratch dir for mute_track()'s per-span stemming work -
+    separate from the per-run tempfile.TemporaryDirectory (which is always deleted on a clean
+    exit, exception included, so it can never survive to be resumed). Naming it after a hash of
+    (media, flagged spans, mute_fill, stem_model) means any change to what would actually get
+    produced - a different hallucination-sweep result, --force after a wordlist edit, a
+    different mute_fill/stem_model - lands in a fresh directory automatically; no separate
+    invalidation check is needed. An old directory left behind by a killed/crashed run that
+    never gets revisited just ages out via _sweep_stale_temp_dirs like any other orphaned pf_*
+    scratch dir (it already globs "pf_*", which this prefix matches too).
+
+    Returns (dir, already_had_content) - the second value is just for a one-line log note so a
+    resumed run is visibly distinguishable from a fresh one."""
+    sig = json.dumps({
+        "media": str(media), "audio_pos": audio_pos,
+        "spans": [[round(s, 3), round(e, 3), hs] for s, e, hs in spans],
+        "mute_fill": cfg.mute_fill, "stem_model": cfg.stem_model,
+    }, sort_keys=True, default=str)
+    digest = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:16]
+    d = out_dir / f"pf_ckpt_{digest}"
+    already_had_content = d.is_dir() and any(d.iterdir())
+    d.mkdir(parents=True, exist_ok=True)
+    return d, already_had_content
+
+
+def _decode_full_track(ffmpeg: str, media: Path, audio_pos: int, fmt_args: list[str],
+                       out_path: Path) -> Path:
+    """Decode the chosen audio track to one lossless intermediate WAV, start to finish, in a
+    single continuous pass - verified exact (two independent seek methods reproduce a long AAC
+    track byte-for-byte with zero internal drift at any point). Every extract_original()
+    bridging-segment slice (splice_stemmed_spans/splice_whole_track_stem) is taken from THIS
+    file via a second, cheap seek, rather than re-seeking the ORIGINAL COMPRESSED media fresh
+    for every gap between flagged spans - doing that (one independent decode-from-scratch per
+    gap, at arbitrary sub-second timestamps, found 2026-11-17 on two real AAC-sourced movies
+    with dozens of flagged spans each) silently lost anywhere from a few ms to several hundred
+    ms per cut, with no self-cancellation between adjacent segments since each is a brand-new
+    decode rather than a trimmed continuation of the one before it - accumulating into tens to
+    hundreds of ms of one-directional, ever-growing desync between the rebuilt "(Cleaned)" track
+    and the real original by the end of a movie. Slicing from an already-decoded PCM file is
+    exact no matter how many times it's resliced - there's no compressed-codec frame boundary
+    left to round to.
+
+    Skipped entirely when out_path already exists non-empty - harmless when out_path is a
+    fresh per-run tmp dir (never pre-exists), and is what lets a checkpoint-dir resume reuse a
+    previous attempt's full decode instead of redoing it."""
+    if out_path.is_file() and out_path.stat().st_size > 0:
+        return out_path
+    _run_to_final([ffmpeg, "-hide_banner", "-y", "-i", str(media),
+                   "-map", f"0:a:{audio_pos}", *fmt_args, str(out_path)], out_path)
+    return out_path
+
+
 def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, n_ch: int,
                          sample_rate: int, layout_name: str | None, stem_tool: str, cfg: Config,
-                         tmp: Path, context: float = SPLICE_CONTEXT_S) -> Path:
+                         tmp: Path, context: float = SPLICE_CONTEXT_S,
+                         ckpt_dir: Path | None = None) -> Path:
     """Replace every flagged span with a freshly-stemmed (vocals removed,
     ambient/music kept - never dead silence) version of just that short clip;
     everything outside the flagged spans is the untouched original, byte for
@@ -1307,27 +2055,41 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
     that way - short, independently seeked, never touching the whole-file
     timeline in one filter pass."""
     total_dur = probe_duration(ffprobe, media)
-    seg_dir = tmp / "splice_segments"
+    seg_dir = ckpt_dir if ckpt_dir is not None else tmp / "splice_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
     fmt_args = ["-ar", str(sample_rate), "-ac", str(n_ch)]
+    full_orig = _decode_full_track(ffmpeg, media, audio_pos, fmt_args, seg_dir / "full_orig.wav")
     segments: list[Path] = []
     cursor = 0.0
 
     def extract_original(s: float, e: float) -> Path:
         out = seg_dir / f"orig_{len(segments)}.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
-             "-i", str(media), "-map", f"0:a:{audio_pos}", *fmt_args, str(out)])
+        if not (out.is_file() and out.stat().st_size > 0):
+            _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
+                          "-i", str(full_orig), *fmt_args, str(out)], out)
         return out
 
+    resumed_spans = 0
     for i, (s, e, hits) in enumerate(spans):
         if s > cursor:
             segments.append(extract_original(cursor, s))
 
+        # a prior interrupted attempt already finished this exact span (ckpt_dir's name is a
+        # hash of the whole spans list + settings, so an existing trimmed.wav here can only be
+        # from a matching previous run of this same work) - reuse it, skip straight to the next.
+        trimmed = seg_dir / f"span{i}_trimmed.wav"
+        if trimmed.is_file() and trimmed.stat().st_size > 0:
+            segments.append(trimmed)
+            cursor = e
+            resumed_spans += 1
+            continue
+
         clip_s = max(0.0, s - context)
         clip_e = min(total_dur, e + context)
         raw_clip = seg_dir / f"span{i}_raw.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{clip_s:.6f}", "-to", f"{clip_e:.6f}",
-             "-i", str(media), "-map", f"0:a:{audio_pos}", *fmt_args, str(raw_clip)])
+        if not (raw_clip.is_file() and raw_clip.stat().st_size > 0):
+            _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{clip_s:.6f}", "-to", f"{clip_e:.6f}",
+                          "-i", str(full_orig), *fmt_args, str(raw_clip)], raw_clip)
 
         span_tmp = seg_dir / f"span{i}_stem"
         span_tmp.mkdir(exist_ok=True)
@@ -1336,11 +2098,14 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
 
         # the extra `context` was only so the stemmer had enough material to
         # work with - trim back down to exactly the flagged span before splicing
-        trimmed = seg_dir / f"span{i}_trimmed.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s - clip_s:.6f}", "-to", f"{e - clip_s:.6f}",
-             "-i", str(inst_clip), *fmt_args, str(trimmed)])
+        _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{s - clip_s:.6f}", "-to", f"{e - clip_s:.6f}",
+                      "-i", str(inst_clip), *fmt_args, str(trimmed)], trimmed)
         segments.append(trimmed)
         cursor = e
+
+    if ckpt_dir is not None and resumed_spans:
+        print(f"  resume: reused {resumed_spans}/{len(spans)} already-stemmed span(s) from a "
+              f"previous interrupted attempt ({seg_dir.name})")
 
     if cursor < total_dur:
         segments.append(extract_original(cursor, total_dur))
@@ -1356,7 +2121,8 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
 
 def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, n_ch: int,
                             sample_rate: int, layout_name: str | None, stem_tool: str, cfg: Config,
-                            tmp: Path, whole_inst: Path | None = None) -> Path:
+                            tmp: Path, whole_inst: Path | None = None,
+                            ckpt_dir: Path | None = None) -> Path:
     """Same precise seek-and-concat splicing as splice_stemmed_spans (never
     the buggy whole-file volume=0:enable='between(...)' filter) - but for
     movies with a lot of flagged spans, where paying a fresh separator
@@ -1375,24 +2141,27 @@ def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: i
     if whole_inst is None:
         print(f"  stemming the whole track once (~{total_dur / 60:.0f} min, {n_ch}ch)...")
         whole_inst = build_instrumental_stem(ffmpeg, stem_tool, media, audio_pos, n_ch, sample_rate,
-                                             tmp, cfg, layout_name)
+                                             tmp, cfg, layout_name, ckpt_dir=ckpt_dir)
 
-    seg_dir = tmp / "splice_segments"
+    seg_dir = ckpt_dir if ckpt_dir is not None else tmp / "splice_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
     fmt_args = ["-ar", str(sample_rate), "-ac", str(n_ch)]
+    full_orig = _decode_full_track(ffmpeg, media, audio_pos, fmt_args, seg_dir / "full_orig.wav")
     segments: list[Path] = []
     cursor = 0.0
 
     def extract_original(s: float, e: float) -> Path:
         out = seg_dir / f"orig_{len(segments)}.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
-             "-i", str(media), "-map", f"0:a:{audio_pos}", *fmt_args, str(out)])
+        if not (out.is_file() and out.stat().st_size > 0):
+            _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
+                          "-i", str(full_orig), *fmt_args, str(out)], out)
         return out
 
     def extract_instrumental(s: float, e: float) -> Path:
         out = seg_dir / f"inst_{len(segments)}.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
-             "-i", str(whole_inst), *fmt_args, str(out)])
+        if not (out.is_file() and out.stat().st_size > 0):
+            _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
+                          "-i", str(whole_inst), *fmt_args, str(out)], out)
         return out
 
     for s, e, hits in spans:
@@ -1431,7 +2200,8 @@ def _predict_stem_seconds(n_ch: int, spans, total_dur: float) -> tuple[float, fl
 
 def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cfg: Config,
               chosen: dict, tmp: Path, stem_tool: str | None = None,
-              cached_whole_instrumental: Path | None = None) -> tuple[Path, bool]:
+              cached_whole_instrumental: Path | None = None,
+              ckpt_dir: Path | None = None) -> tuple[Path, bool]:
     """Never leaves dead air and never mutes a channel that doesn't need it:
     every flagged span gets vocals stemmed out of EVERY channel for just that
     short clip (ambient noise/music keeps playing, exactly like the
@@ -1462,7 +2232,8 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
                   "the track a second time")
             spliced = splice_whole_track_stem(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
                                               None, stem_tool, cfg, tmp,
-                                              whole_inst=cached_whole_instrumental)
+                                              whole_inst=cached_whole_instrumental,
+                                              ckpt_dir=ckpt_dir)
             return _encode_track_from_wav(ffmpeg, spliced, n_ch, cfg, tmp), False
         if stem_tool is not None:
             layout_name = None
@@ -1480,7 +2251,8 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
                       f"{per_span_s / 60:.1f} min per-span ({len(spans)} span(s)) - stemming the "
                       f"whole track once (mute_fill=stems, model={cfg.stem_model})")
                 spliced = splice_whole_track_stem(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
-                                                  layout_name, stem_tool, cfg, tmp)
+                                                  layout_name, stem_tool, cfg, tmp,
+                                                  ckpt_dir=ckpt_dir)
             else:
                 print(f"  fill: predicted {per_span_s / 60:.1f} min per-span vs "
                       f"{whole_track_s / 60:.1f} min whole-track - stemming vocals out of every "
@@ -1488,7 +2260,8 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
                       f"model={cfg.stem_model}) - ambient noise/music keeps playing throughout, "
                       f"nothing is ever fully silenced")
                 spliced = splice_stemmed_spans(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
-                                               layout_name, stem_tool, cfg, tmp)
+                                               layout_name, stem_tool, cfg, tmp,
+                                               ckpt_dir=ckpt_dir)
             return _encode_track_from_wav(ffmpeg, spliced, n_ch, cfg, tmp), False
         print(f"  [note] mute_fill=stems but no stemmer found at {STEM_VENV} - falling back to "
               f"silence (see README for one-time setup)", file=sys.stderr)
@@ -1614,7 +2387,7 @@ def _stereo_instrumental_to_mono(ffmpeg: str, stereo_wav: Path, out_wav: Path) -
 
 def build_instrumental_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos: int, n_ch: int,
                             sample_rate: int, tmp: Path, cfg: Config,
-                            layout_name: str | None) -> Path:
+                            layout_name: str | None, ckpt_dir: Path | None = None) -> Path:
     """A wav with the SAME channel count as the source audio track, holding
     only its non-dialogue content ("everything else" - music/effects/room
     tone) with the dialogue stemmed out.
@@ -1627,41 +2400,69 @@ def build_instrumental_stem(ffmpeg: str, stem_tool: str, media: Path, audio_pos:
     faked up to stereo, stemmed, and folded back to mono ON ITS OWN - then all
     of them are rejoined into one file with the original layout. Slower (one
     separator pass per channel) but it's the only way to keep the channel
-    count the caller asked for."""
+    count the caller asked for.
+
+    `ckpt_dir`, when given (splice_whole_track_stem's own ckpt_dir - the same
+    one splice_stemmed_spans checkpoints into, see _mute_checkpoint_dir),
+    makes each channel's separator pass individually resumable: this is the
+    single most expensive GPU step on the whole-track path (one full-length
+    separator invocation per channel, picked by _predict_stem_seconds()
+    specifically because per-channel beats per-span on a heavily-flagged
+    file) - losing it whole to a kill was the main gap left after the
+    per-span checkpoint work (2026-11-19)."""
+    work_dir = ckpt_dir if ckpt_dir is not None else tmp
     if n_ch <= 2:
-        src_wav = tmp / "stem_src.wav"
+        final = work_dir / "instrumental.wav"
+        if final.is_file() and final.stat().st_size > 0:
+            return final
+        src_wav = work_dir / "stem_src.wav"
         run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
              "-map", f"0:a:{audio_pos}", str(src_wav)])
         if n_ch == 1:
-            fake = tmp / "stem_src_stereo.wav"
+            fake = work_dir / "stem_src_stereo.wav"
             _mono_to_fake_stereo(ffmpeg, src_wav, fake)
-            inst = _run_separator(stem_tool, fake, tmp / "stem_out", cfg)
-            mono_out = tmp / "instrumental.wav"
-            _stereo_instrumental_to_mono(ffmpeg, inst, mono_out)
-            return mono_out
-        return _run_separator(stem_tool, src_wav, tmp / "stem_out", cfg)
+            inst = _run_separator(stem_tool, fake, work_dir / "stem_out", cfg)
+            part = final.with_name(final.name + ".part")
+            _stereo_instrumental_to_mono(ffmpeg, inst, part)
+            os.replace(part, final)
+            return final
+        inst = _run_separator(stem_tool, src_wav, work_dir / "stem_out", cfg)
+        os.replace(inst, final)
+        return final
 
-    ch_dir = tmp / "stem_channels"
+    ch_dir = work_dir / "stem_channels"
     ch_dir.mkdir(exist_ok=True)
     inst_paths = []
+    resumed_channels = 0
     for i in range(n_ch):
+        mono_inst = ch_dir / f"ch{i}_inst.wav"
+        if mono_inst.is_file() and mono_inst.stat().st_size > 0:
+            inst_paths.append(mono_inst)
+            resumed_channels += 1
+            continue
         mono = ch_dir / f"ch{i}.wav"
         run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
              "-map", f"0:a:{audio_pos}", "-af", f"pan=mono|c0=c{i}", str(mono)])
         fake = ch_dir / f"ch{i}_stereo.wav"
         _mono_to_fake_stereo(ffmpeg, mono, fake)
         inst = _run_separator(stem_tool, fake, ch_dir / f"out{i}", cfg)
-        mono_inst = ch_dir / f"ch{i}_inst.wav"
-        _stereo_instrumental_to_mono(ffmpeg, inst, mono_inst)
+        part = mono_inst.with_name(mono_inst.name + ".part")
+        _stereo_instrumental_to_mono(ffmpeg, inst, part)
+        os.replace(part, mono_inst)
         inst_paths.append(mono_inst)
 
+    if ckpt_dir is not None and resumed_channels:
+        print(f"  resume: reused {resumed_channels}/{n_ch} already-stemmed channel(s) from a "
+              f"previous interrupted attempt ({ch_dir.name})")
+
     layout = layout_name if layout_name in CHANNEL_LAYOUTS else f"{n_ch}c"
-    merged = tmp / "instrumental.wav"
-    inputs = [a for p in inst_paths for a in ("-i", str(p))]
-    pads = "".join(f"[{i}:a]" for i in range(n_ch))
-    graph = f"{pads}join=inputs={n_ch}:channel_layout={layout}[out]"
-    run([ffmpeg, "-hide_banner", "-y", *inputs,
-         "-filter_complex", graph, "-map", "[out]", "-ar", str(sample_rate), str(merged)])
+    merged = work_dir / "instrumental.wav"
+    if not (merged.is_file() and merged.stat().st_size > 0):
+        inputs = [a for p in inst_paths for a in ("-i", str(p))]
+        pads = "".join(f"[{i}:a]" for i in range(n_ch))
+        graph = f"{pads}join=inputs={n_ch}:channel_layout={layout}[out]"
+        run([ffmpeg, "-hide_banner", "-y", *inputs,
+             "-filter_complex", graph, "-map", "[out]", "-ar", str(sample_rate), str(merged)])
     return merged
 
 
@@ -1713,11 +2514,13 @@ def ensure_vocals_transcript(media: Path, vocals_wav: Path, tmp: Path, cfg: Conf
     Voice_to_Text names its output after ITS input's stem, not the original
     media's."""
     js = media.with_name(f"{media.stem}.vocals.json")
+    diarize = cfg.transcript_diarize
     if js.is_file() and not cfg.retranscribe:
-        if _transcript_is_aligned(js):
+        if _transcript_is_aligned(js) and (not diarize or _transcript_has_speakers(js)):
             print(f"  transcript (vocals stem): {js.name} (reusing)")
             return js
-        print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript - "
+        print(f"  [warn] {js.name} exists but isn't a forced-aligned transcript, or lacks the "
+              f"diarized speaker labels this run requires - "
               f"re-transcribing the vocals stem instead of reusing it", file=sys.stderr)
     py = VOICE_TO_TEXT / ".venv" / "Scripts" / "python.exe"
     script = VOICE_TO_TEXT / "transcribe.py"
@@ -1727,8 +2530,17 @@ def ensure_vocals_transcript(media: Path, vocals_wav: Path, tmp: Path, cfg: Conf
     staged = tmp / f"{media.stem}.wav"
     shutil.copy2(vocals_wav, staged)
     print(f"  transcript (vocals stem): running Voice_to_Text on the isolated vocal track...")
-    run([str(py), "-X", "utf8", str(script), str(staged),
-         "--formats", "json", "--no-diarize", "--output-dir", str(tmp)], cwd=str(VOICE_TO_TEXT))
+    cmd = [str(py), "-X", "utf8", str(script), str(staged),
+          "--formats", "json", "--diarize" if diarize else "--no-diarize",
+          "--output-dir", str(tmp)]
+    if diarize:
+        if cfg.replace_num_speakers is not None:
+            cmd += ["--num-speakers", str(cfg.replace_num_speakers)]
+        if cfg.replace_min_speakers is not None:
+            cmd += ["--min-speakers", str(cfg.replace_min_speakers)]
+        if cfg.replace_max_speakers is not None:
+            cmd += ["--max-speakers", str(cfg.replace_max_speakers)]
+    run(cmd, cwd=str(VOICE_TO_TEXT))
     produced = tmp / f"{media.stem}.json"
     if not produced.is_file():
         raise SystemExit("[error] vocals-stem transcription produced no .json")
@@ -2332,11 +3144,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="clean.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input", help="media file (mkv recommended)")
-    p.add_argument("--method", choices=["mute", "bleep", "cut", "dialog"],
+    p.add_argument("--method", choices=["mute", "bleep", "cut", "dialog", "replace"],
                    help="removal method: 'mute' (default, each flagged span stemmed), "
-                        "'bleep', 'cut' (splice out entirely - audio-only inputs only), or "
+                        "'bleep', 'cut' (splice out entirely - audio-only inputs only), "
                         "'dialog' (strip ALL dialogue - not just flagged words - into a new "
-                        "(Wordless) track; ignores the wordlists/--categories entirely)")
+                        "(Wordless) track; ignores the wordlists/--categories entirely), or "
+                        "'replace' (swap the flagged word for a different, non-profane one, "
+                        "spoken in a voice matching the speaker, falling back to 'mute' per "
+                        "occurrence when that can't be done confidently - see "
+                        "wordlists/replacements.txt and AGENTS.md)")
     p.add_argument("--categories", help="comma list: profanity,irreverence")
     p.add_argument("--extra-spans", dest="extra_spans",
                    help="JSON file of hand-reviewed [{start,end,label,category}] spans (input's "
@@ -2404,6 +3220,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="override the OpenSubtitles search title auto-guessed from the filename")
     p.add_argument("--opensubtitles-id", dest="opensubtitles_id",
                    help="exact OpenSubtitles file_id to download - bypasses search entirely")
+    p.add_argument("--no-subdl", dest="subdl", action="store_false", default=None,
+                   help="don't fall back to SubDL (subdl.com) when OpenSubtitles didn't produce "
+                        "a usable result either - needs its own free API key, see subdl.py")
+    p.add_argument("--subdl-lang", dest="subdl_lang",
+                   help='2-letter language to search/download (default "en")')
+    p.add_argument("--subdl-query", dest="subdl_query",
+                   help="override the SubDL search title auto-guessed from the filename")
     p.add_argument("--no-faith-detection", dest="faith_detection", action="store_false", default=None,
                    help="don't look up TMDB to detect an overtly Christian/faith-based film (see "
                         "tmdb.py) - always use the normal irreverence wordlist instead of the "
@@ -2455,7 +3278,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    default=None,
                    help="request speaker diarization when a transcript has to be run (off by "
                         "default - clean.py's own detection never needs speaker labels, and "
-                        "it's a real extra GPU cost)")
+                        "it's a real extra GPU cost; --method replace forces this on regardless)")
+    p.add_argument("--replace-wordlist", dest="replace_wordlist",
+                   help="'replace' only: path to the word -> replacement-word(s) map "
+                        "(default wordlists/replacements.txt) - ignored if --replace-pool is set")
+    p.add_argument("--replace-pool", dest="replace_pool",
+                   help="'replace' only: path to a flat replacement pool (one word/phrase per "
+                        "line, no mapping) - switches to pool mode: every flagged occurrence gets "
+                        "candidates drawn randomly from this one shared bucket instead of a "
+                        "fixed per-word mapping, so a listener can't infer the original word from "
+                        "the replacement. Overrides --replace-wordlist when set. See "
+                        "wordlists/blue(y)_pool.txt for the starter pool.")
+    p.add_argument("--replace-max-candidates", dest="replace_max_word_candidates", type=int,
+                   help="'replace' only: try at most this many replacement words per flagged "
+                        "occurrence (in replacements.txt's own priority order) before muting it")
+    p.add_argument("--replace-donor-window", dest="replace_donor_search_window_s", type=float,
+                   help="'replace' only: restrict donor-word search to within this many seconds "
+                        "of the flagged occurrence (default 0 = search the whole file)")
+    p.add_argument("--replace-min-speaker-audio", dest="replace_min_speaker_audio_s", type=float,
+                   help="'replace' only: minimum seconds of a speaker's isolated vocal audio "
+                        "needed before attempting to train a voice-conversion model for them")
+    p.add_argument("--no-replace-prosody", dest="replace_prosody", action="store_false",
+                   default=None,
+                   help="'replace' only: don't transplant the original word's pitch/energy "
+                        "contour onto the replacement audio")
+    p.add_argument("--no-replace-scene-blend", dest="replace_scene_blend", action="store_false",
+                   default=None,
+                   help="'replace' only: don't loudness/EQ/reverb-match the replacement audio "
+                        "to its surrounding scene")
+    p.add_argument("--replace-quality-threshold", dest="replace_quality_threshold", type=float,
+                   help="'replace' only: minimum candidate score (0-1) to accept instead of "
+                        "muting the occurrence (default 0.55)")
+    p.add_argument("--replace-num-speakers", dest="replace_num_speakers", type=int,
+                   help="'replace' only: hint the exact speaker count for diarization")
+    p.add_argument("--replace-min-speakers", dest="replace_min_speakers", type=int,
+                   help="'replace' only: hint a lower-bound speaker count for diarization")
+    p.add_argument("--replace-max-speakers", dest="replace_max_speakers", type=int,
+                   help="'replace' only: hint an upper-bound speaker count for diarization")
+    p.add_argument("--retrain-voice-model", dest="retrain_voice_model", action="store_true",
+                   default=None,
+                   help="'replace' only: force-retrain a speaker's cached voice-conversion "
+                        "model even if a cached one already exists")
     p.add_argument("--config", default=str(HERE / "config.toml"))
     return p
 
@@ -2486,20 +3349,24 @@ def _dir_last_activity(d: Path) -> float:
 
 
 def _sweep_stale_temp_dirs(out_dir: Path) -> None:
-    """Remove any leftover "pf_*" scratch dir (main()'s own
-    tempfile.TemporaryDirectory(prefix="pf_", dir=out_dir)) idle for longer
-    than any real single-file run has ever taken. A normal run - success or
-    a plain Python exception - always cleans its own tmp dir up via that
-    context manager's __exit__; one only survives when the interpreter was
-    killed before reaching it; a forceful taskkill/process-manager stop, or
-    the real access-violation crash this file's docstrings mention as an
-    observed audio-separator failure mode under GPU contention. Found
-    accumulating silently back to 2026-09-24, discovered and first swept
-    2026-10-01 - 12+ scratch dirs' worth of leftover audio, never cleaned up
-    on its own because nothing ever looked. 12h is well past every real
-    single-file processing time observed even under heavy multi-process GPU
-    contention, so anything idle that long is safe to treat as orphaned
-    rather than still legitimately owned by a slow sibling run."""
+    """Remove any leftover "pf_*" scratch dir idle for longer than any real single-file run has
+    ever taken. Covers two kinds of dir, both prefixed "pf_":
+      - main()'s own tempfile.TemporaryDirectory(prefix="pf_", dir=out_dir): a normal run -
+        success or a plain Python exception - always cleans this up via the context manager's
+        __exit__; one only survives a forceful taskkill/process-manager stop, or the real
+        access-violation crash this file's docstrings mention as an observed audio-separator
+        failure mode under GPU contention.
+      - a mute_track() checkpoint dir (prefix "pf_ckpt_", see _mute_checkpoint_dir): deliberately
+        NOT inside that TemporaryDirectory, so it survives a kill/crash on purpose - the next
+        attempt at the same file resumes from it. It's removed explicitly on a successful run
+        (see main()'s cleanup right before the final "wrote:" line); one only survives when no
+        later attempt ever finished successfully.
+    Found accumulating silently back to 2026-09-24, discovered and first swept 2026-10-01 - 12+
+    scratch dirs' worth of leftover audio, never cleaned up on its own because nothing ever
+    looked. The age threshold is well past every real single-file processing time observed even
+    under heavy multi-process GPU contention, so anything idle that long is safe to treat as
+    orphaned rather than still legitimately owned by a slow sibling run or a backlog that just
+    hasn't gotten back around to retrying this file yet."""
     now = time.time()
     for d in out_dir.glob("pf_*"):
         if not d.is_dir():
@@ -2535,14 +3402,31 @@ def main(argv: list[str] | None = None) -> int:
                  "sync_ms", "subs_track", "srt_backfill", "sidecar_subs", "sidecar_lang",
                  "pgs_ocr", "pgs_ocr_lang", "vobsub_ocr", "vobsub_ocr_lang", "opensubtitles",
                  "opensubtitles_lang", "opensubtitles_query", "opensubtitles_id",
+                 "subdl", "subdl_lang", "subdl_query",
                  "faith_detection", "tmdb_query",
                  "stem_retranscribe", "output_dir", "retranscribe", "overwrite",
-                 "stt_only", "transcript_formats", "transcript_diarize"]:
+                 "stt_only", "transcript_formats", "transcript_diarize",
+                 "replace_wordlist", "replace_pool", "replace_max_word_candidates", "replace_donor_search_window_s",
+                 "replace_min_speaker_audio_s", "replace_prosody", "replace_scene_blend",
+                 "replace_quality_threshold", "replace_num_speakers", "replace_min_speakers",
+                 "replace_max_speakers", "retrain_voice_model"]:
         val = getattr(args, name, None)
         if val is not None:
             setattr(cfg, name, val)
     if args.categories:
         cfg.categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+
+    if cfg.method == "replace":
+        # Donor-word matching and per-speaker voice-conversion models (see
+        # word_replace.py) are only meaningful with real speaker labels -
+        # without them, donor search degrades to a time-proximity guess and
+        # voice-model training collapses everyone in the file into one
+        # bucket. Forced unconditionally rather than left as a config toggle
+        # a user could forget to set - same posture as --stt-only forcing
+        # cfg.opensubtitles off below.
+        cfg.transcript_diarize = True
+        print("  replace: diarization forced on (needed to match donor words "
+              "and voice models to the correct speaker)")
 
     if cfg.stt_only:
         if cfg.method == "dialog":
@@ -2551,6 +3435,7 @@ def main(argv: list[str] | None = None) -> int:
                              "there's no detection pass to report")
         cfg.opensubtitles = False   # stt-only is for pre-warming local-only detection - never
         #   spend an OpenSubtitles download/quota on a file that isn't being cleaned yet
+        cfg.subdl = False           # same reasoning, same posture, for the second subtitle source
 
     tools = locate_tools()
     ffmpeg, ffprobe = tools["ffmpeg"], tools["ffprobe"]
@@ -2586,6 +3471,9 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = HERE / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     _sweep_stale_temp_dirs(out_dir)
+    ckpt_dir: Path | None = None  # set just before mute_track(), see _mute_checkpoint_dir;
+    #   stays None for every other method - only "mute" gets checkpointed resume (see clean.py's
+    #   docstring discussion / the per-span checkpoint work added 2026-11-19)
     name_suffix = cfg.dialog_track_suffix if cfg.method == "dialog" else cfg.track_name_suffix
     # The cleaned result replaces the source in place - same folder, same
     # stem. Only the extension can change (mkvmerge always writes .mkv), so
@@ -2638,10 +3526,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  [note] {len(stale_ids)} pre-existing (Cleaned)/(Wordless) track(s) found - "
               f"re-detecting from the original source; a fresh build only replaces them if the "
               f"flagged words differ (--force to always replace)")
-    chosen, audio_pos = choose_audio(tracks, cfg.source_track)
+    chosen, _filtered_audio_pos = choose_audio(tracks, cfg.source_track)
     if chosen is None:
         print(f"  [warn] {media.name} has no audio track - skipping clean")
         return 0
+    # choose_audio()'s own index is computed within the STALE-FILTERED
+    # `tracks` list, which is correct for picking WHICH track but wrong for
+    # -map 0:a:{audio_pos}: every caller maps that number against the real,
+    # unfiltered file (ffmpeg has no notion of "stale" tracks), so on a
+    # rerun where a stale (Cleaned)/(Wordless) track sits BEFORE the real
+    # one in the container's own track order, the filtered-list index
+    # under-counts and silently points at the wrong physical audio stream -
+    # confirmed live 2026-10-21 (a --force rerun on a once-cleaned file fed
+    # the stemmer/transcript pipeline the stale track's own audio instead of
+    # the original, producing a bogus detection at an unrelated timestamp
+    # while leaving the real flagged word completely untouched). Recompute
+    # against tracks_all (every audio track, stale ones included) instead.
+    audio_pos = [t["id"] for t in tracks_all if t["type"] == "audio"].index(chosen["id"])
     cp = chosen["properties"]
     print(f"  cleaning audio #{audio_pos}: "
           f"{cp.get('language', 'und')} / {cp.get('track_name') or '<no name>'} / "
@@ -2708,8 +3609,8 @@ def main(argv: list[str] | None = None) -> int:
         #                          censor_pgs_track() (later) needs its cached .sup/.words.json, not clean_srt
         pgs_cache = None  # {"sup_path", "json_path"} from analyze_pgs_track(), for the same reason
         if subs_enabled and chosen_subs is None and cfg.pgs_ocr:
-            pgs_track, _pgs_tid = choose_pgs(tracks, cfg.subs_track)
-            if pgs_track is not None:
+            pgs_candidates = _rank_image_sub_candidates(tracks, "S_HDMV/PGS", cp.get("language", ""))
+            if pgs_candidates:
                 tesseract_cmd = locate_tesseract()
                 if tesseract_cmd is None:
                     print("  [warn] a PGS (Blu-ray bitmap) subtitle track exists but Tesseract "
@@ -2719,19 +3620,41 @@ def main(argv: list[str] | None = None) -> int:
                     if str(HERE) not in sys.path:
                         sys.path.insert(0, str(HERE))
                     import pgs_ocr
-                    lang3 = pgs_track["properties"].get("language") or "und"
-                    ocr_lang = cfg.pgs_ocr_lang or "eng"
-                    cache_base = media.with_name(f"{media.stem}.{lang3}.pgsocr")
-                    print(f"  subtitles: no text/sidecar track - OCR'ing PGS track id "
-                          f"{pgs_track['id']} [{lang3}] with Tesseract (this can take a "
-                          f"while on a full film; cached for reruns)...")
-                    stats = pgs_ocr.analyze_pgs_track(
-                        mkvextract, media, pgs_track["id"], cache_base,
-                        lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
-                    action = "reusing cached" if stats["cached"] else "OCR'd"
-                    print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
-                          f"image cue(s) to text ({stats['display_sets']} display sets)")
-                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                    best = None  # (stats, track, lang3) - whichever candidate tried so far OCR'd
+                    #               the most text_cues, kept in case NONE clears _ocr_coverage_is_good
+                    for i, cand in enumerate(pgs_candidates):
+                        lang3 = cand["properties"].get("language") or "und"
+                        ocr_lang = cfg.pgs_ocr_lang or "eng"
+                        # Only the FIRST (best-ranked) candidate reuses the plain per-language cache
+                        # name every prior run already used - a file with just one PGS track (the
+                        # overwhelming majority) never pays to re-OCR something already cached under
+                        # the old naming. A fallback candidate gets its own track-id-qualified cache
+                        # instead of overwriting that one.
+                        cache_base = media.with_name(
+                            f"{media.stem}.{lang3}.pgsocr" if i == 0
+                            else f"{media.stem}.{lang3}.t{cand['id']}.pgsocr")
+                        label = cand["properties"].get("track_name") or ""
+                        print(f"  subtitles: no text/sidecar track - OCR'ing PGS track id "
+                              f"{cand['id']} [{lang3}]{f' {label!r}' if label else ''} with "
+                              f"Tesseract (this can take a while on a full film; cached for "
+                              f"reruns)...")
+                        stats = pgs_ocr.analyze_pgs_track(
+                            mkvextract, media, cand["id"], cache_base,
+                            lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
+                        action = "reusing cached" if stats["cached"] else "OCR'd"
+                        print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
+                              f"image cue(s) to text ({stats['display_sets']} display sets)")
+                        if best is None or stats["text_cues"] > best[0]["text_cues"]:
+                            best = (stats, cand, lang3)
+                        if _ocr_coverage_is_good(stats["srt_path"]):
+                            break
+                        elif i + 1 < len(pgs_candidates):
+                            print(f"  [note] coverage looks too sparse to trust ({stats['text_cues']}/"
+                                  f"{stats['image_cues']} cues) - trying another candidate PGS track",
+                                  file=sys.stderr)
+                    stats, pgs_track, lang3 = best
+                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS \
+                            and _ocr_coverage_is_good(stats["srt_path"]):
                         raw_srt = stats["srt_path"]
                         chosen_subs = {"id": None, "type": "subtitles",
                                       "properties": {"language": lang3,
@@ -2744,16 +3667,16 @@ def main(argv: list[str] | None = None) -> int:
                               "the ORIGINAL bitmap with flagged words redacted in the image itself, "
                               "not a text conversion; expect occasional misreads/missed redactions")
                     else:
-                        print("  [warn] PGS OCR produced too little usable text - discarding",
-                              file=sys.stderr)
+                        print(f"  [warn] PGS OCR produced too little usable text across "
+                              f"{len(pgs_candidates)} candidate track(s) - discarding", file=sys.stderr)
 
         vobsub_source_track = None  # set below when a VobSub track is what raw_srt/chosen_subs came
         #                             from - censor_vobsub_track() (later) needs its cached
         #                             .idx/.sub/.words.json, not clean_srt
         vobsub_cache = None  # {"idx_path", "sub_path", "json_path"} from analyze_vobsub_track()
         if subs_enabled and chosen_subs is None and cfg.vobsub_ocr:
-            vobsub_track, _vobsub_tid = choose_vobsub(tracks, cfg.subs_track)
-            if vobsub_track is not None:
+            vobsub_candidates = _rank_image_sub_candidates(tracks, "S_VOBSUB", cp.get("language", ""))
+            if vobsub_candidates:
                 tesseract_cmd = locate_tesseract()
                 if tesseract_cmd is None:
                     print("  [warn] a VobSub (DVD bitmap) subtitle track exists but Tesseract "
@@ -2763,19 +3686,35 @@ def main(argv: list[str] | None = None) -> int:
                     if str(HERE) not in sys.path:
                         sys.path.insert(0, str(HERE))
                     import vobsub_ocr
-                    lang3 = vobsub_track["properties"].get("language") or "und"
-                    ocr_lang = cfg.vobsub_ocr_lang or "eng"
-                    cache_base = media.with_name(f"{media.stem}.{lang3}.vobsubocr")
-                    print(f"  subtitles: no text/sidecar/PGS track - OCR'ing VobSub track id "
-                          f"{vobsub_track['id']} [{lang3}] with Tesseract (this can take a "
-                          f"while on a full film; cached for reruns)...")
-                    stats = vobsub_ocr.analyze_vobsub_track(
-                        mkvextract, media, vobsub_track["id"], cache_base,
-                        lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
-                    action = "reusing cached" if stats["cached"] else "OCR'd"
-                    print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
-                          f"image cue(s) to text ({stats['entries']} entries)")
-                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                    best = None  # (stats, track, lang3) - see the PGS block above for why
+                    for i, cand in enumerate(vobsub_candidates):
+                        lang3 = cand["properties"].get("language") or "und"
+                        ocr_lang = cfg.vobsub_ocr_lang or "eng"
+                        cache_base = media.with_name(
+                            f"{media.stem}.{lang3}.vobsubocr" if i == 0
+                            else f"{media.stem}.{lang3}.t{cand['id']}.vobsubocr")
+                        label = cand["properties"].get("track_name") or ""
+                        print(f"  subtitles: no text/sidecar/PGS track - OCR'ing VobSub track id "
+                              f"{cand['id']} [{lang3}]{f' {label!r}' if label else ''} with "
+                              f"Tesseract (this can take a while on a full film; cached for "
+                              f"reruns)...")
+                        stats = vobsub_ocr.analyze_vobsub_track(
+                            mkvextract, media, cand["id"], cache_base,
+                            lang=ocr_lang, tesseract_cmd=tesseract_cmd, force=cfg.retranscribe)
+                        action = "reusing cached" if stats["cached"] else "OCR'd"
+                        print(f"  subtitles: {action} {stats['text_cues']}/{stats['image_cues']} "
+                              f"image cue(s) to text ({stats['entries']} entries)")
+                        if best is None or stats["text_cues"] > best[0]["text_cues"]:
+                            best = (stats, cand, lang3)
+                        if _ocr_coverage_is_good(stats["srt_path"]):
+                            break
+                        elif i + 1 < len(vobsub_candidates):
+                            print(f"  [note] coverage looks too sparse to trust ({stats['text_cues']}/"
+                                  f"{stats['image_cues']} cues) - trying another candidate VobSub "
+                                  f"track", file=sys.stderr)
+                    stats, vobsub_track, lang3 = best
+                    if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS \
+                            and _ocr_coverage_is_good(stats["srt_path"]):
                         raw_srt = stats["srt_path"]
                         chosen_subs = {"id": None, "type": "subtitles",
                                       "properties": {"language": lang3,
@@ -2789,8 +3728,8 @@ def main(argv: list[str] | None = None) -> int:
                               "the ORIGINAL bitmap with flagged words redacted in the image itself, "
                               "not a text conversion; expect occasional misreads/missed redactions")
                     else:
-                        print("  [warn] VobSub OCR produced too little usable text - discarding",
-                              file=sys.stderr)
+                        print(f"  [warn] VobSub OCR produced too little usable text across "
+                              f"{len(vobsub_candidates)} candidate track(s) - discarding", file=sys.stderr)
 
         if subs_enabled and chosen_subs is None and cfg.opensubtitles:
             if str(HERE) not in sys.path:
@@ -2816,6 +3755,35 @@ def main(argv: list[str] | None = None) -> int:
                     subs_tid = None
                     resynced_extra_srt = (synced_path, {"language": lang3, "track_name": os_name})
 
+        if subs_enabled and chosen_subs is None and cfg.subdl:
+            # Deliberately gated on chosen_subs still being None, not on WHY OpenSubtitles came
+            # up empty - a missing key, no match, a quota exhaustion, and a resync-validation
+            # rejection of a wrong-film match all look identical from here (chosen_subs never
+            # got set), and in every one of those cases this file still has zero subtitle
+            # corroboration without trying a second, independent source. See subdl.py.
+            if str(HERE) not in sys.path:
+                sys.path.insert(0, str(HERE))
+            import subdl
+            lang2 = (cfg.subdl_lang or "").lower() or subdl.LANG_3TO2.get(
+                (cp.get("language") or "").lower(), "en")
+            print(f"  subtitles: OpenSubtitles didn't provide a usable subtitle - trying SubDL "
+                  f"[{lang2}]...")
+            fetched = subdl.fetch_subtitle(media, cfg, force=cfg.retranscribe)
+            if fetched is not None:
+                raw_sdl_srt, sdl_meta = fetched
+                lang3 = subdl.LANG_2TO3.get(lang2, "und")
+                synced_path = media.with_name(f"{media.stem}.{lang2}.subdl.srt")
+                label = f"SubDL ({sdl_meta.get('release') or sdl_meta.get('sd_id')})"
+                result = resync_external_srt(raw_sdl_srt, get_transcript(), lang3, SUBDL_TRACK_SUFFIX,
+                                             synced_path, label)
+                if result is not None:
+                    synced_path, sdl_name = result
+                    raw_srt = synced_path
+                    chosen_subs = {"id": None, "type": "subtitles",
+                                  "properties": {"language": lang3, "track_name": sdl_name}}
+                    subs_tid = None
+                    resynced_extra_srt = (synced_path, {"language": lang3, "track_name": sdl_name})
+
         vocals_hits = None
         cached_instrumental = None   # a whole-track Instrumental stem produced "for free"
         #   alongside a Config.stem_retranscribe vocals pass below (build_vocals_stem's
@@ -2836,6 +3804,17 @@ def main(argv: list[str] | None = None) -> int:
                   "and re-run the missed spots.")
 
             n_ch = int(cp.get("audio_channels") or 2)
+            # Tried extending this to cfg.method == "replace" too (2026-10-21) on the
+            # theory that replace's own per-hit background bed could reuse this whole-
+            # track stem for free instead of re-stemming each span - reverted the same
+            # day: _run_separator_pair's dual-stem invocation (single_stem=None) is a
+            # DIFFERENT audio-separator call than the dedicated single_stem="Vocals"
+            # pass replace's own detection transcript depends on, and switching to it
+            # measurably changed the Vocals stem - enough to make Whisper's VAD miss a
+            # real, borderline-quiet flagged word on two consecutive runs that had
+            # caught it fine before. The background-bed RMS was already confirmed
+            # identical either way (see word_replace.py / AGENTS.md), so there was no
+            # real quality upside being bought - not worth risking a missed word for.
             also_instrumental = cfg.method == "mute" and cfg.mute_fill == "stems" and n_ch <= 2
 
             if not cfg.stem_retranscribe:
@@ -2871,6 +3850,8 @@ def main(argv: list[str] | None = None) -> int:
                 vocals_js = ensure_vocals_transcript(media, vocals_wav, tmp, cfg)
                 vocals_hits = scan_vocals_transcript(vocals_js, matchers)
 
+        per_hit_outcomes = None  # only ever set for cfg.method == "replace" (see below) - defined
+        #   here unconditionally so _build_report() can safely reference it for every method
         if cfg.method == "dialog":
             print("  method: dialog removal - stripping ALL dialogue (not just flagged words) "
                   "into a new (Wordless) track")
@@ -2883,7 +3864,8 @@ def main(argv: list[str] | None = None) -> int:
             clean_srt = None
         else:
             extra_hits = load_extra_spans(args.extra_spans) if args.extra_spans else None
-            spans, all_hits = find_spans(js, cfg, matchers, raw_srt, extra_hits, vocals_hits)
+            spans, all_hits = find_spans(js, cfg, matchers, raw_srt, extra_hits, vocals_hits,
+                                         media=media, tools=tools, tmp=tmp)
             total = sum(e - s for s, e, _ in spans)
             print(f"  flagged: {len(all_hits)} hit(s) -> {len(spans)} span(s) to {cfg.method}, {total:.1f}s")
             for s, e, hs in spans:
@@ -2973,8 +3955,22 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.method == "bleep":
                 clean_audio = bleep_track(ffmpeg, media, audio_pos, spans, cfg, chosen, tmp)
             elif cfg.method == "mute":
+                if cfg.mute_fill == "stems":
+                    ckpt_dir, resumed = _mute_checkpoint_dir(out_dir, media, audio_pos, spans, cfg)
+                    if resumed:
+                        print(f"  [note] resuming from a previous interrupted attempt - reusing "
+                              f"any already-stemmed span(s) found in {ckpt_dir.name}")
                 clean_audio, used_center = mute_track(ffmpeg, ffprobe, media, audio_pos, spans, cfg,
-                                                      chosen, tmp, stem_tool, cached_instrumental)
+                                                      chosen, tmp, stem_tool, cached_instrumental,
+                                                      ckpt_dir=ckpt_dir)
+            elif cfg.method == "replace":
+                if str(HERE) not in sys.path:
+                    sys.path.insert(0, str(HERE))
+                import word_replace
+                clean_audio, per_hit_outcomes = word_replace.replace_track(
+                    ffmpeg, ffprobe, media, audio_pos, spans, cfg, chosen, tmp, js,
+                    stem_tool=stem_tool, cached_whole_instrumental=cached_instrumental,
+                    stem_clip_fn=stem_clip_all_channels)
             elif src_codec == "mp3":
                 clean_audio, src_dur, new_dur = mp3_splice_cut(ffmpeg, ffprobe, media, audio_pos, spans, tmp)
                 lossless_splice = True
@@ -3012,18 +4008,30 @@ def main(argv: list[str] | None = None) -> int:
                       f"redacted directly in the image across {vobsub_stats['entries_touched']} "
                       f"entries")
             elif raw_srt is not None:
-                # mute: audio has no audible trace of the word left, so the
-                # subtitle removes it entirely rather than visibly marking
-                # it; bleep: the word is audibly replaced by a tone, so the
-                # subtitle marks it the same way with subs_mask ("***").
-                subs_mask = "" if cfg.method == "mute" else cfg.subs_mask
-                new_text, ncues, nwords = censor_srt(
-                    raw_srt.read_text(encoding="utf-8-sig"), spans, matchers,
-                    subs_mask, cfg.subs_pad)
+                if cfg.method == "replace":
+                    # Each flagged occurrence got its own independent outcome
+                    # (a real donor clip, a synthesized+voice-converted render,
+                    # or a mute fallback) from word_replace.replace_track()
+                    # above - the subtitle needs to show whichever word (or
+                    # nothing, for a muted occurrence) actually ended up in
+                    # the audio, not a single fixed mask for every match.
+                    new_text, ncues, nwords = word_replace.censor_srt_with_replacements(
+                        raw_srt.read_text(encoding="utf-8-sig"), spans, matchers,
+                        per_hit_outcomes, cfg.subs_pad)
+                    action = "replaced (or removed, where muted)"
+                else:
+                    # mute: audio has no audible trace of the word left, so the
+                    # subtitle removes it entirely rather than visibly marking
+                    # it; bleep: the word is audibly replaced by a tone, so the
+                    # subtitle marks it the same way with subs_mask ("***").
+                    subs_mask = "" if cfg.method == "mute" else cfg.subs_mask
+                    new_text, ncues, nwords = censor_srt(
+                        raw_srt.read_text(encoding="utf-8-sig"), spans, matchers,
+                        subs_mask, cfg.subs_pad)
+                    action = "removed" if subs_mask == "" else f"masked ({subs_mask!r})"
                 clean_srt = tmp / "clean.srt"
                 clean_srt.write_text(new_text, encoding="utf-8")
                 subs_stats = {"cues": ncues, "words": nwords}
-                action = "removed" if subs_mask == "" else f"masked ({subs_mask!r})"
                 print(f"  subtitles: {nwords} word(s) {action} across {ncues} cue(s)")
 
         report = final_dest.parent / f"{final_dest.stem}.bleeps.json"
@@ -3045,6 +4053,7 @@ def main(argv: list[str] | None = None) -> int:
                 "lossless_splice": lossless_splice if cfg.method == "cut" else None,
                 "id3_tags": id3_info if cfg.method == "cut" else None,
                 "used_center_channel_trick": used_center,
+                "replace_outcomes": per_hit_outcomes if cfg.method == "replace" else None,
                 "spans": [{"start": round(s, 3), "end": round(e, 3),
                            "matches": sorted({h["match"] for h in hs})} for s, e, hs in spans],
             }
@@ -3108,6 +4117,11 @@ def main(argv: list[str] | None = None) -> int:
         staging.replace(final_dest)
 
     report.write_text(json.dumps(_build_report(), indent=2), encoding="utf-8")
+
+    if ckpt_dir is not None:
+        # Only reached on a full, successful run - a kill/crash/exception never gets here, which
+        # is exactly what leaves the checkpoint dir behind for the next attempt to resume from.
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
 
     print(f"  wrote: {final_dest}")
     print(f"         {report.name}")

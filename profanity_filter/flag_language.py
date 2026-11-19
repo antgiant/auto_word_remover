@@ -42,6 +42,7 @@ import bisect
 import difflib
 import json
 import re
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -227,10 +228,44 @@ def _units_from_flat_words(words: list[dict]) -> list[Unit]:
     return units
 
 
+def _merge_srt_fragments(blocks: list[str]) -> list[str]:
+    """Reassembles a cue that got torn into multiple pieces by parse_srt's own
+    blank-line block splitter - confirmed 2026-11-19 on a real SubDL-sourced
+    download of Star Trek V (1989): that release has an EXTRA blank line
+    between a cue's own index/timestamp/text lines, not just between cues
+    ("1\\n\\n00:01:46,907 --> 00:01:48,671\\n\\nI thought weapons were
+    forbidden\\n\\n\\n\\n2\\n\\n..." - three blank-line gaps per cue instead
+    of one), which made `\\n\\s*\\n` split a 93KB, ~1550-cue file into 4636
+    one-line fragments and parse_srt() silently return ZERO units (every
+    fragment either had no "-->" line at all, or had one with no text
+    following it in the SAME fragment - both fail parse_srt's own `ts_idx`/
+    `text.strip()` checks). A bare cue INDEX (just digits) or a bare
+    TIMESTAMP line can never be a complete, standalone cue by SRT's own
+    grammar, so either one is merged forward into the next block
+    unconditionally - a no-op on a normally-formatted file (where neither
+    ever appears as its own block to begin with), real repair on this
+    one."""
+    merged: list[str] = []
+    pending: list[str] = []
+    for block in blocks:
+        stripped = block.strip()
+        is_bare_index = stripped.isdigit()
+        is_bare_timestamp = "-->" in stripped and len(stripped.splitlines()) == 1
+        if is_bare_index or is_bare_timestamp:
+            pending.append(block)
+            continue
+        pending.append(block)
+        merged.append("\n\n".join(pending))
+        pending = []
+    if pending:
+        merged.append("\n\n".join(pending))
+    return merged
+
+
 def parse_srt(path: Path, kind: str = "srt") -> list[Unit]:
     raw = path.read_text(encoding="utf-8-sig")
     units: list[Unit] = []
-    for block in re.split(r"\n\s*\n", raw.strip()):
+    for block in _merge_srt_fragments(re.split(r"\n\s*\n", raw.strip())):
         lines = [ln for ln in block.splitlines() if ln.strip()]
         ts_idx = next((j for j, ln in enumerate(lines) if "-->" in ln), None)
         if ts_idx is None:
@@ -364,6 +399,590 @@ def _scan_unit(unit: Unit, matchers: dict[str, re.Pattern | None], ctx: int) -> 
     return hits
 
 
+_HALLUCINATION_MIN_GAP_S = 15.0  # minimum time between two occurrences of the same line before
+#   treating the later one as a suspected repetition-loop hallucination rather than real
+#   dialogue - a quick stutter or call-and-response repeat happens within a few seconds; every
+#   confirmed hallucination found so far (Elemental (2023), 2026-11-17 - WhisperX repeating an
+#   earlier real line of dialogue verbatim 7 times during a musical/emotional climax scene with
+#   no actual speech) recurred 28-270s after the real line. Comfortably below that smallest real
+#   gap while still well clear of any quick genuine repeat.
+_HALLUCINATION_MIN_CHARS = 20   # ignore short/common lines ("No!", "I love you.") that
+#   legitimately recur throughout any film on their own - only a longer, more specific line
+#   repeating verbatim is a meaningful signal.
+_HALLUCINATION_LOGPROB_GAP = 0.35   # how much worse than the file's own median avg_logprob a
+#   repeated segment must score before it's treated as a hallucination rather than real
+#   repeated dialogue - repetition ALONE is not a safe signal on its own: validated live
+#   2026-11-17 on Elemental (2023), where plain repeated-text detection (no confidence check)
+#   flagged 25 segments, but 17 of those were GENUINE repeats with ordinary confidence
+#   (median -0.165) - a song's chorus reprised later in the film, a story narrated twice, a
+#   generic question ("What are you doing here?") asked in two different scenes. Only the 8
+#   segments that were BOTH a repeat AND scored markedly worse (-0.52 to -1.20, i.e. at least
+#   this far below the file's median) were confirmed actual hallucinations by listening to
+#   context. 0.35 was picked to sit cleanly between the worst genuine repeat found (-0.29) and
+#   the best confirmed hallucination (-0.52) on that file - see AGENTS.md for the full
+#   before/after segment dump this was tuned against.
+_HALLUCINATION_EPISODE_MAX_GAP_S = 120.0  # max elapsed time between two ADJACENT segments (by
+#   list position) for the low-confidence-run extension below to treat them as part of the
+#   same hallucination episode - keeps a real scene change/pause from bridging two unrelated
+#   low-confidence moments into one. The confirmed 12-segment episode (Elemental (2023)
+#   {edition-Wooley Cut}, 2026-11-17) had gaps up to 87s BETWEEN its own scattered hallucinated
+#   lines (each one a short fabricated utterance dropped into an otherwise silent/musical
+#   stretch, not literally back-to-back) - an earlier 20s cap missed most of that same episode
+#   entirely. 120s gives real margin above the worst gap actually seen while still well under
+#   a genuine scene-to-scene jump.
+
+
+def _normalize_for_repeat_check(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", text.lower())).strip()
+
+
+def detect_repeated_segments(path: str | Path) -> dict[str, dict]:
+    """Flags WhisperX repetition-loop hallucinations: segments whose text is a near-verbatim
+    repeat of an EARLIER segment's text, well separated in time, AND scored notably less
+    confidently than the file's own typical segment - a known Whisper-family failure mode
+    where, during a stretch of audio with no real matching speech (silence, music, sound
+    effects), the decoder gets stuck replaying a line from its own prior context instead of
+    transcribing what's actually there. condition_on_previous_text=False and a
+    repetition_penalty are already set in voice_to_text/transcribe.py specifically to reduce
+    this, but neither eliminates it outright - confirmed live 2026-11-17 on Elemental (2023): a
+    real, contextually-coherent line ("Holy shit, stop being such a dick.") legitimately spoken
+    once during an argument scene at 4284s was then repeated near-verbatim 7 more times between
+    5761s-6052s during the film's musical/emotional climax, muting ambient score/dialogue that
+    was never profanity at all. 8 of that file's 29 total wordlist hits (28%) were this
+    artifact.
+
+    Repeated text ALONE is not a safe signal - see _HALLUCINATION_LOGPROB_GAP's docstring for
+    why a confidence check is REQUIRED, not just recorded for visibility. Confirmed the forced-
+    aligner's per-word "score" is NOT a usable substitute for that confidence check (statistically
+    indistinguishable between hallucinated and real words - see transcribe.py's own 2026-10-01
+    finding) - this uses the ASR decoder's own avg_logprob instead, captured separately for
+    exactly this reason (see transcribe.py's CONFIDENCE_KEYS).
+
+    Only meaningful for a `.json` transcript with WhisperX-style `segments` carrying
+    avg_logprob (this is the only format with both full segment text AND that field) - returns
+    {} for anything else, including a `.words.json`/flat-word file (no segment-level text to
+    compare) or a file with no avg_logprob recorded at all (an older transcript, or one from a
+    pipeline run that dropped it - see transcribe.py's own pre_align_meta fallback warning).
+
+    Returns {locator: {reason, matched_locator, gap_s, avg_logprob, median_avg_logprob}} for
+    every segment identified as a hallucination - the locator format ("segment N") matches what
+    parse_json()/scan_file() already uses, so a caller can filter scan_file()'s own hits by
+    `hit["locator"] in detect_repeated_segments(path)` with no further plumbing needed. The
+    FIRST occurrence of a repeated line is never flagged - only the later one(s), since that's
+    the real line and the later ones are the hallucinated copies."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    segs = data.get("segments") if isinstance(data, dict) else None
+    if not segs:
+        return {}
+
+    logprobs = [s.get("avg_logprob") for s in segs if s.get("avg_logprob") is not None]
+    if not logprobs:
+        return {}  # no confidence data at all - repeated text alone isn't trustworthy enough
+    median_lp = statistics.median(logprobs)
+    threshold_lp = median_lp - _HALLUCINATION_LOGPROB_GAP
+
+    normalized = [_normalize_for_repeat_check(s.get("text") or "") for s in segs]
+    first_seen: dict[str, int] = {}
+    suspects: dict[str, dict] = {}
+    for i, norm in enumerate(normalized):
+        if len(norm) < _HALLUCINATION_MIN_CHARS:
+            continue
+        start_i = segs[i].get("start")
+        if start_i is None:
+            continue
+        j = first_seen.get(norm)
+        if j is None:
+            first_seen[norm] = i
+            continue
+        start_j = segs[j].get("start")
+        if start_j is None or start_i - start_j < _HALLUCINATION_MIN_GAP_S:
+            continue  # too close together to be a repetition-loop rather than real repeated dialogue
+        lp_i = segs[i].get("avg_logprob")
+        if lp_i is None or lp_i > threshold_lp:
+            continue  # repeated, but ordinary confidence - a genuine repeat (reprised song
+            #   lyrics, a story told twice, a generic line reused in a different scene), not a
+            #   hallucination - see _HALLUCINATION_LOGPROB_GAP
+        suspects[f"segment {i}"] = {
+            "reason": "repeated-text",
+            "matched_locator": f"segment {j}",
+            "gap_s": round(start_i - start_j, 1),
+            "avg_logprob": segs[i].get("avg_logprob"),
+            "median_avg_logprob": median_lp,
+        }
+
+    # A hallucination EPISODE often isn't just one repeated line - once the decoder is stuck,
+    # it can keep producing a whole cascade of VARIED fabricated lines, not just verbatim
+    # repeats of one phrase. Confirmed live 2026-11-17 on Elemental (2023) {edition-Wooley
+    # Cut}: a 12-segment run (5685s-6073s+) was uniformly far below the confidence threshold,
+    # but exact-repeat matching above only caught 2 of those 12 - the other 10 ("I love you,
+    # you stupid bastard.", "I'm not a bitch, stop being such a dick.", "Get your ass over
+    # here.", ...) were each the FIRST time their specific wording appeared in this file,
+    # despite scoring just as badly as their already-anchored neighbors. Extend every anchor
+    # found above through any IMMEDIATELY ADJACENT segment (by list position, not elapsed
+    # time) that's ALSO below the confidence threshold, capped at
+    # _HALLUCINATION_EPISODE_MAX_GAP_S between consecutive segments so a real scene change or
+    # pause can't bridge two unrelated low-confidence moments into one episode - confirmed this
+    # correctly stops at the boundary of a legitimate reprised song in the same file (whose
+    # segments scored -0.37 to -0.42, worse than the file's typical dialogue but still above
+    # this threshold).
+    #
+    # NOTE: a segment that a LATER one's repeated-text match points back to as the "original"
+    # (every suspect's own matched_locator) is NOT assumed real and is NOT exempted from this
+    # extension - that assumption was tried and directly disproved 2026-11-18: "Holy shit, stop
+    # being such a dick." was treated as confirmed-real in the main (non-Wooley-Cut) file
+    # (segment 991, matched_locator for 1226/1229/1230) specifically BECAUSE it repeated later,
+    # on the theory that repetition is evidence something was real enough for the decoder to
+    # latch onto - manual listening confirmed this exact line is ALSO fake there. Proof it's a
+    # pure decoder artifact, not scene-dependent: segments 0 ("What the hell is wrong with
+    # you?") and 402/393 ("What the hell is that?") score within 0.002 of each other between
+    # the main file and Wooley Cut (-0.840/-0.840 and -1.066/-1.068) at nearly the same relative
+    # position in both cuts - the model hallucinates this same cluster of lines the same way
+    # regardless of which edit it's fed, with no real occurrence in either one. So a
+    # matched_locator segment is evaluated purely on its own confidence/adjacency like anything
+    # else below - if something qualifies it for this extension, it gets flagged too.
+    frontier = set(suspects)
+    while frontier:
+        new_frontier = set()
+        for loc in frontier:
+            i = int(loc.split()[1])
+            t_i = segs[i].get("start")
+            for ni in (i - 1, i + 1):
+                if not (0 <= ni < len(segs)):
+                    continue
+                nloc = f"segment {ni}"
+                if nloc in suspects:
+                    continue
+                lp_n = segs[ni].get("avg_logprob")
+                t_n = segs[ni].get("start")
+                if lp_n is None or lp_n > threshold_lp or t_i is None or t_n is None \
+                        or abs(t_n - t_i) > _HALLUCINATION_EPISODE_MAX_GAP_S:
+                    continue
+                suspects[nloc] = {
+                    "reason": "contiguous-low-confidence-run",
+                    "matched_locator": None,
+                    "gap_s": None,
+                    "avg_logprob": lp_n,
+                    "median_avg_logprob": median_lp,
+                }
+                new_frontier.add(nloc)
+        frontier = new_frontier
+    return suspects
+
+
+_KNOWN_HALLUCINATION_PHRASES = (
+    # Confirmed recurring VERBATIM-OR-NEAR-VERBATIM across wildly unrelated films - a dead
+    # giveaway of a stable decoder bias (something in this specific WhisperX model's training
+    # data it reaches for during ambiguous/low-signal audio), not real dialogue from any one
+    # film. Matched as case-insensitive SUBSTRINGS of the normalized segment text, not exact
+    # lines, since the model varies the exact wording around a stable "favorite" core phrase.
+    #
+    # Deliberately narrower than first attempted: "what the hell is wrong with you" and "what
+    # the hell is that" were ALSO tried and had to be dropped - a full-library sweep
+    # (2026-11-18) found them matching ordinary, plausibly-real dialogue in films like The
+    # Truth About Charlie (2002), City of Ember (2008), and Babe: Pig in the City (1998) - both
+    # are just common enough reactive lines that real characters legitimately say them too
+    # often to trust alone, even confidence-gated. The phrases kept below are different in
+    # kind: compound, unusual insult pairings distinctive enough that their cross-film spread
+    # is implausible as real dialogue - confirmed appearing (all confidence-gated, i.e. each
+    # one ALSO scored notably below its own file's median) in The Wizard of Oz (1939), The
+    # General (1926, a Buster Keaton SILENT film - no spoken dialogue track exists for it to
+    # transcribe at all), Animal Crackers (1930), Horse Feathers (1932), The Jungle Book
+    # (1942), Ben-Hur (1959), Charlotte's Web (1973), Chitty Chitty Bang Bang (1968), Big Hero
+    # 6 (2014), multiple Christian documentaries (Revelation, God of Wonders, Noah, Samson),
+    # and Elemental (2023)/Aladdin (1992) {edition-No Jafar Cut}, where this was first
+    # confirmed - no genre, era, or content rating in common, which real dialogue would need.
+    "stupid bastard",
+    "stop being such a dick",
+    "holy shit, stop being",
+    "get your ass over here",
+    "not a bitch",
+)
+
+
+def detect_known_hallucination_phrases(path: str | Path) -> dict[str, dict]:
+    """Flags a segment as a suspected hallucination when its text contains one of
+    _KNOWN_HALLUCINATION_PHRASES AND it scores notably below this file's own median
+    avg_logprob (the same _HALLUCINATION_LOGPROB_GAP threshold detect_repeated_segments uses) -
+    independent of repetition entirely, unlike every other check in this module. This is the
+    ONLY check here that needs no subtitle/CC and no earlier repeat within the SAME file to
+    work from, which makes it the one signal that still helps a file with no safety net at all
+    (no usable CC on the file itself or any sibling edition - see Aladdin (1992) {edition-No
+    Jafar Cut}, which has neither, confirmed live 2026-11-18: 8 of its hits that the
+    repetition-based detector left untouched - lone, non-repeated lines like "Holy shit, stop
+    being such a dick.", "...you stupid bastard?", "Get your ass over here right now." - are
+    now caught by phrase match alone).
+
+    Deliberately requires the confidence gate on top of the phrase match: a real film COULD
+    legitimately contain one of these common insults in a real, well-transcribed scene, and
+    the phrase match alone isn't enough to rule that out - only phrase match AND notably-worse-
+    than-this-file's-own-typical confidence together should be trusted. If this list ever
+    produces a confirmed false positive, that's real evidence a specific phrase here is more
+    common in genuine dialogue than assumed and should be removed, not tightened further - it
+    is NOT a substitute for the confidence gate.
+
+    Returns {locator: {reason, matched_locator, gap_s, avg_logprob, median_avg_logprob}} in the
+    same shape every other check in this module returns, for the same reason: so scan_file()'s
+    own hits can filter by `hit["locator"] in detect_known_hallucination_phrases(path)` with no
+    extra plumbing."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    segs = data.get("segments") if isinstance(data, dict) else None
+    if not segs:
+        return {}
+    logprobs = [s.get("avg_logprob") for s in segs if s.get("avg_logprob") is not None]
+    if not logprobs:
+        return {}
+    median_lp = statistics.median(logprobs)
+    threshold_lp = median_lp - _HALLUCINATION_LOGPROB_GAP
+    suspects: dict[str, dict] = {}
+    for i, s in enumerate(segs):
+        lp = s.get("avg_logprob")
+        if lp is None or lp > threshold_lp:
+            continue
+        text_norm = (s.get("text") or "").lower()
+        if any(phrase in text_norm for phrase in _KNOWN_HALLUCINATION_PHRASES):
+            suspects[f"segment {i}"] = {
+                "reason": "known-hallucination-phrase",
+                "matched_locator": None,
+                "gap_s": None,
+                "avg_logprob": lp,
+                "median_avg_logprob": median_lp,
+            }
+    return suspects
+
+
+_HALLUCINATION_RESCUE_WINDOW_S = 8.0  # how far from a suspected-hallucination hit's own
+#   timestamp to look for a confirming subtitle/CC cue - generous enough to absorb the
+#   transcript's own small timing slop (and the coarser cue-level timing a sidecar/OpenSubtitles
+#   source carries after resync) without being so wide it risks matching an unrelated,
+#   coincidental use of the same word elsewhere in a busy scene.
+
+
+def rescue_via_subtitle(hallucinated_hits: list[dict], sub_units: list[Unit]) -> list[dict]:
+    """Un-flags a suspected-hallucination hit when an INDEPENDENTLY-authored subtitle/CC cue
+    near its timestamp actually contains the matched word. A hallucination filter trades real
+    risk in both directions - the whole point is cutting false positives (muting audio that was
+    never profanity), but being too aggressive about it reintroduces false negatives (missing
+    real profanity) instead, which is just as real a failure for this tool. The embedded
+    subtitle/CC track (or a sidecar/OpenSubtitles one, already resynced to this recording's own
+    timeline by the time a caller has one to pass in - see resync_external_srt()) was never
+    generated by the same ASR decoder that's doing the hallucinating, so if IT independently
+    confirms the word was said near that moment, the word really was there regardless of how
+    suspicious the transcript's own repetition/confidence signals looked on their own -
+    overriding the filter is the more conservative choice in that specific case.
+
+    `sub_units` is whatever parse_srt() (or any other Unit-producing parser) already returned -
+    this function doesn't parse anything itself, so a caller that already has units in hand
+    (e.g. clean.py's find_spans(), which already extracts/parses a subtitle source for
+    backfill_from_srt()) doesn't pay to re-read the file.
+
+    Returns the hits that are STILL considered hallucinated after this check (i.e. the ones
+    NOT found in `sub_units` are passed through unchanged; a rescued hit is removed from the
+    returned list and the caller's own `hits` is expected to already have it available by
+    identity if it wants to report what got rescued - this function itself only filters)."""
+    still_bad = []
+    for h in hallucinated_hits:
+        t = h["time"]
+        if t is None:
+            still_bad.append(h)
+            continue
+        word = _norm_tok(h["match"].split()[-1])
+        confirmed = any(
+            u.start is not None and u.start - _HALLUCINATION_RESCUE_WINDOW_S <= t
+            <= (u.end if u.end is not None else u.start) + _HALLUCINATION_RESCUE_WINDOW_S
+            and any(_norm_tok(tok) == word for tok in u.text.split())
+            for u in sub_units
+        )
+        if confirmed:
+            h["suspected_hallucination"]["rescued_by_subtitle"] = True
+        else:
+            still_bad.append(h)
+    return still_bad
+
+
+_CC_SFX_CUE_RE = re.compile(r"^(\([^)]*\)|\[[^\]]*\])$")   # SDH sound-effect cues use either
+#   bracket style depending on the source - "(WAVES LAPPING)" (Elemental (2023)'s embedded
+#   SRT) vs. "[LIGHT SWITCH CLICKS]" (Home Alone (1990)'s) - confirmed 2026-11-18 the square-
+#   bracket style is just as real an SDH track (3.5% of Home Alone's 1752 cues, well above
+#   _CC_MIN_SFX_FRACTION) and was being wrongly classified as dialogue-only by only matching
+#   parens, which would have silently refused a perfectly good absence-of-coverage signal.
+_CC_MIN_CUES = 50   # minimum total cues before trusting a "full CC" classification below - a
+#   tiny forced/partial subtitle track could spuriously look SFX-heavy by fraction alone from
+#   just a handful of cues.
+_CC_MIN_SFX_FRACTION = 0.02   # share of cues that are a PURE bracketed sound-effect
+#   description ("(WAVES LAPPING)", "(HORN BLOWS)") before treating a subtitle source as a
+#   full SDH-style closed-caption track - one that transcribes non-dialogue audio too, not
+#   just speech - rather than a dialogue-only one. Measured 2026-11-18 on Elemental (2023): the
+#   main cut's embedded SRT is 24.5% pure-SFX cues (482/1965) - a real SDH track; the Wooley
+#   Cut edition's OpenSubtitles-sourced SRT is 0% (0/1159) - dialogue only, as expected from a
+#   fan-resynced third-party source that was never trying to describe non-speech audio. 2%
+#   leaves wide margin below the real case while still requiring more than an occasional
+#   one-off bracketed aside ("(laughs)") in an otherwise dialogue-only track.
+_DIALOGUE_TRACK_MIN_CUES = 300   # minimum cues before trusting a DIALOGUE-ONLY subtitle (one
+#   that fails _is_full_cc - no SFX-cue coverage) for exclude_via_cc_word_absence specifically.
+#   Confirmed 2026-11-18: Balto (1995, 752-cue OpenSubtitles track) and Cars (2006, 2032-cue
+#   studio track) both correctly show no nearby cue for confirmed-fake "fuck" hallucinations
+#   (the REAL line in Cars - "You were booking!" - reveals exactly how "booking" got misheard
+#   as "fucking"); Big (1988)'s 995-cue English dialogue track shows the matching line VERBATIM
+#   for one "fuck" hit (a real, MPAA-permitted single use in a PG film) and nothing nearby for
+#   a second, confirmed-fake one in the SAME file - word-presence/absence from a merely dense
+#   dialogue track is just as reliable as rescue_via_subtitle already assumes (that function has
+#   never required _is_full_cc). Set well above _CC_MIN_CUES (50) specifically to exclude thin
+#   forced/signs-only tracks, not to second-guess SDH classification - confirmed on the SAME
+#   Big (1988) file, which also ships an 8-cue French forced track and an 11-cue Spanish one.
+#   Deliberately NOT applied to exclude_via_cc_absence (the stricter "no cue of ANY kind"
+#   check) - that one's claim is broader (nothing happened at all, not just nothing SAID) and
+#   a dialogue-only track was never trying to describe non-speech audio, so staying full-CC-
+#   only there is still the right call.
+
+
+def _is_substantial_dialogue_track(sub_units: list[Unit]) -> bool:
+    """True if `sub_units` has enough cues to trust as a working dialogue subtitle (see
+    _DIALOGUE_TRACK_MIN_CUES) - weaker than _is_full_cc (doesn't require describing non-
+    dialogue audio), but still enough to rule out a near-empty forced/signs-only track."""
+    return len(sub_units) >= _DIALOGUE_TRACK_MIN_CUES
+
+
+_HALLUCINATION_NO_CC_WINDOW_S = 12.0   # how far from a hit's own timestamp to look for ANY cue
+#   (dialogue or sound-effect) before treating total silence in a full CC track as independent
+#   confirmation nothing was said there at all. Wider than _HALLUCINATION_RESCUE_WINDOW_S
+#   because this makes the OPPOSITE claim (absence proves nothing was said, not presence
+#   confirms something was) - it should tolerate more CC timing slop before concluding
+#   "nothing's there" rather than risk wrongly excluding real dialogue over a sync offset.
+
+
+def find_shared_prefix_cutoff(segs_a: list[dict], segs_b: list[dict],
+                              tol: float = 0.1) -> float | None:
+    """Returns the timestamp through which two WhisperX segment lists - typically different
+    editions/cuts of the same title - are text-AND-timing identical, or None if they diverge
+    on their very first segment. Confirmed 2026-11-18: Elemental (2023) and its Wooley Cut
+    edition share an exact (same text, start time within 0.05s) prefix through segment 118 /
+    t=633.3s before the fan edit's first actual change (segment 119: "I'm doing a reading."
+    vs. "Sorry, gotta grab some stuff.") - meaning the opening ~10.5 minutes, including the
+    entire Disney+Pixar logo sequence, is bit-identical audio in both cuts, despite the fan
+    edit's own subtitle track being too sparse/unreliable to help on its own.
+
+    A confirmed-identical prefix like this means evidence gathered against ONE cut in that
+    range (e.g. a full SDH CC track that only exists on the other cut - see
+    exclude_via_cc_absence) is just as valid for the other cut's own hits in the same range,
+    without needing full cross-edit realignment past the point where they actually diverge."""
+    n = min(len(segs_a), len(segs_b))
+    cutoff = None
+    for i in range(n):
+        a, b = segs_a[i], segs_b[i]
+        if a.get("text") != b.get("text") or abs((a.get("start") or 0) - (b.get("start") or 0)) > tol:
+            break
+        cutoff = a.get("start")
+    return cutoff
+
+
+def find_local_alignment_offset(segs_a: list[dict], segs_b: list[dict], target_b_idx: int,
+                                max_block_distance: int = 20, min_blocks: int = 2,
+                                max_offset_stddev: float = 3.0) -> float | None:
+    """Returns a reliable local time offset (segs_a's time - segs_b's time) for mapping a
+    timestamp in `segs_b` (e.g. a hallucination hit in an edition's own transcript) onto the
+    corresponding point in `segs_a` (e.g. a sibling edition's transcript), for use past
+    find_shared_prefix_cutoff's point - i.e. once the two cuts have already diverged and a
+    single global offset no longer applies, but short stretches may still be genuinely
+    unedited between the two cuts, just shifted by whatever's been added/removed before them.
+
+    Derived from TEXT-matching blocks (difflib.SequenceMatcher on segment text) near
+    `target_b_idx`, deliberately EXCLUDING any block that contains target_b_idx itself. That
+    exclusion is the whole point, not an optimization: confirmed 2026-11-18 on Elemental (2023)
+    {edition-Wooley Cut} segment 725 ("Oh my gosh", a confirmed hallucination at t=3119.4) -
+    its own text happens to exactly match a GENUINELY REAL "Oh, my gosh!" line in the main cut
+    at t=3135.3, an unrelated story moment the two cuts' edits have drifted apart from. Using
+    that coincidental match's own offset (~16.4s) would silently validate the wrong position.
+    The blocks immediately before and after it (not containing it) agree on a quite different,
+    mutually consistent ~8.3s offset - which the coincidental match's own offset disagrees with
+    enough that requiring low variance across surrounding blocks protects against exactly this
+    trap. A WhisperX decoder can hallucinate a phrase that also occurs for real elsewhere in
+    the same film, so text equality AT the hit itself is never trustworthy alignment evidence.
+
+    Returns None - the safe, request-nothing-happen default - unless at least `min_blocks`
+    qualifying blocks exist within `max_block_distance` list positions of `target_b_idx` and
+    their offsets agree within `max_offset_stddev` of each other. A caller only uses the
+    returned offset to look for ADDITIONAL exclusion evidence (see exclude_via_cc_absence /
+    exclude_via_cc_word_absence) - never to protect or confirm a hit - so the worst case of a
+    missing or wrong offset is simply failing to catch something, not a new false exclusion."""
+    a_texts = [s.get("text") for s in segs_a]
+    b_texts = [s.get("text") for s in segs_b]
+    sm = difflib.SequenceMatcher(None, a_texts, b_texts, autojunk=False)
+    offsets = []
+    for blk in sm.get_matching_blocks():
+        if blk.size == 0 or (blk.b <= target_b_idx < blk.b + blk.size):
+            continue
+        if abs((blk.b + blk.size // 2) - target_b_idx) > max_block_distance:
+            continue
+        a_t = segs_a[blk.a].get("start")
+        b_t = segs_b[blk.b].get("start")
+        if a_t is not None and b_t is not None:
+            offsets.append(a_t - b_t)
+    if len(offsets) < min_blocks:
+        return None
+    if statistics.pstdev(offsets) > max_offset_stddev:
+        return None
+    return statistics.mean(offsets)
+
+
+_SIBLING_MIN_OVERLAP_SEGMENTS = 50   # minimum total matching-block size (see
+#   has_substantial_overlap) before treating two files as the same underlying film worth
+#   cross-referencing at all, when they don't even share a leading prefix (find_shared_prefix_
+#   cutoff returned 0) - guards against wasting OCR effort (_find_usable_sub_units in clean.py
+#   can be expensive) on a candidate that just happens to share a directory, not real content.
+
+
+def has_substantial_overlap(segs_a: list[dict], segs_b: list[dict]) -> bool:
+    """True if `segs_a` and `segs_b` share enough matching segment TEXT somewhere - not
+    necessarily at the start - to be worth treating as two versions of the same film at all.
+    Unlike find_shared_prefix_cutoff (which requires an exact, index-aligned PREFIX - two cuts
+    sharing a literal master, like an edition re-edit), this allows matches anywhere, in any
+    order, which is what two INDEPENDENT rips/encodes of the same film need: confirmed
+    2026-11-18 that Apollo 13 (1995) and Apollo 13 (1995) (HD) don't share a prefix at all
+    (their very first segments are completely different - the HD rip's own opening is itself
+    a hallucination, and the two releases carry different amounts of lead-in narration before
+    the content lines up) despite being the same film through and through, just different
+    sources/cuts of the opening minutes. find_local_alignment_offset already handles per-hit
+    alignment once a candidate passes this gate - this function only decides whether it's
+    worth trying at all, which is why it's just a total-overlap-size check, not a timestamp."""
+    a_texts = [s.get("text") for s in segs_a]
+    b_texts = [s.get("text") for s in segs_b]
+    sm = difflib.SequenceMatcher(None, a_texts, b_texts, autojunk=False)
+    total = sum(b.size for b in sm.get_matching_blocks())
+    return total >= _SIBLING_MIN_OVERLAP_SEGMENTS
+
+
+def _is_full_cc(sub_units: list[Unit]) -> bool:
+    """True if `sub_units` looks like a full SDH-style closed-caption track that transcribes
+    non-dialogue audio (sound effects, music cues) as well as speech, not just a dialogue-only
+    subtitle - see _CC_MIN_SFX_FRACTION's docstring for how this was calibrated. Only a track
+    like this makes silence itself meaningful evidence (see exclude_via_cc_absence); a
+    dialogue-only source says nothing about a pure-music/silent stretch even when it has no
+    cue there, since it was never trying to describe non-speech audio in the first place."""
+    if len(sub_units) < _CC_MIN_CUES:
+        return False
+    sfx = sum(1 for u in sub_units if _CC_SFX_CUE_RE.match((u.text or "").strip()))
+    return sfx / len(sub_units) >= _CC_MIN_SFX_FRACTION
+
+
+def exclude_via_cc_absence(hits: list[dict], sub_units: list[Unit], reason: str = "no-cc-coverage") -> None:
+    """Flags a wordlist hit as a suspected hallucination - independent of, and a different
+    mechanism from, detect_repeated_segments' repetition/confidence check - when a full
+    SDH-style CC track (see _is_full_cc) has NO cue of any kind, dialogue or sound-effect,
+    anywhere near its timestamp. This catches exactly what repetition-based detection
+    structurally cannot: a hallucination that occurs only ONCE in the file with nothing earlier
+    to repeat-match against. Confirmed 2026-11-18 on Elemental (2023): "What the hell is wrong
+    with you?" at 0:06 falls inside the main cut's own CC track's completely silent 0:00-1:01
+    opening (the Disney + Pixar logo sequence - music only, not even a sound-effect cue) yet
+    was invisible to the repeated-text detector since it's the first, not a later, occurrence
+    of that exact line.
+
+    Does nothing when `sub_units` doesn't look like a full CC - silence in a dialogue-only
+    subtitle proves nothing about a pure-music stretch, since such a track was never attempting
+    to describe non-speech audio at all (see _is_full_cc).
+
+    Mutates `hits` in place (sets suspected_hallucination on the ones newly caught) and returns
+    None - mirrors detect_repeated_segments/scan_file's own already-in-place hit mutation
+    pattern, unlike rescue_via_subtitle's filter-and-return-a-new-list shape, since this is
+    ADDING markers rather than removing hits from a list. Only evaluates hits NOT already
+    flagged by the caller - this is a second, independent path onto the same
+    suspected_hallucination marker, not a replacement for the repetition-based one."""
+    if not _is_full_cc(sub_units):
+        return
+    for h in hits:
+        if h.get("suspected_hallucination"):
+            continue
+        t = h.get("time")
+        if t is None:
+            continue
+        nearby = any(
+            u.start is not None and u.start - _HALLUCINATION_NO_CC_WINDOW_S <= t
+            <= (u.end if u.end is not None else u.start) + _HALLUCINATION_NO_CC_WINDOW_S
+            for u in sub_units
+        )
+        if not nearby:
+            h["suspected_hallucination"] = {
+                "reason": reason,
+                "matched_locator": None,
+                "gap_s": None,
+                "avg_logprob": None,
+                "median_avg_logprob": None,
+            }
+
+
+def exclude_via_cc_word_absence(hits: list[dict], sub_units: list[Unit],
+                                reason: str = "no-cc-word-match") -> None:
+    """A stronger sibling of exclude_via_cc_absence for the case that one can't catch: a busy,
+    well-covered scene (lots of CC cues nearby - a crowd cheering, music, other dialogue) where
+    none of those cues contain the matched word itself. exclude_via_cc_absence requires total
+    silence, so it correctly does nothing here - there IS plenty of CC activity nearby, just not
+    this word - but that's exactly the situation a full SDH track is positioned to adjudicate:
+    captioners transcribe profanity/exclamations verbatim (accessibility standards require
+    capturing meaningful dialogue regardless of volume, unlike an automated VAD/ASR system),
+    so if the scene is confirmed covered but this specific word never appears anywhere nearby,
+    that's real evidence against it, not just an absence of evidence.
+
+    Confirmed 2026-11-18 on Elemental (2023): the main cut's hallucinated "What the hell is
+    that?" at 1765s sits inside a loudly-captioned celebration scene ("We love you, Lutz!",
+    "(CHEERING)", "Yay! Yeah! Way to go, Lutz!", "(WHISTLE BLOWS)") - exclude_via_cc_absence
+    can't touch it (the window is full of other cues) but none of those cues contain "hell"
+    anywhere nearby, and the Wooley Cut edition hallucinates the exact same line at the
+    aligned position in its own cut (see find_shared_prefix_cutoff's docstring and
+    find_local_alignment_offset) - two independent cuts agreeing on a fabrication is itself
+    further evidence it's a shared decoder artifact, not real dialogue either cut's captioners
+    ever had reason to transcribe.
+
+    Reuses the exact same word-match logic as rescue_via_subtitle (same
+    _HALLUCINATION_RESCUE_WINDOW_S), just inverted and applied to hits the caller hasn't
+    already flagged - a hit this WOULD rescue if it were already flagged is, by construction,
+    never caught here, so the two functions can't contradict each other on the same hit.
+
+    Gated on _is_full_cc OR _is_substantial_dialogue_track - unlike exclude_via_cc_absence,
+    which stays full-CC-only (its claim is broader: nothing happened at all, not just nothing
+    SAID). Confirmed 2026-11-18 this widening is safe: a merely dense dialogue-only track
+    (Balto (1995)'s 752-cue OpenSubtitles track, Cars (2006)'s 2032-cue studio track, Big
+    (1988)'s 995-cue English track) is just as reliable here as rescue_via_subtitle already
+    assumes for the opposite direction (that function has never required _is_full_cc either).
+    Big (1988) is the clean proof: its own dialogue track correctly shows nothing nearby for
+    one "fuck" hit (fake) and the line VERBATIM for a different one (a real, MPAA-permitted
+    single use in this PG film) - word-presence/absence works the same regardless of whether
+    the track also covers sound effects, since it was always about SPEECH specifically.
+
+    Carries real risk a plain silence check doesn't: even a thorough SDH track can occasionally
+    paraphrase a quick exclamation into a generic cue ("(EXCLAIMS)") rather than transcribing it
+    verbatim, which would make this wrongly treat a real line as absent. Verify the blast radius
+    broadly (not just on one already-confirmed file) before trusting this at library scale -
+    see the 2026-11-18 commit message for how this was checked before shipping."""
+    if not (_is_full_cc(sub_units) or _is_substantial_dialogue_track(sub_units)):
+        return
+    for h in hits:
+        if h.get("suspected_hallucination"):
+            continue
+        t = h.get("time")
+        if t is None:
+            continue
+        word = _norm_tok(h["match"].split()[-1])
+        confirmed = any(
+            u.start is not None and u.start - _HALLUCINATION_RESCUE_WINDOW_S <= t
+            <= (u.end if u.end is not None else u.start) + _HALLUCINATION_RESCUE_WINDOW_S
+            and any(_norm_tok(tok) == word for tok in u.text.split())
+            for u in sub_units
+        )
+        if not confirmed:
+            h["suspected_hallucination"] = {
+                "reason": reason,
+                "matched_locator": None,
+                "gap_s": None,
+                "avg_logprob": None,
+                "median_avg_logprob": None,
+            }
+
+
 def scan_file(path: str | Path, matchers: dict[str, re.Pattern | None],
               ctx: int = 48) -> tuple[list[dict], str]:
     fmt, units = parse_transcript(Path(path))
@@ -372,6 +991,19 @@ def scan_file(path: str | Path, matchers: dict[str, re.Pattern | None],
         hits.extend(_scan_unit(u, matchers, ctx))
     for h in hits:
         h["source"] = fmt
+    if fmt == "json":
+        suspects = detect_repeated_segments(path)
+        for h in hits:
+            info = suspects.get(h["locator"])
+            if info is not None:
+                h["suspected_hallucination"] = info
+        phrase_suspects = detect_known_hallucination_phrases(path)
+        for h in hits:
+            if h.get("suspected_hallucination"):
+                continue
+            info = phrase_suspects.get(h["locator"])
+            if info is not None:
+                h["suspected_hallucination"] = info
     hits.sort(key=lambda h: (h["time"] is None, h["time"] or 0.0, str(h["locator"])))
     return hits, fmt
 

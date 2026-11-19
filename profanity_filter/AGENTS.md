@@ -17,9 +17,15 @@ for the whole toolkit and goes stale fast otherwise.
 |---|---|
 | `flag_language.py` | transcript scanner — finds every profanity / irreverence hit + timestamp in any common transcript format. Standalone CLI **and** importable API. |
 | `opensubtitles.py` | last-resort subtitle source — search + download from OpenSubtitles when there's no usable local subtitle at all (see "OpenSubtitles fallback" below). Standalone, pure stdlib. |
+| `subdl.py` | SECOND, independent subtitle source — search + download from SubDL (subdl.com) when OpenSubtitles didn't produce a usable result either (see "SubDL fallback" below). Standalone, pure stdlib. |
 | `tmdb.py` | faith-based-film detection — TMDB genre/keyword lookup that swaps the `irreverence` category for the stricter `irreverence_strict` one on an overtly Christian/faith-based film (see "Faith-based detection" below). Standalone, pure stdlib. |
-| `wordlists/` | `profanity.txt`, `irreverence.txt`, `profanity_strict.txt`, `irreverence_strict.txt` — plain-text match lists, re-read every run |
-| `clean.py` | end-to-end: media in → transcript → flag → mute (or bleep) one audio track → mkvmerge remux → cleaned `.mkv` |
+| `wordlists/` | `profanity.txt`, `irreverence.txt`, `profanity_strict.txt`, `irreverence_strict.txt` — plain-text match lists, re-read every run; `replacements.txt` — hand-authored word → replacement-word(s) map for `--method replace` (see "Word replacement" below) |
+| `word_replace.py` | `--method replace` orchestration: wordlist lookup/selection, donor-word search, the per-hit fallback chain, splice assembly, subtitle substitution. The only one of the files below `clean.py` itself imports. |
+| `word_replace_synth.py` / `word_replace_tts_driver.py` | two-stage TTS → voice-conversion synthesis; the driver runs under its own `.venv-tts` (see "Word replacement" below) |
+| `word_replace_prosody.py` | pitch/energy contour extraction + imposition (`pyworld`) |
+| `word_replace_score.py` | batched candidate re-transcription + scoring (calls `voice_to_text/transcribe_clip_batch.py`) |
+| `word_replace_blend.py` | loudness/EQ/reverb-approximation blending, pure ffmpeg |
+| `clean.py` | end-to-end: media in → transcript → flag → mute/bleep/replace one audio track → mkvmerge remux → cleaned `.mkv` |
 | `clean.ps1` | launcher (runs `clean.py` with the sibling voice_to_text project's venv, UTF-8 console) |
 | `config.toml` | `clean.py` defaults |
 | `bin/mkvtoolnix/` | portable MKVToolNix (mkvmerge v101) — `clean.py` finds it here automatically |
@@ -28,6 +34,8 @@ for the whole toolkit and goes stale fast otherwise.
 
 No venv of its own — `clean.ps1` / callers use `..\voice_to_text\.venv\Scripts\python.exe`
 (Python 3.11, already has everything). `flag_language.py` itself is pure stdlib.
+`--method replace`'s own TTS/voice-conversion stack is the one exception - see
+"Word replacement" below for its dedicated `.venv-tts`.
 
 **GPU lock**: two paths touch it now. `clean.py`/`_whisperx_check.py` invoke
 `voice_to_text\transcribe.py` as a subprocess for any WhisperX work, and
@@ -218,6 +226,37 @@ module doesn't parse) has its own equivalent module - see `vobsub_ocr.py`
 below - tried as a further fallback when there's neither a text track nor
 a PGS one.
 
+**Known limitation: no quality-based tiebreak between same-language
+candidate tracks.** `choose_pgs()`/`choose_vobsub()` pick ONE track for
+"default" mode - the container's own default flag if set, else (since
+2026-11-19) the first track matching the already-chosen audio's language,
+else just the first track of that codec in container order. When a file
+has MORE THAN ONE same-language PGS/VobSub track and neither is flagged
+default, there's no way to know in advance which one will actually OCR
+well - that would need running Tesseract on every candidate just to find
+out, which is real cost paid on every multi-candidate file to guard
+against a rare bad case.
+
+Confirmed real, not hypothetical: Arthur Christmas (2011) has two English
+VobSub tracks (ids 7 and 8, neither flagged default). Track 7 (picked,
+sitting first in container order) OCR'd to near-total garbage - 60 legible
+lines out of 1947 image cues (~3%), despite the track's own alpha/contrast
+values being strong (fully opaque text, confirmed by inspecting
+`VobSubEntry.info.contr` directly - not a contrast/scaling bug in
+vobsub_ocr.py's rendering, which already scales VobSub's 0-15 contrast
+range to 0-255 correctly). Track 8 OCR'd cleanly - 1325/1521 (~87%) -
+producing real, coherent, correctly-timed dialogue
+("Dear Santa, are you real?..."). The most likely explanation is a
+stylized/decorative font on track 7 that Tesseract's `eng` model simply
+can't read well, not a code defect - two same-content, same-language
+tracks can legitimately differ in authored style (e.g. a "deluxe edition"
+holiday-themed subtitle style bundled alongside a plain one).
+
+If OCR output for a file looks suspiciously sparse/garbled compared to its
+own image-cue count, check for another same-codec candidate track with
+`mkvmerge -J` and force it explicitly with `--subs-track <id>` rather than
+trusting "default" - there's no automatic fallback for this today.
+
 ### Sidecar subtitle files (`find_sidecar_subtitle()`, an external file next to the input)
 
 Second in the subtitle-discovery chain (text track -> CC608 -> **sidecar
@@ -249,13 +288,14 @@ same way.
 
 ### OpenSubtitles fallback (`opensubtitles.py`, real-world subtitle sourcing for TV recordings)
 
-Last in the subtitle-discovery chain (text track -> CC608 -> sidecar file ->
-PGS OCR -> VobSub OCR -> **OpenSubtitles**), tried only when `chosen_subs` is
-still `None` after everything above - the common case for a TV recording,
-which almost never carries an embedded subtitle track of any kind. Needs an
-API key (see "Setup" below); degrades gracefully (a warning, pipeline
-continues without it) on a missing key, failed search, exhausted quota, or
-network error, same as every other optional dependency in this project.
+Second-to-last in the subtitle-discovery chain (text track -> CC608 ->
+sidecar file -> PGS OCR -> VobSub OCR -> **OpenSubtitles** -> SubDL, see
+below), tried only when `chosen_subs` is still `None` after everything
+above - the common case for a TV recording, which almost never carries an
+embedded subtitle track of any kind. Needs an API key (see "Setup" below);
+degrades gracefully (a warning, pipeline continues without it) on a missing
+key, failed search, exhausted quota, or network error, same as every other
+optional dependency in this project.
 
 **Why this needed a fundamentally different algorithm from `backfill_from_srt`
 above**: that function trusts an SRT's own timestamps to within `window`
@@ -380,6 +420,80 @@ because it will sometimes guess wrong. Not yet run end-to-end against a
 real commercial-broken TV recording - validated so far only by code review
 against the documented algorithm and by exercising `resync_units_to_
 transcript()`/`is_ad_cue()` on synthetic inputs.
+
+### SubDL fallback (`subdl.py`, a second independent subtitle source)
+
+Tried right after OpenSubtitles, still gated on `chosen_subs is None` - not
+on WHY OpenSubtitles came up empty. A missing key, no search match, an
+exhausted daily quota, and `resync_external_srt`'s own rejection of a
+wrong-film match all look identical from this point in the pipeline
+(`chosen_subs` never got set), and in every one of those cases the file
+still has zero subtitle corroboration without a second source to try.
+Reuses the exact same `resync_external_srt`/`resync_units_to_transcript`
+machinery OpenSubtitles does - nothing about this source's own timestamps
+is trusted either, for the same reasons (see the OpenSubtitles section
+above).
+
+**Why SubDL specifically**: investigated 2026-11-19 while looking for a
+second subtitle source as part of closing the "no subtitle anywhere" gap
+(see the hallucination-rescue work above). Podnapisi.net, the other
+long-standing free alternative, has been unreachable since ~2026-03-26 (the
+domain stopped resolving). Subscene and Addic7ed have no stable public API
+at all - scraping-only, aggressive anti-bot measures, frequent breakage.
+SubDL (subdl.com) is the one still-live, similarly free, key-based service
+with a documented-enough JSON API, and its own quota is independent of
+OpenSubtitles' - a file that's merely unlucky on one service still has a
+real shot at the other. A general multi-provider library (`subliminal`) was
+deliberately NOT adopted despite existing and covering more providers at
+once - it pulls in a real dependency tree (babelfish, guessit, requests,
+dogpile.cache, rarfile, click, ...) against this project's established
+"every module here is standalone, pure stdlib" posture (see
+`opensubtitles.py`'s own docstring); `subdl.py` follows that same posture,
+using only `urllib` + the stdlib `zipfile` (SubDL's normal download is a
+zip; `download()` checks the actual bytes for a `PK` signature rather than
+guessing from the URL shape, since the `unpack=1` query param's exact
+behavior isn't documented precisely enough to trust blindly).
+
+**The title-match guard is different from OpenSubtitles', and weaker by
+necessity**: `opensubtitles.best_title_match()` re-ranks EVERY result in the
+search response by title similarity, because OpenSubtitles returns multiple
+candidate films with their own titles to check. SubDL's API shape is
+different - its `subtitles` array is already scoped server-side to just the
+FIRST matched title in `results`, with no per-subtitle title of its own to
+re-rank against. So `subdl.fetch_subtitle()` can only check `results[0]`
+itself (via the same `difflib`/`_MIN_TITLE_MATCH_RATIO` approach) before
+trusting anything in `subtitles` at all - a wrong top-level match has
+nothing further downstream to catch it except `resync_external_srt`'s own
+independent `_MIN_RESYNC_MATCH_FRACTION` guard (the same second layer of
+defense OpenSubtitles relies on too).
+
+**Setup**: sign up for a free API key at
+[subdl.com](https://subdl.com) (instant, no payment, from the API section
+of account settings), then either
+- set the `SUBDL_API_KEY` environment variable, or
+- drop it as the only line in a new `subdl.key` file next to `subdl.py`
+  (gitignored - never committed).
+
+Free-tier limits aren't published precisely by SubDL; word-of-mouth as of
+2026-11 is roughly 2000 searches / 50 downloads a day.
+`SubDLQuotaExceeded` mirrors `OpenSubtitlesQuotaExceeded`'s own same
+best-effort heuristic (HTTP 406/429, or "quota"/"limit" in the response
+body) and the same caveat that it isn't yet validated against a real
+quota-exceeded response.
+
+`--subdl-query` overrides the guessed title (reuses
+`opensubtitles.guess_query()` - the two modules share that one function
+rather than duplicating filename-parsing logic, since both already live in
+this project). `--no-subdl` disables this fallback entirely.
+
+**Known rough edges (POC, same status as OpenSubtitles above)**: not yet
+run end-to-end against a real file that actually needed it (every title
+tested locally so far already had OpenSubtitles coverage) - validated so
+far only by code review against the documented-enough API shape and a
+couple of live search calls. The exact conditions under which SubDL returns
+`unpack_files` vs. a plain zipped `subtitles[].url` aren't confirmed from
+real responses yet, which is why `download()` checks content rather than
+trusting either shape.
 
 ### Faith-based detection (`tmdb.py`, swapping to the `*_strict.txt` wordlists)
 
@@ -712,6 +826,11 @@ are `irreverence.txt`/`profanity.txt` minus the entries that are commonly
 auto-selected for an overtly Christian/faith-based title, see "Faith-based
 detection" below.
 
+`replacements.txt` is a different KIND of file - a word/phrase → replacement-
+word(s) mapping, not a detection wordlist (it's never run through
+`compile_wordlist()`/`load_matchers()`, and isn't a member of `CATEGORIES`).
+Used only by `--method replace` - see "Word replacement" below.
+
 ## clean.py — remove profanity from a media file
 
 ```powershell
@@ -823,7 +942,7 @@ now: the `TemporaryDirectory` location and where `--keep-temp` drops debug
 copies of the clean track / filter graph / clean subtitle. It is **not** where
 the cleaned result ends up - that's always `final_dest`.
 
-### Re-running on an already-cleaned file (`mute`/`bleep` only)
+### Re-running on an already-cleaned file (`mute`/`bleep`/`replace` only)
 
 Running `clean.py` a second time on a file it already cleaned doesn't just
 add another `(Cleaned)` track alongside the old one, and doesn't blindly
@@ -859,12 +978,14 @@ field records, no new state file needed):
   already exists: the existing track is left as-is - there's nothing to
   build a replacement from, and this tool doesn't "un-clean" a file.
 
-Scoped to `mute`/`bleep` only, matching what the user actually asked for
-("only if that would result in a different set of words"): `dialog` doesn't
-use wordlists at all (it strips ALL dialogue, so there's no word set to
-compare - it always reruns), and `cut` fully replaces the file with a
-shorter one with no separate alt track to detect/compare against in the
-first place.
+Scoped to `mute`/`bleep`/`replace` only, matching what the user actually
+asked for ("only if that would result in a different set of words"):
+`dialog` doesn't use wordlists at all (it strips ALL dialogue, so there's
+no word set to compare - it always reruns), and `cut` fully replaces the
+file with a shorter one with no separate alt track to detect/compare
+against in the first place. `replace` reuses `cfg.track_name_suffix` (see
+"Word replacement" above) so it's covered by this mechanism for free -
+no separate code path needed.
 
 **Known gap, not fixed here**: `ensure_transcript()` reuses `<name>.json` if
 present (the common case, and the only case this matters for) but otherwise
@@ -1125,6 +1246,367 @@ old whole-file approach was dropped in favor of this.
 
 No stemmer installed (`STEM_VENV` not found) -> falls back to the old plain
 `volume=0:enable='SPANS'` silence on the whole track.
+
+**Per-span checkpointing (resume after a kill/crash).** `clean.py` has no
+mid-run checkpoint in general - a kill restarts the whole file from scratch.
+Under the shared single-GPU lock this environment runs under, that was a
+real, repeated cost: a 3h-then-48h per-file timeout, GPU contention from
+sibling sweeps, or a manual kill each threw away every span already stemmed
+(hit on Apollo 13 (HD), Elemental {edition-Wooley Cut}, and Apple Dumpling
+Gang on 2026-11-17/18; hit again on Apollo 13's base edition on 2026-11-19
+when `_batch_hallucination_fix.py`'s in-flight process was deliberately
+killed to pick up a logging fix). `mute_fill="stems"` is the one path that
+now checkpoints, since it's both the default and the GPU-bound one:
+
+- `_mute_checkpoint_dir()` derives a stable dir name (`pf_ckpt_<sha1 prefix>`
+  under `out_dir`, alongside the normal `pf_*` random-named tempdirs) from a
+  hash of (media path, audio track index, the full flagged-`spans` list,
+  `mute_fill`, `stem_model`). Any change to what would actually get produced
+  - a different hallucination-sweep result, `--force` after a wordlist edit,
+  a different `mute_fill`/`stem_model` - lands in a fresh directory
+  automatically; there's no separate invalidation check to get wrong.
+- Unlike the per-run `tempfile.TemporaryDirectory`, this dir is NOT inside a
+  `with` block and is NOT deleted by Python's normal exception-unwinding
+  cleanup - it's deleted explicitly, once, right before the final "wrote:"
+  success line. A kill, crash, or timeout leaves it behind on purpose.
+- `splice_stemmed_spans()`/`splice_whole_track_stem()` use that dir (via a
+  new `ckpt_dir` param, default `None` for full backward compatibility) as
+  `seg_dir` instead of a throwaway `tmp/splice_segments`. Every artifact
+  written there (`full_orig.wav`, each `span{i}_raw/trimmed.wav`,
+  `orig_{n}.wav`/`inst_{n}.wav`) is written via `_run_to_final()` - to a
+  `.part` sibling first, renamed into place only on success - so a
+  half-written file from a kill can never be mistaken for a completed one on
+  resume; existence of the final-named file at full size IS the resume
+  check, nothing fancier.
+- On the next attempt at the same file (same spans/settings), each
+  already-finished span's `_trimmed.wav` is reused outright - no re-seek,
+  re-stem, or re-trim - and the run prints how many spans it resumed
+  (`resume: reused N/M already-stemmed span(s)...`). An abandoned checkpoint
+  that nothing ever retries ages out via `_sweep_stale_temp_dirs()` exactly
+  like any other orphaned `pf_*` dir (same glob, same age threshold).
+- `build_instrumental_stem()`'s whole-track stem - the *other* GPU-bound
+  unit of work on the whole-track path, and often the single most expensive
+  step in the whole file when `_predict_stem_seconds()` picks it over
+  per-span on a heavily-flagged file - is checkpointed too (added
+  2026-11-19, same day as the per-span work above, once it became clear
+  losing a whole-track stem to a kill was the bigger remaining gap). It
+  shares the SAME `ckpt_dir` as `splice_whole_track_stem`'s own
+  `orig_*.wav`/`inst_*.wav` files (no name collisions - `instrumental.wav`,
+  `stem_channels/`, `stem_src.wav` vs. `orig_{n}.wav`/`inst_{n}.wav`), so one
+  checkpoint dir covers all of a `mute_track()` run's GPU-bound work. A >2ch
+  track stems one separator pass per channel (`ch{i}_inst.wav`, final name
+  via the same `.part`-then-`os.replace` pattern); a <=2ch track is one pass
+  checkpointed as a single `instrumental.wav`. Losing at most one channel's
+  redo on a kill (rather than every channel on a 5.1/7.1 track) is the win
+  here, same shape as the per-span savings above. `cached_whole_instrumental`
+  (the Config.stem_retranscribe reuse path) bypasses this entirely, same as
+  before - that stem was never at risk since it's already a completed result
+  by the time `splice_whole_track_stem` sees it.
+- **Still not covered**: every stage before `mute_track()` (subtitle
+  extraction, transcript correlation, hallucination exclusion) and
+  everything after it (subtitle mux, final remux) - cheap/fast relative to
+  stemming, and Whisper transcription itself is already effectively
+  checkpointed via its own on-disk `.json` cache, reused across runs
+  regardless of this feature. `--method replace` isn't covered either, even
+  though it reuses `stem_clip_all_channels()` - its own per-occurrence
+  TTS/voice-conversion loop would need the same treatment separately if it
+  turns out to need it.
+
+### Word replacement (`--method replace`, local TTS + voice conversion)
+
+Swaps a flagged word/phrase for a DIFFERENT, non-profane one instead of
+removing it - spoken in a voice matching the original speaker, entirely
+locally. This is a genuinely hard audio problem (naive voice-cloned TTS
+alone tends to sound flatly "read," mismatches duration, and sits dry
+against the scene's ambience), so this method layers several strategies
+rather than relying on one, and falls back to the normal `mute` behavior
+per OCCURRENCE (not per file) whenever a step below can't produce a
+confident result - never a hard failure, same "degrade gracefully"
+posture as every other optional piece of this project.
+
+**`wordlists/replacements.txt`** (hand-authored, step 1 of this feature -
+see that file's own header for the exact line format): surface form(s) →
+ordered replacement candidate(s), e.g. `fuck, fucking => freak, fudge`.
+Looked up via `word_replace.normalize_surface()` (reuses
+`flag_language._norm_tok`'s punctuation-stripping normalization - a second,
+independently-drifting normalizer bit this project once already, see SRT
+backfill's "Gotcha already hit and fixed" note above) against each hit's
+exact matched text, case/punctuation/whitespace-insensitively, phrase or
+single word alike. A lookup MISS - a surface form not listed, including
+any open-ended `re:` wildcard slot in `irreverence.txt` a literal table
+can't exhaustively enumerate (e.g. `christ on a \w+`) - mutes that one
+occurrence, same as every other failure mode below. Multiple replacement
+candidates are supported and picked deterministically
+(`select_replacement_words()`): whichever candidate's character length is
+closest to the original matched text's own length sorts first, ties broken
+by the file's own left-to-right order - a rough, reproducible proxy for
+duration fit, re-verified for real later via the scoring pass.
+
+**Pool mode** (`--replace-pool PATH`, e.g. `wordlists/blue(y)_pool.txt`):
+an alternative to the mapped mode above, for when you deliberately don't
+want any fixed word→replacement correspondence a listener could infer
+(added 2026-10-21 at the user's request - they wanted a Bluey-style
+random grab-bag of family-friendly exclamations, with NO guessable link
+back to which specific word was originally flagged). `blue(y)_pool.txt`
+is a flat list - one word/phrase per line, no `=>` mapping at all
+(`word_replace.load_replacement_pool()`). Every flagged occurrence in the
+file, regardless of which word it actually was, draws
+`replace_max_word_candidates` picks at random from the WHOLE pool
+(`select_pool_candidates()`) - deliberately with no length-closeness bias
+toward the original (that would itself leak a faint signal: a longer
+replacement correlating with a longer original word). The random pick is
+seeded from `(media path, hit time, matched text)`, not real process
+randomness, so a rerun on unchanged input makes the identical picks
+rather than needlessly invalidating the rerun-dedup skip-rebuild check.
+`--replace-pool` overrides `--replace-wordlist` entirely when set; donor
+search, scoring, prosody, and blending all work identically either way,
+since none of them care whether the candidate word came from a mapping or
+a random draw. `wordlists/blue(y)_pool.txt`'s content (expanded to the
+user's own full list 2026-10-21) is Bluey's family-friendly exclamations/
+euphemisms - expand it freely, same as `replacements.txt`'s own seed
+content.
+
+**Diarization is forced on, unconditionally**, the moment `--method
+replace` is selected (`main()`, right after `cfg` is loaded) - regardless
+of `transcript_diarize`/`--diarize-transcript`:
+```python
+if cfg.method == "replace":
+    cfg.transcript_diarize = True
+```
+Donor-word matching and per-speaker voice-conversion models (both below)
+are only meaningful with real speaker labels; without them, donor search
+degrades to a time-proximity guess and every speaker's voice model
+training audio collapses into one shared bucket. A cache-reuse guard
+(`_transcript_has_speakers()`, parallel to `_transcript_is_aligned()`)
+makes sure a pre-existing, non-diarized `<name>.json`/`<name>.vocals.json`
+from an earlier (non-`replace`) run is never silently trusted here -
+`ensure_transcript()`/`ensure_vocals_transcript()` re-transcribe with
+`--diarize` instead when that check fails. **Known cost**: this means a
+`replace` run pays for real diarization even on a file whose transcript
+would otherwise be fully cached - accepted deliberately, since speaker
+accuracy is the whole point of forcing it on. `replace_num_speakers`/
+`replace_min_speakers`/`replace_max_speakers` optionally hint the count
+through to `voice_to_text`'s own diarization when you already know it.
+
+**Donor-word search** (`word_replace.find_donor_clip()`): before
+synthesizing anything, search this SAME file's own word timeline
+(`flag_language.load_word_timeline()`) for a real spoken instance of the
+chosen replacement word/phrase elsewhere in the file - a sliding window
+sized to the candidate's own word count, normalized and compared the same
+way the wordlist lookup is. A real recorded instance, time/pitch-fitted
+into the target span, sidesteps the "flat TTS delivery" problem entirely
+because the prosody is real human speech, just borrowed. **Speaker-aware**:
+a candidate whose diarized speaker is confirmed DIFFERENT from the hit's
+own is rejected outright (never just deprioritized) via
+`word_replace.speaker_at()` interval lookups built from
+`flag_language.parse_transcript()`'s `Unit.speaker`/`start`/`end`; when
+either side's speaker is unknown (diarization left that stretch
+unassigned - overlapping speech and fast back-and-forth dialogue are known
+failure modes for any diarizer, pyannote included), falls back to
+time-then-pitch proximity. **Speaker matching is only as good as the
+diarization pass underneath it** - not a claim of perfect speaker
+isolation.
+
+**Two-stage synthesis** (`word_replace_synth.py` +
+`word_replace_tts_driver.py`), tried when no donor exists: a neutral local
+TTS (Piper, recommended - verify the current package name/API before
+installing, this ecosystem churns fast) generates the replacement text
+with roughly correct duration (its own `length_scale` knob, one corrective
+re-run if needed), then a per-speaker voice-conversion model (RVC,
+recommended) converts it to that speaker's timbre. The voice-conversion
+model is trained ONCE per speaker per film, from that speaker's own
+isolated vocal audio (reusing the same `audio-separator` stemming infra
+`build_vocals_stem` uses elsewhere in this project - see
+`word_replace._ensure_file_vocals_stem()`/`_speaker_training_wav()`), and
+cached next to the media as `<name>.<speaker>.vc_model.meta.json` + a
+sibling `<name>.<speaker>.vc_model/` directory (reused on rerun unless
+`--retrain-voice-model`). Needs at least `replace_min_speaker_audio_s`
+(default 30s) of that speaker's isolated audio in the file - below that,
+synthesis falls back to a neutral (un-converted) voice rather than
+skipping synthesis outright. Runs in its own dedicated `.venv-tts` (same
+reasoning as `.venv-stem`: its torch/CUDA pins should never touch any
+other venv's) - not auto-installed, see README's "TTS/Voice-Conversion
+setup"; missing entirely, synthesis is simply never attempted and the
+fallback chain moves straight to muting.
+
+**Prosody transplantation** (`word_replace_prosody.py`, `pyworld`/WORLD
+vocoder): before a flagged span's original audio is touched, its pitch
+(F0) contour and energy envelope are extracted; once a donor or synthesized
+candidate is duration-fitted, that SAME contour is imposed onto it
+(voiced frames only - unvoiced/silent frames are left alone so consonants
+and silence aren't forced into a tone), so a shouted or tearful line
+doesn't come back sounding flatly read. A human opt-out
+(`--no-replace-prosody`), not an automatic fallback - same posture as
+`--center-mute`.
+
+**Scene-matched blending** (`word_replace_blend.py`, pure ffmpeg,
+`--no-replace-scene-blend` to disable): loudness-matches the candidate to
+the RMS level of its immediate neighbors (`astats`-driven plain
+`volume=<gain>dB`, not `loudnorm` - its R128 integrated measurement needs
+several seconds, a poor fit for a sub-second clip) and applies a coarse
+3-band EQ nudge the same way. A reverb/ambience-matching step
+(`estimate_ambient_decay()`/`apply_reverb_blend()`) also exists, using a
+crude RT20-style decay-time proxy read off the instrumental/ambient stem
+plus a conservative `aecho` tail - **explicitly the lowest-confidence
+piece of this whole feature**, not a real room-impulse-response match;
+it's implemented but not currently wired up with a live ambient-clip
+reference in the main pipeline (loudness/EQ matching IS active), left as
+a clearly-separated piece for a future pass that extracts a real nearby
+instrumental clip rather than skipping it. True blind RIR estimation was
+judged out of scope for this feature entirely.
+
+**Multi-candidate generation + quality gating** (`word_replace_score.py` +
+`voice_to_text/transcribe_clip_batch.py`): up to `replace_max_word_candidates`
+(default 2) replacement words are tried, donor and/or synthesized, and
+EVERY candidate render across the WHOLE file is re-transcribed in one
+batched subprocess call (`transcribe_clip_batch.py`, a small driver next to
+`transcribe.py` that loads WhisperX once for the whole batch rather than
+once per candidate - no new venv needed, it runs under the shared
+`voice_to_text/.venv`) using a deliberately smaller/cheaper model
+(`replace_score_model`, default `"small"`) than the main transcript's own.
+Each candidate scores `0.7*intelligibility + 0.3*duration_fit` (difflib
+ratio against the intended text; `1 - |actual-target|/target` clipped to
+[0,1]); the highest-scoring candidate at or above `replace_quality_threshold`
+(default 0.55) wins - below that, the occurrence is muted instead.
+
+**Subtitle substitution** (`word_replace.censor_srt_with_replacements()`):
+a new function, not forced into `censor_srt()`'s single-global-mask
+signature - each regex match is resolved against the per-hit outcome
+(keyed by time) that `replace_track()` already produced: a muted
+occurrence's word is deleted (identical to `method="mute"`'s own subtitle
+behavior), a replaced one is substituted with the chosen replacement text,
+case-matched to the original (ALL-CAPS → ALL-CAPS, Title → Title, else
+lowercase). PGS/VobSub bitmap subtitle sources keep their existing
+blank-redaction behavior under `replace` - no text substitution on image
+subs, a documented scope limit, not silently wrong.
+
+**Rerun-dedup**: deliberately reuses `cfg.track_name_suffix` ("(Cleaned)")
+rather than a separate `replace_track_suffix` - `is_own_output_track()`
+already covers it with zero code changes, since `replace` isn't
+`"dialog"`. One deliberate side effect: switching `--method mute` ↔
+`--method replace` on a rerun correctly treats the OTHER method's prior
+track as stale and replaces it, rather than accumulating a second
+"(Cleaned)" track - the behavior a user changing their mind about method
+would want. The word-set-comparison skip-rebuild logic ("Re-running on an
+already-cleaned file" below) applies to `replace` the same way it does to
+`mute`/`bleep`, since nothing in that code path is actually gated to a
+specific method - only `dialog` (no wordlist scan at all) and `cut` (no
+separate alt track to compare against) are structurally excluded.
+
+**Known limitations, not fixed here**: no real diarization is a claim this
+section doesn't make - diarization is forced on, but it's never perfect,
+and overlapping speech/crowd scenes/fast back-and-forth dialogue can still
+leave a candidate's speaker unresolved or misassigned (donor search and
+voice-model bucketing both fall back to a less-confident heuristic in that
+case, never a crash). Multi-word phrase replacement IS in scope (unlike an
+earlier draft of this plan), but an open-ended detection regex (`christ on
+a \w+`) can still outrun what a literal `replacements.txt` table
+practically enumerates. A multi-word phrase candidate's internal rhythm
+is time-fitted as one uniform stretch, not per-word within the phrase - a
+replacement with a very different word count than the original can sound
+slightly off in internal cadence even once the total duration matches.
+Reverb blending is implemented but not live-wired (see above). **Confirmed
+2026-10-20 against the real, installed package**: `rvc-python` is
+INFERENCE ONLY - it loads a pre-existing `.pth` model file
+(`RVCInference(device=...).load_model(...)`/`.infer_file(...)`, both used
+exactly as documented) but has no training/fitting entry point at all.
+Real per-speaker RVC model training needs the full RVC-WebUI-style
+pipeline (feature extraction + many-epoch training) or a different,
+zero-shot-capable voice-conversion tool chosen specifically for that
+property - out of scope for now. `word_replace_tts_driver.py`'s
+`_train_rvc_model()` raises `NotImplementedError` rather than pretending
+to train something; `ensure_voice_model()` catches this like any other
+training failure, so **every synthesized candidate currently uses a
+neutral (un-converted) Piper voice, never the actual speaker's timbre** -
+donor-word reuse is the only path that gets the real voice right today.
+Piper's own API was NOT independently re-verified against the installed
+version the same way RVC's was - treat `word_replace_tts_driver.py`'s
+`_synthesize_piper()` as the more likely of the two to still need a fix
+once actually exercised against real output.
+
+**Validated 2026-10-20** against a real local run (`.venv-tts` set up per
+README, Piper + `en_US-lessac-medium`, RVC installed but unreachable - see
+above): a synthetic test clip's one flagged word was correctly detected,
+candidates were generated (donor + two synthesized words), scored, and on
+one run the best-scoring synthesized candidate was accepted and spliced in
+(`outcome: "synth"` in `.bleeps.json`) - confirms the full chain works
+end to end, not just in isolation. **Also observed, worth flagging
+honestly**: candidate scoring is noticeably run-to-run variable on a
+clip this short, and not always in the donor's favor the way design intent
+expected - a real re-run of the identical input scored a perfectly
+intelligible real donor clip (independently verified to transcribe
+correctly on its own) as Whisper hallucinating "Thank you for watching."
+instead, a well-known Whisper failure mode on very short/quiet audio,
+while a neutral-voice synthesized candidate for the same word scored well
+enough to win. The prosody-transplant and loudness-matching steps likely
+push a donor clip's level/spectral shape into territory more prone to
+this than the raw clip was (both steps are easy to disable per-run via
+`--no-replace-prosody`/`--no-replace-scene-blend` if a real file shows
+this pattern often). Net effect: the fallback-to-mute safety net is doing
+real work, not just a theoretical backstop - expect a meaningful fraction
+of occurrences to mute rather than replace even when a decent candidate
+exists, and don't read one muted occurrence as the feature being broken.
+
+**Four real bugs found and fixed 2026-10-20/21, against a real clip from
+a real film** (not the synthetic test clip above) - each one confirmed
+live before being called fixed, not just reasoned about:
+1. **`clean.py`'s `choose_audio()` call site computed `audio_pos` against
+   the STALE-FILTERED track list, not the real unfiltered one** - on a
+   rerun where a stale prior output track sorted before the real track in
+   the container, every method (not just `replace`) could silently map
+   `-ss`/stemming/transcription against the WRONG physical audio stream.
+   Fixed by recomputing `audio_pos` against the full, unfiltered track list.
+2. **`word_replace._build_candidates_for_hit`'s `target_duration_s` was
+   computed from the bare `[hit_time, hit_end]` match window, not the
+   padded `[hit_time - pad_start, hit_end + pad_end]` slot `_splice_spans`
+   actually splices the winning candidate into** - every ACTUAL
+   replacement (not a mute fallback) shortened the whole output by
+   `pad_start + pad_end` (confirmed: a real delivered clip measured
+   19.805s against a 20.000s source). Fixed by computing the target from
+   the same padded, span-clamped window `_splice_spans` uses.
+3. **`word_replace_tts_driver.do_tts`'s one-shot corrective retry set
+   Piper's `length_scale` to `ratio` (`actual/target`) instead of
+   `1/ratio`** - backwards, per Piper's own doc ("< 1 is faster, > 1 is
+   slower"): a too-long first pass got asked to render even LONGER, a
+   too-short one even SHORTER, pushing the final `atempo` fit to close a
+   much larger gap than necessary. A likely contributor to an
+   unnatural-sounding replacement word the user flagged directly ("pitched
+   up"), though not confirmed as the sole cause - see the voice notes
+   below. Fixed to `length_scale=1.0/ratio`.
+4. **Tried, then reverted, extending `clean.py`'s `also_instrumental`
+   reuse (originally mute-only) to `replace`** - the idea was a free
+   whole-track Instrumental stem for `replace`'s own background-bed
+   mixing, same as `mute` already gets. Reverted the same day:
+   `_run_separator_pair`'s dual-stem invocation (`single_stem=None`) is a
+   DIFFERENT `audio-separator` call than the dedicated
+   `single_stem="Vocals"` pass `replace`'s own detection transcript
+   depends on, and switching to it measurably changed the Vocals stem -
+   enough that Whisper's VAD missed a real, borderline-quiet flagged word
+   on two consecutive runs that had caught it fine before. A direct RMS
+   comparison had already shown the background-bed itself identical
+   either way, so there was no real quality upside being traded for that
+   detection risk. **Lesson for next time touching this area**: any
+   change to HOW the Vocals stem for `replace`'s own detection pass gets
+   produced needs to be tested against actual word detection, not just
+   against the background-bed's own audio quality.
+
+**Voice default changed 2026-10-21** after a direct listening test (not
+just engineering reasoning): the original default, `en_US-lessac-medium`,
+read as female to the user. Two alternatives tried next -
+`en_US-john-medium`, `en_US-joe-medium` - had audible crackling/distortion.
+`en_US-hfc_male-medium` was the one that actually sounded right and is
+now the default (`word_replace_tts_driver.PIPER_VOICE_MALE`). **This is
+still just "best available neutral voice," not real per-speaker
+matching** - the fundamental limitation above (no RVC training API)
+is unchanged; a better default voice doesn't change the fact that every
+synthesized candidate uses ONE voice per gender for the entire film,
+regardless of which character is actually speaking.
+
+**Pool mode added 2026-10-21** - see the "Pool mode" paragraph above for
+the mechanism. Validated end-to-end on a real clip: correctly picked a
+random multi-word phrase ("beans on toast") for a flagged word with no
+donor available, spliced it at the correct timestamp, and a full
+re-transcription of the output found zero remaining flagged terms.
 
 ### Center-channel-only removal (`--method dialog`, explicit opt-in only)
 
