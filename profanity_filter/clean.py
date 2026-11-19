@@ -155,6 +155,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -1972,6 +1973,44 @@ def stem_clip_all_channels(ffmpeg: str, stem_tool: str, clip_wav: Path, n_ch: in
     return merged
 
 
+def _run_to_final(cmd: list[str], final_path: Path) -> Path:
+    """Run an ffmpeg command whose last argument is its output path, but write to a `.part`
+    sibling first and only rename into place once the process exits 0. Used for every
+    checkpointed artifact under a mute_track() ckpt_dir (see _mute_checkpoint_dir) so a killed
+    or crashed run never leaves a half-written file at the final name for the next resume
+    attempt to mistake as complete - existence of the final-named file is the resume check."""
+    part = final_path.with_name(final_path.name + ".part")
+    cmd = [*cmd[:-1], str(part)]
+    run(cmd)
+    os.replace(part, final_path)
+    return final_path
+
+
+def _mute_checkpoint_dir(out_dir: Path, media: Path, audio_pos: int, spans, cfg: Config) -> tuple[Path, bool]:
+    """Stable, content-addressed scratch dir for mute_track()'s per-span stemming work -
+    separate from the per-run tempfile.TemporaryDirectory (which is always deleted on a clean
+    exit, exception included, so it can never survive to be resumed). Naming it after a hash of
+    (media, flagged spans, mute_fill, stem_model) means any change to what would actually get
+    produced - a different hallucination-sweep result, --force after a wordlist edit, a
+    different mute_fill/stem_model - lands in a fresh directory automatically; no separate
+    invalidation check is needed. An old directory left behind by a killed/crashed run that
+    never gets revisited just ages out via _sweep_stale_temp_dirs like any other orphaned pf_*
+    scratch dir (it already globs "pf_*", which this prefix matches too).
+
+    Returns (dir, already_had_content) - the second value is just for a one-line log note so a
+    resumed run is visibly distinguishable from a fresh one."""
+    sig = json.dumps({
+        "media": str(media), "audio_pos": audio_pos,
+        "spans": [[round(s, 3), round(e, 3), hs] for s, e, hs in spans],
+        "mute_fill": cfg.mute_fill, "stem_model": cfg.stem_model,
+    }, sort_keys=True, default=str)
+    digest = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:16]
+    d = out_dir / f"pf_ckpt_{digest}"
+    already_had_content = d.is_dir() and any(d.iterdir())
+    d.mkdir(parents=True, exist_ok=True)
+    return d, already_had_content
+
+
 def _decode_full_track(ffmpeg: str, media: Path, audio_pos: int, fmt_args: list[str],
                        out_path: Path) -> Path:
     """Decode the chosen audio track to one lossless intermediate WAV, start to finish, in a
@@ -1987,15 +2026,22 @@ def _decode_full_track(ffmpeg: str, media: Path, audio_pos: int, fmt_args: list[
     hundreds of ms of one-directional, ever-growing desync between the rebuilt "(Cleaned)" track
     and the real original by the end of a movie. Slicing from an already-decoded PCM file is
     exact no matter how many times it's resliced - there's no compressed-codec frame boundary
-    left to round to."""
-    run([ffmpeg, "-hide_banner", "-y", "-i", str(media),
-         "-map", f"0:a:{audio_pos}", *fmt_args, str(out_path)])
+    left to round to.
+
+    Skipped entirely when out_path already exists non-empty - harmless when out_path is a
+    fresh per-run tmp dir (never pre-exists), and is what lets a checkpoint-dir resume reuse a
+    previous attempt's full decode instead of redoing it."""
+    if out_path.is_file() and out_path.stat().st_size > 0:
+        return out_path
+    _run_to_final([ffmpeg, "-hide_banner", "-y", "-i", str(media),
+                   "-map", f"0:a:{audio_pos}", *fmt_args, str(out_path)], out_path)
     return out_path
 
 
 def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, n_ch: int,
                          sample_rate: int, layout_name: str | None, stem_tool: str, cfg: Config,
-                         tmp: Path, context: float = SPLICE_CONTEXT_S) -> Path:
+                         tmp: Path, context: float = SPLICE_CONTEXT_S,
+                         ckpt_dir: Path | None = None) -> Path:
     """Replace every flagged span with a freshly-stemmed (vocals removed,
     ambient/music kept - never dead silence) version of just that short clip;
     everything outside the flagged spans is the untouched original, byte for
@@ -2009,7 +2055,7 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
     that way - short, independently seeked, never touching the whole-file
     timeline in one filter pass."""
     total_dur = probe_duration(ffprobe, media)
-    seg_dir = tmp / "splice_segments"
+    seg_dir = ckpt_dir if ckpt_dir is not None else tmp / "splice_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
     fmt_args = ["-ar", str(sample_rate), "-ac", str(n_ch)]
     full_orig = _decode_full_track(ffmpeg, media, audio_pos, fmt_args, seg_dir / "full_orig.wav")
@@ -2018,19 +2064,32 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
 
     def extract_original(s: float, e: float) -> Path:
         out = seg_dir / f"orig_{len(segments)}.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
-             "-i", str(full_orig), *fmt_args, str(out)])
+        if not (out.is_file() and out.stat().st_size > 0):
+            _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
+                          "-i", str(full_orig), *fmt_args, str(out)], out)
         return out
 
+    resumed_spans = 0
     for i, (s, e, hits) in enumerate(spans):
         if s > cursor:
             segments.append(extract_original(cursor, s))
 
+        # a prior interrupted attempt already finished this exact span (ckpt_dir's name is a
+        # hash of the whole spans list + settings, so an existing trimmed.wav here can only be
+        # from a matching previous run of this same work) - reuse it, skip straight to the next.
+        trimmed = seg_dir / f"span{i}_trimmed.wav"
+        if trimmed.is_file() and trimmed.stat().st_size > 0:
+            segments.append(trimmed)
+            cursor = e
+            resumed_spans += 1
+            continue
+
         clip_s = max(0.0, s - context)
         clip_e = min(total_dur, e + context)
         raw_clip = seg_dir / f"span{i}_raw.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{clip_s:.6f}", "-to", f"{clip_e:.6f}",
-             "-i", str(full_orig), *fmt_args, str(raw_clip)])
+        if not (raw_clip.is_file() and raw_clip.stat().st_size > 0):
+            _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{clip_s:.6f}", "-to", f"{clip_e:.6f}",
+                          "-i", str(full_orig), *fmt_args, str(raw_clip)], raw_clip)
 
         span_tmp = seg_dir / f"span{i}_stem"
         span_tmp.mkdir(exist_ok=True)
@@ -2039,11 +2098,14 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
 
         # the extra `context` was only so the stemmer had enough material to
         # work with - trim back down to exactly the flagged span before splicing
-        trimmed = seg_dir / f"span{i}_trimmed.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s - clip_s:.6f}", "-to", f"{e - clip_s:.6f}",
-             "-i", str(inst_clip), *fmt_args, str(trimmed)])
+        _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{s - clip_s:.6f}", "-to", f"{e - clip_s:.6f}",
+                      "-i", str(inst_clip), *fmt_args, str(trimmed)], trimmed)
         segments.append(trimmed)
         cursor = e
+
+    if ckpt_dir is not None and resumed_spans:
+        print(f"  resume: reused {resumed_spans}/{len(spans)} already-stemmed span(s) from a "
+              f"previous interrupted attempt ({seg_dir.name})")
 
     if cursor < total_dur:
         segments.append(extract_original(cursor, total_dur))
@@ -2059,7 +2121,8 @@ def splice_stemmed_spans(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int,
 
 def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, n_ch: int,
                             sample_rate: int, layout_name: str | None, stem_tool: str, cfg: Config,
-                            tmp: Path, whole_inst: Path | None = None) -> Path:
+                            tmp: Path, whole_inst: Path | None = None,
+                            ckpt_dir: Path | None = None) -> Path:
     """Same precise seek-and-concat splicing as splice_stemmed_spans (never
     the buggy whole-file volume=0:enable='between(...)' filter) - but for
     movies with a lot of flagged spans, where paying a fresh separator
@@ -2080,7 +2143,7 @@ def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: i
         whole_inst = build_instrumental_stem(ffmpeg, stem_tool, media, audio_pos, n_ch, sample_rate,
                                              tmp, cfg, layout_name)
 
-    seg_dir = tmp / "splice_segments"
+    seg_dir = ckpt_dir if ckpt_dir is not None else tmp / "splice_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
     fmt_args = ["-ar", str(sample_rate), "-ac", str(n_ch)]
     full_orig = _decode_full_track(ffmpeg, media, audio_pos, fmt_args, seg_dir / "full_orig.wav")
@@ -2089,14 +2152,16 @@ def splice_whole_track_stem(ffmpeg: str, ffprobe: str, media: Path, audio_pos: i
 
     def extract_original(s: float, e: float) -> Path:
         out = seg_dir / f"orig_{len(segments)}.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
-             "-i", str(full_orig), *fmt_args, str(out)])
+        if not (out.is_file() and out.stat().st_size > 0):
+            _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
+                          "-i", str(full_orig), *fmt_args, str(out)], out)
         return out
 
     def extract_instrumental(s: float, e: float) -> Path:
         out = seg_dir / f"inst_{len(segments)}.wav"
-        run([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
-             "-i", str(whole_inst), *fmt_args, str(out)])
+        if not (out.is_file() and out.stat().st_size > 0):
+            _run_to_final([ffmpeg, "-hide_banner", "-y", "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
+                          "-i", str(whole_inst), *fmt_args, str(out)], out)
         return out
 
     for s, e, hits in spans:
@@ -2135,7 +2200,8 @@ def _predict_stem_seconds(n_ch: int, spans, total_dur: float) -> tuple[float, fl
 
 def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cfg: Config,
               chosen: dict, tmp: Path, stem_tool: str | None = None,
-              cached_whole_instrumental: Path | None = None) -> tuple[Path, bool]:
+              cached_whole_instrumental: Path | None = None,
+              ckpt_dir: Path | None = None) -> tuple[Path, bool]:
     """Never leaves dead air and never mutes a channel that doesn't need it:
     every flagged span gets vocals stemmed out of EVERY channel for just that
     short clip (ambient noise/music keeps playing, exactly like the
@@ -2166,7 +2232,8 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
                   "the track a second time")
             spliced = splice_whole_track_stem(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
                                               None, stem_tool, cfg, tmp,
-                                              whole_inst=cached_whole_instrumental)
+                                              whole_inst=cached_whole_instrumental,
+                                              ckpt_dir=ckpt_dir)
             return _encode_track_from_wav(ffmpeg, spliced, n_ch, cfg, tmp), False
         if stem_tool is not None:
             layout_name = None
@@ -2184,7 +2251,8 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
                       f"{per_span_s / 60:.1f} min per-span ({len(spans)} span(s)) - stemming the "
                       f"whole track once (mute_fill=stems, model={cfg.stem_model})")
                 spliced = splice_whole_track_stem(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
-                                                  layout_name, stem_tool, cfg, tmp)
+                                                  layout_name, stem_tool, cfg, tmp,
+                                                  ckpt_dir=ckpt_dir)
             else:
                 print(f"  fill: predicted {per_span_s / 60:.1f} min per-span vs "
                       f"{whole_track_s / 60:.1f} min whole-track - stemming vocals out of every "
@@ -2192,7 +2260,8 @@ def mute_track(ffmpeg: str, ffprobe: str, media: Path, audio_pos: int, spans, cf
                       f"model={cfg.stem_model}) - ambient noise/music keeps playing throughout, "
                       f"nothing is ever fully silenced")
                 spliced = splice_stemmed_spans(ffmpeg, ffprobe, media, audio_pos, spans, n_ch, sr,
-                                               layout_name, stem_tool, cfg, tmp)
+                                               layout_name, stem_tool, cfg, tmp,
+                                               ckpt_dir=ckpt_dir)
             return _encode_track_from_wav(ffmpeg, spliced, n_ch, cfg, tmp), False
         print(f"  [note] mute_fill=stems but no stemmer found at {STEM_VENV} - falling back to "
               f"silence (see README for one-time setup)", file=sys.stderr)
@@ -3252,20 +3321,24 @@ def _dir_last_activity(d: Path) -> float:
 
 
 def _sweep_stale_temp_dirs(out_dir: Path) -> None:
-    """Remove any leftover "pf_*" scratch dir (main()'s own
-    tempfile.TemporaryDirectory(prefix="pf_", dir=out_dir)) idle for longer
-    than any real single-file run has ever taken. A normal run - success or
-    a plain Python exception - always cleans its own tmp dir up via that
-    context manager's __exit__; one only survives when the interpreter was
-    killed before reaching it; a forceful taskkill/process-manager stop, or
-    the real access-violation crash this file's docstrings mention as an
-    observed audio-separator failure mode under GPU contention. Found
-    accumulating silently back to 2026-09-24, discovered and first swept
-    2026-10-01 - 12+ scratch dirs' worth of leftover audio, never cleaned up
-    on its own because nothing ever looked. 12h is well past every real
-    single-file processing time observed even under heavy multi-process GPU
-    contention, so anything idle that long is safe to treat as orphaned
-    rather than still legitimately owned by a slow sibling run."""
+    """Remove any leftover "pf_*" scratch dir idle for longer than any real single-file run has
+    ever taken. Covers two kinds of dir, both prefixed "pf_":
+      - main()'s own tempfile.TemporaryDirectory(prefix="pf_", dir=out_dir): a normal run -
+        success or a plain Python exception - always cleans this up via the context manager's
+        __exit__; one only survives a forceful taskkill/process-manager stop, or the real
+        access-violation crash this file's docstrings mention as an observed audio-separator
+        failure mode under GPU contention.
+      - a mute_track() checkpoint dir (prefix "pf_ckpt_", see _mute_checkpoint_dir): deliberately
+        NOT inside that TemporaryDirectory, so it survives a kill/crash on purpose - the next
+        attempt at the same file resumes from it. It's removed explicitly on a successful run
+        (see main()'s cleanup right before the final "wrote:" line); one only survives when no
+        later attempt ever finished successfully.
+    Found accumulating silently back to 2026-09-24, discovered and first swept 2026-10-01 - 12+
+    scratch dirs' worth of leftover audio, never cleaned up on its own because nothing ever
+    looked. The age threshold is well past every real single-file processing time observed even
+    under heavy multi-process GPU contention, so anything idle that long is safe to treat as
+    orphaned rather than still legitimately owned by a slow sibling run or a backlog that just
+    hasn't gotten back around to retrying this file yet."""
     now = time.time()
     for d in out_dir.glob("pf_*"):
         if not d.is_dir():
@@ -3370,6 +3443,9 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = HERE / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     _sweep_stale_temp_dirs(out_dir)
+    ckpt_dir: Path | None = None  # set just before mute_track(), see _mute_checkpoint_dir;
+    #   stays None for every other method - only "mute" gets checkpointed resume (see clean.py's
+    #   docstring discussion / the per-span checkpoint work added 2026-11-19)
     name_suffix = cfg.dialog_track_suffix if cfg.method == "dialog" else cfg.track_name_suffix
     # The cleaned result replaces the source in place - same folder, same
     # stem. Only the extension can change (mkvmerge always writes .mkv), so
@@ -3851,8 +3927,14 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.method == "bleep":
                 clean_audio = bleep_track(ffmpeg, media, audio_pos, spans, cfg, chosen, tmp)
             elif cfg.method == "mute":
+                if cfg.mute_fill == "stems":
+                    ckpt_dir, resumed = _mute_checkpoint_dir(out_dir, media, audio_pos, spans, cfg)
+                    if resumed:
+                        print(f"  [note] resuming from a previous interrupted attempt - reusing "
+                              f"any already-stemmed span(s) found in {ckpt_dir.name}")
                 clean_audio, used_center = mute_track(ffmpeg, ffprobe, media, audio_pos, spans, cfg,
-                                                      chosen, tmp, stem_tool, cached_instrumental)
+                                                      chosen, tmp, stem_tool, cached_instrumental,
+                                                      ckpt_dir=ckpt_dir)
             elif cfg.method == "replace":
                 if str(HERE) not in sys.path:
                     sys.path.insert(0, str(HERE))
@@ -4007,6 +4089,11 @@ def main(argv: list[str] | None = None) -> int:
         staging.replace(final_dest)
 
     report.write_text(json.dumps(_build_report(), indent=2), encoding="utf-8")
+
+    if ckpt_dir is not None:
+        # Only reached on a full, successful run - a kill/crash/exception never gets here, which
+        # is exactly what leaves the checkpoint dir behind for the next attempt to resume from.
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
 
     print(f"  wrote: {final_dest}")
     print(f"         {report.name}")

@@ -1247,6 +1247,57 @@ old whole-file approach was dropped in favor of this.
 No stemmer installed (`STEM_VENV` not found) -> falls back to the old plain
 `volume=0:enable='SPANS'` silence on the whole track.
 
+**Per-span checkpointing (resume after a kill/crash).** `clean.py` has no
+mid-run checkpoint in general - a kill restarts the whole file from scratch.
+Under the shared single-GPU lock this environment runs under, that was a
+real, repeated cost: a 3h-then-48h per-file timeout, GPU contention from
+sibling sweeps, or a manual kill each threw away every span already stemmed
+(hit on Apollo 13 (HD), Elemental {edition-Wooley Cut}, and Apple Dumpling
+Gang on 2026-11-17/18; hit again on Apollo 13's base edition on 2026-11-19
+when `_batch_hallucination_fix.py`'s in-flight process was deliberately
+killed to pick up a logging fix). `mute_fill="stems"` is the one path that
+now checkpoints, since it's both the default and the GPU-bound one:
+
+- `_mute_checkpoint_dir()` derives a stable dir name (`pf_ckpt_<sha1 prefix>`
+  under `out_dir`, alongside the normal `pf_*` random-named tempdirs) from a
+  hash of (media path, audio track index, the full flagged-`spans` list,
+  `mute_fill`, `stem_model`). Any change to what would actually get produced
+  - a different hallucination-sweep result, `--force` after a wordlist edit,
+  a different `mute_fill`/`stem_model` - lands in a fresh directory
+  automatically; there's no separate invalidation check to get wrong.
+- Unlike the per-run `tempfile.TemporaryDirectory`, this dir is NOT inside a
+  `with` block and is NOT deleted by Python's normal exception-unwinding
+  cleanup - it's deleted explicitly, once, right before the final "wrote:"
+  success line. A kill, crash, or timeout leaves it behind on purpose.
+- `splice_stemmed_spans()`/`splice_whole_track_stem()` use that dir (via a
+  new `ckpt_dir` param, default `None` for full backward compatibility) as
+  `seg_dir` instead of a throwaway `tmp/splice_segments`. Every artifact
+  written there (`full_orig.wav`, each `span{i}_raw/trimmed.wav`,
+  `orig_{n}.wav`/`inst_{n}.wav`) is written via `_run_to_final()` - to a
+  `.part` sibling first, renamed into place only on success - so a
+  half-written file from a kill can never be mistaken for a completed one on
+  resume; existence of the final-named file at full size IS the resume
+  check, nothing fancier.
+- On the next attempt at the same file (same spans/settings), each
+  already-finished span's `_trimmed.wav` is reused outright - no re-seek,
+  re-stem, or re-trim - and the run prints how many spans it resumed
+  (`resume: reused N/M already-stemmed span(s)...`). An abandoned checkpoint
+  that nothing ever retries ages out via `_sweep_stale_temp_dirs()` exactly
+  like any other orphaned `pf_*` dir (same glob, same age threshold).
+- **Scoped deliberately narrow** (2026-11-19): only the per-span stemming
+  loop is checkpointed. `build_instrumental_stem()`'s one-time whole-track
+  stem (the expensive step on the *whole-track* path, picked by
+  `_predict_stem_seconds()` on heavily-flagged files) is NOT checkpointed -
+  a kill mid-whole-track-stem still restarts that stem from zero. Likewise
+  every stage before `mute_track()` (subtitle extraction, transcript
+  correlation, hallucination exclusion) and everything after it (subtitle
+  mux, final remux) is unchanged - cheap/fast relative to stemming, and
+  Whisper transcription itself is already effectively checkpointed via its
+  own on-disk `.json` cache, reused across runs regardless of this feature.
+  `--method replace` isn't covered either, even though it reuses
+  `stem_clip_all_channels()` - its own per-occurrence TTS/voice-conversion
+  loop would need the same treatment separately if it turns out to need it.
+
 ### Word replacement (`--method replace`, local TTS + voice conversion)
 
 Swaps a flagged word/phrase for a DIFFERENT, non-profane one instead of
