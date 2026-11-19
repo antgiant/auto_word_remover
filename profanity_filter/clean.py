@@ -20,11 +20,14 @@ End-to-end from a single media file:
                  usable one wins: an embedded text/CC608 track, then a
                  sidecar subtitle FILE next to the input (e.g. "Movie.srt"),
                  then OCR'd from an embedded PGS/VobSub bitmap track, then
-                 (last resort) fetched from OpenSubtitles. A sidecar file is
-                 treated exactly like an OpenSubtitles download, not like an
-                 embedded track: it did not necessarily come from THIS
+                 (last resort) fetched from OpenSubtitles, then (if THAT
+                 didn't pan out either - no key, no match, quota exhausted,
+                 or a resync-validation rejection) SubDL, a second,
+                 independent subtitle source (see subdl.py). A sidecar file
+                 or either online source is treated the same way, not like
+                 an embedded track: it did not necessarily come from THIS
                  exact cut of the file, so its own timestamps are never
-                 trusted either - both are realigned to the transcript's own
+                 trusted either - all are realigned to the transcript's own
                  word timings via flag_language.resync_units_to_transcript
                  before use. See AGENTS.md.
 
@@ -253,6 +256,8 @@ OPENSUBS_TRACK_SUFFIX = " (OpenSubtitles)"  # the extra uncensored track remux()
 #                                             (is_own_output_track) so it's replaced, not duplicated
 SIDECAR_TRACK_SUFFIX = " (Sidecar)"  # same idea as OPENSUBS_TRACK_SUFFIX, for a sidecar subtitle
 #                                       file next to the input - see find_sidecar_subtitle/main()
+SUBDL_TRACK_SUFFIX = " (SubDL)"  # same idea as OPENSUBS_TRACK_SUFFIX, for a subdl.com-sourced
+#                                   subtitle - see subdl.py/main()
 
 SIDECAR_SUB_EXTS = (".srt", ".vtt", ".ass", ".ssa")  # ffmpeg converts .ass/.ssa to plain SRT text
 #                                                        before resyncing; .srt/.vtt parse as-is
@@ -374,6 +379,18 @@ class Config:
     #                                    chosen audio track's own language)
     opensubtitles_query: str = ""      # override the title auto-guessed from the filename
     opensubtitles_id: str = ""         # exact OpenSubtitles file_id to download - bypasses search
+
+    subdl: bool = True                 # SECOND, independent subtitle source (subdl.com, see
+    #                                    subdl.py) - tried whenever OpenSubtitles didn't produce a
+    #                                    usable result (no key, no match, quota exhausted, or its
+    #                                    own resync validation rejected a wrong-film match), not
+    #                                    only when OpenSubtitles is unconfigured. Needs its own
+    #                                    free API key - subdl.py's docstring / sign up at
+    #                                    https://subdl.com. Same "never trust its own timestamps"
+    #                                    posture as opensubtitles above.
+    subdl_lang: str = "en"             # 2-letter language to search/download ("" = fall back to
+    #                                    opensubtitles_lang, then the chosen audio track's language)
+    subdl_query: str = ""              # override the title auto-guessed from the filename
 
     faith_detection: bool = True        # TMDB keyword/genre lookup (tmdb.py) to detect an overtly
     #                                    Christian / faith-based film (movie OR TV) - when found,
@@ -1715,7 +1732,8 @@ def is_own_output_track(t: dict, cfg: Config) -> bool:
         return name == suffix.strip() or name.endswith(suffix)
 
     return (any(_matches(s) for s in audio_suffixes)
-            or _matches(OPENSUBS_TRACK_SUFFIX) or _matches(SIDECAR_TRACK_SUFFIX))
+            or _matches(OPENSUBS_TRACK_SUFFIX) or _matches(SIDECAR_TRACK_SUFFIX)
+            or _matches(SUBDL_TRACK_SUFFIX))
 
 
 def _span_expr(spans) -> str:
@@ -2997,6 +3015,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="override the OpenSubtitles search title auto-guessed from the filename")
     p.add_argument("--opensubtitles-id", dest="opensubtitles_id",
                    help="exact OpenSubtitles file_id to download - bypasses search entirely")
+    p.add_argument("--no-subdl", dest="subdl", action="store_false", default=None,
+                   help="don't fall back to SubDL (subdl.com) when OpenSubtitles didn't produce "
+                        "a usable result either - needs its own free API key, see subdl.py")
+    p.add_argument("--subdl-lang", dest="subdl_lang",
+                   help='2-letter language to search/download (default "en")')
+    p.add_argument("--subdl-query", dest="subdl_query",
+                   help="override the SubDL search title auto-guessed from the filename")
     p.add_argument("--no-faith-detection", dest="faith_detection", action="store_false", default=None,
                    help="don't look up TMDB to detect an overtly Christian/faith-based film (see "
                         "tmdb.py) - always use the normal irreverence wordlist instead of the "
@@ -3168,6 +3193,7 @@ def main(argv: list[str] | None = None) -> int:
                  "sync_ms", "subs_track", "srt_backfill", "sidecar_subs", "sidecar_lang",
                  "pgs_ocr", "pgs_ocr_lang", "vobsub_ocr", "vobsub_ocr_lang", "opensubtitles",
                  "opensubtitles_lang", "opensubtitles_query", "opensubtitles_id",
+                 "subdl", "subdl_lang", "subdl_query",
                  "faith_detection", "tmdb_query",
                  "stem_retranscribe", "output_dir", "retranscribe", "overwrite",
                  "stt_only", "transcript_formats", "transcript_diarize",
@@ -3200,6 +3226,7 @@ def main(argv: list[str] | None = None) -> int:
                              "there's no detection pass to report")
         cfg.opensubtitles = False   # stt-only is for pre-warming local-only detection - never
         #   spend an OpenSubtitles download/quota on a file that isn't being cleaned yet
+        cfg.subdl = False           # same reasoning, same posture, for the second subtitle source
 
     tools = locate_tools()
     ffmpeg, ffprobe = tools["ffmpeg"], tools["ffprobe"]
@@ -3477,6 +3504,35 @@ def main(argv: list[str] | None = None) -> int:
                                   "properties": {"language": lang3, "track_name": os_name}}
                     subs_tid = None
                     resynced_extra_srt = (synced_path, {"language": lang3, "track_name": os_name})
+
+        if subs_enabled and chosen_subs is None and cfg.subdl:
+            # Deliberately gated on chosen_subs still being None, not on WHY OpenSubtitles came
+            # up empty - a missing key, no match, a quota exhaustion, and a resync-validation
+            # rejection of a wrong-film match all look identical from here (chosen_subs never
+            # got set), and in every one of those cases this file still has zero subtitle
+            # corroboration without trying a second, independent source. See subdl.py.
+            if str(HERE) not in sys.path:
+                sys.path.insert(0, str(HERE))
+            import subdl
+            lang2 = (cfg.subdl_lang or "").lower() or subdl.LANG_3TO2.get(
+                (cp.get("language") or "").lower(), "en")
+            print(f"  subtitles: OpenSubtitles didn't provide a usable subtitle - trying SubDL "
+                  f"[{lang2}]...")
+            fetched = subdl.fetch_subtitle(media, cfg, force=cfg.retranscribe)
+            if fetched is not None:
+                raw_sdl_srt, sdl_meta = fetched
+                lang3 = subdl.LANG_2TO3.get(lang2, "und")
+                synced_path = media.with_name(f"{media.stem}.{lang2}.subdl.srt")
+                label = f"SubDL ({sdl_meta.get('release') or sdl_meta.get('sd_id')})"
+                result = resync_external_srt(raw_sdl_srt, get_transcript(), lang3, SUBDL_TRACK_SUFFIX,
+                                             synced_path, label)
+                if result is not None:
+                    synced_path, sdl_name = result
+                    raw_srt = synced_path
+                    chosen_subs = {"id": None, "type": "subtitles",
+                                  "properties": {"language": lang3, "track_name": sdl_name}}
+                    subs_tid = None
+                    resynced_extra_srt = (synced_path, {"language": lang3, "track_name": sdl_name})
 
         vocals_hits = None
         cached_instrumental = None   # a whole-track Instrumental stem produced "for free"

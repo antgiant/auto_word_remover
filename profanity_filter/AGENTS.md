@@ -17,6 +17,7 @@ for the whole toolkit and goes stale fast otherwise.
 |---|---|
 | `flag_language.py` | transcript scanner — finds every profanity / irreverence hit + timestamp in any common transcript format. Standalone CLI **and** importable API. |
 | `opensubtitles.py` | last-resort subtitle source — search + download from OpenSubtitles when there's no usable local subtitle at all (see "OpenSubtitles fallback" below). Standalone, pure stdlib. |
+| `subdl.py` | SECOND, independent subtitle source — search + download from SubDL (subdl.com) when OpenSubtitles didn't produce a usable result either (see "SubDL fallback" below). Standalone, pure stdlib. |
 | `tmdb.py` | faith-based-film detection — TMDB genre/keyword lookup that swaps the `irreverence` category for the stricter `irreverence_strict` one on an overtly Christian/faith-based film (see "Faith-based detection" below). Standalone, pure stdlib. |
 | `wordlists/` | `profanity.txt`, `irreverence.txt`, `profanity_strict.txt`, `irreverence_strict.txt` — plain-text match lists, re-read every run; `replacements.txt` — hand-authored word → replacement-word(s) map for `--method replace` (see "Word replacement" below) |
 | `word_replace.py` | `--method replace` orchestration: wordlist lookup/selection, donor-word search, the per-hit fallback chain, splice assembly, subtitle substitution. The only one of the files below `clean.py` itself imports. |
@@ -256,13 +257,14 @@ same way.
 
 ### OpenSubtitles fallback (`opensubtitles.py`, real-world subtitle sourcing for TV recordings)
 
-Last in the subtitle-discovery chain (text track -> CC608 -> sidecar file ->
-PGS OCR -> VobSub OCR -> **OpenSubtitles**), tried only when `chosen_subs` is
-still `None` after everything above - the common case for a TV recording,
-which almost never carries an embedded subtitle track of any kind. Needs an
-API key (see "Setup" below); degrades gracefully (a warning, pipeline
-continues without it) on a missing key, failed search, exhausted quota, or
-network error, same as every other optional dependency in this project.
+Second-to-last in the subtitle-discovery chain (text track -> CC608 ->
+sidecar file -> PGS OCR -> VobSub OCR -> **OpenSubtitles** -> SubDL, see
+below), tried only when `chosen_subs` is still `None` after everything
+above - the common case for a TV recording, which almost never carries an
+embedded subtitle track of any kind. Needs an API key (see "Setup" below);
+degrades gracefully (a warning, pipeline continues without it) on a missing
+key, failed search, exhausted quota, or network error, same as every other
+optional dependency in this project.
 
 **Why this needed a fundamentally different algorithm from `backfill_from_srt`
 above**: that function trusts an SRT's own timestamps to within `window`
@@ -387,6 +389,80 @@ because it will sometimes guess wrong. Not yet run end-to-end against a
 real commercial-broken TV recording - validated so far only by code review
 against the documented algorithm and by exercising `resync_units_to_
 transcript()`/`is_ad_cue()` on synthetic inputs.
+
+### SubDL fallback (`subdl.py`, a second independent subtitle source)
+
+Tried right after OpenSubtitles, still gated on `chosen_subs is None` - not
+on WHY OpenSubtitles came up empty. A missing key, no search match, an
+exhausted daily quota, and `resync_external_srt`'s own rejection of a
+wrong-film match all look identical from this point in the pipeline
+(`chosen_subs` never got set), and in every one of those cases the file
+still has zero subtitle corroboration without a second source to try.
+Reuses the exact same `resync_external_srt`/`resync_units_to_transcript`
+machinery OpenSubtitles does - nothing about this source's own timestamps
+is trusted either, for the same reasons (see the OpenSubtitles section
+above).
+
+**Why SubDL specifically**: investigated 2026-11-19 while looking for a
+second subtitle source as part of closing the "no subtitle anywhere" gap
+(see the hallucination-rescue work above). Podnapisi.net, the other
+long-standing free alternative, has been unreachable since ~2026-03-26 (the
+domain stopped resolving). Subscene and Addic7ed have no stable public API
+at all - scraping-only, aggressive anti-bot measures, frequent breakage.
+SubDL (subdl.com) is the one still-live, similarly free, key-based service
+with a documented-enough JSON API, and its own quota is independent of
+OpenSubtitles' - a file that's merely unlucky on one service still has a
+real shot at the other. A general multi-provider library (`subliminal`) was
+deliberately NOT adopted despite existing and covering more providers at
+once - it pulls in a real dependency tree (babelfish, guessit, requests,
+dogpile.cache, rarfile, click, ...) against this project's established
+"every module here is standalone, pure stdlib" posture (see
+`opensubtitles.py`'s own docstring); `subdl.py` follows that same posture,
+using only `urllib` + the stdlib `zipfile` (SubDL's normal download is a
+zip; `download()` checks the actual bytes for a `PK` signature rather than
+guessing from the URL shape, since the `unpack=1` query param's exact
+behavior isn't documented precisely enough to trust blindly).
+
+**The title-match guard is different from OpenSubtitles', and weaker by
+necessity**: `opensubtitles.best_title_match()` re-ranks EVERY result in the
+search response by title similarity, because OpenSubtitles returns multiple
+candidate films with their own titles to check. SubDL's API shape is
+different - its `subtitles` array is already scoped server-side to just the
+FIRST matched title in `results`, with no per-subtitle title of its own to
+re-rank against. So `subdl.fetch_subtitle()` can only check `results[0]`
+itself (via the same `difflib`/`_MIN_TITLE_MATCH_RATIO` approach) before
+trusting anything in `subtitles` at all - a wrong top-level match has
+nothing further downstream to catch it except `resync_external_srt`'s own
+independent `_MIN_RESYNC_MATCH_FRACTION` guard (the same second layer of
+defense OpenSubtitles relies on too).
+
+**Setup**: sign up for a free API key at
+[subdl.com](https://subdl.com) (instant, no payment, from the API section
+of account settings), then either
+- set the `SUBDL_API_KEY` environment variable, or
+- drop it as the only line in a new `subdl.key` file next to `subdl.py`
+  (gitignored - never committed).
+
+Free-tier limits aren't published precisely by SubDL; word-of-mouth as of
+2026-11 is roughly 2000 searches / 50 downloads a day.
+`SubDLQuotaExceeded` mirrors `OpenSubtitlesQuotaExceeded`'s own same
+best-effort heuristic (HTTP 406/429, or "quota"/"limit" in the response
+body) and the same caveat that it isn't yet validated against a real
+quota-exceeded response.
+
+`--subdl-query` overrides the guessed title (reuses
+`opensubtitles.guess_query()` - the two modules share that one function
+rather than duplicating filename-parsing logic, since both already live in
+this project). `--no-subdl` disables this fallback entirely.
+
+**Known rough edges (POC, same status as OpenSubtitles above)**: not yet
+run end-to-end against a real file that actually needed it (every title
+tested locally so far already had OpenSubtitles coverage) - validated so
+far only by code review against the documented-enough API shape and a
+couple of live search calls. The exact conditions under which SubDL returns
+`unpack_files` vs. a plain zipped `subtitles[].url` aren't confirmed from
+real responses yet, which is why `download()` checks content rather than
+trusting either shape.
 
 ### Faith-based detection (`tmdb.py`, swapping to the `*_strict.txt` wordlists)
 
