@@ -796,6 +796,33 @@ def find_local_alignment_offset(segs_a: list[dict], segs_b: list[dict], target_b
     return statistics.mean(offsets)
 
 
+_SIBLING_MIN_OVERLAP_SEGMENTS = 50   # minimum total matching-block size (see
+#   has_substantial_overlap) before treating two files as the same underlying film worth
+#   cross-referencing at all, when they don't even share a leading prefix (find_shared_prefix_
+#   cutoff returned 0) - guards against wasting OCR effort (_find_usable_sub_units in clean.py
+#   can be expensive) on a candidate that just happens to share a directory, not real content.
+
+
+def has_substantial_overlap(segs_a: list[dict], segs_b: list[dict]) -> bool:
+    """True if `segs_a` and `segs_b` share enough matching segment TEXT somewhere - not
+    necessarily at the start - to be worth treating as two versions of the same film at all.
+    Unlike find_shared_prefix_cutoff (which requires an exact, index-aligned PREFIX - two cuts
+    sharing a literal master, like an edition re-edit), this allows matches anywhere, in any
+    order, which is what two INDEPENDENT rips/encodes of the same film need: confirmed
+    2026-11-18 that Apollo 13 (1995) and Apollo 13 (1995) (HD) don't share a prefix at all
+    (their very first segments are completely different - the HD rip's own opening is itself
+    a hallucination, and the two releases carry different amounts of lead-in narration before
+    the content lines up) despite being the same film through and through, just different
+    sources/cuts of the opening minutes. find_local_alignment_offset already handles per-hit
+    alignment once a candidate passes this gate - this function only decides whether it's
+    worth trying at all, which is why it's just a total-overlap-size check, not a timestamp."""
+    a_texts = [s.get("text") for s in segs_a]
+    b_texts = [s.get("text") for s in segs_b]
+    sm = difflib.SequenceMatcher(None, a_texts, b_texts, autojunk=False)
+    total = sum(b.size for b in sm.get_matching_blocks())
+    return total >= _SIBLING_MIN_OVERLAP_SEGMENTS
+
+
 def _is_full_cc(sub_units: list[Unit]) -> bool:
     """True if `sub_units` looks like a full SDH-style closed-caption track that transcribes
     non-dialogue audio (sound effects, music cues) as well as speech, not just a dialogue-only

@@ -870,35 +870,108 @@ def find_sibling_edition_cc(media: Path, js: Path, tools: dict, tmp: Path):
             continue
         if not cand_segs:
             continue
-        cutoff = flag_language.find_shared_prefix_cutoff(own_segs, cand_segs)
-        if not cutoff or cutoff < 5.0:   # too little shared material to be worth the probe below
+        cutoff = flag_language.find_shared_prefix_cutoff(own_segs, cand_segs) or 0.0
+        if cutoff < 5.0 and not flag_language.has_substantial_overlap(own_segs, cand_segs):
+            # No leading-prefix match AND no substantial overlap anywhere else either - not
+            # worth the OCR cost below on what's probably an unrelated file that just happens
+            # to share this directory. A real prefix match (cutoff >= 5.0) always proceeds
+            # even with 0 further overlap; a sibling that's merely SHIFTED throughout (two
+            # independent rips/encodes of the same film, not a true shared-master re-edit -
+            # confirmed 2026-11-18 on Apollo 13 (1995) vs. Apollo 13 (1995) (HD), whose very
+            # first segments don't even line up by list index) still needs this overlap check
+            # to pass, since cutoff alone would be 0 for it.
             continue
-        try:
-            tracks_all = run_json([tools["mkvmerge"], "-J", str(cand_media)])["tracks"]
-        except Exception:
+        sub_units, source_desc = _find_usable_sub_units(cand_media, tools, tmp)
+        if sub_units is None:
             continue
-        sub_track = next((t for t in tracks_all if t["type"] == "subtitles"
-                          and t["codec"] == "SubRip/SRT"
-                          and "cleaned" not in (t["properties"].get("track_name") or "").lower()
-                          and (t["properties"].get("language") or "").lower() in ("eng", "en", "")),
-                         None)
-        if sub_track is None:
-            continue
+        if flag_language._is_full_cc(sub_units) or flag_language._is_substantial_dialogue_track(sub_units):
+            print(f"  [note] borrowing {cand_media.name!r}'s {source_desc} as a cross-reference "
+                  f"for the t<={cutoff:.0f}s window this file's own transcript matches it "
+                  f"exactly - see flag_language.find_shared_prefix_cutoff")
+            return sub_units, cutoff, own_segs, cand_segs
+    return None, None, None, None
+
+
+def _find_usable_sub_units(cand_media: Path, tools: dict, tmp: Path):
+    """The first usable (full-CC or substantial-dialogue - see flag_language._is_full_cc /
+    _is_substantial_dialogue_track) English subtitle source for `cand_media`, trying plain
+    text (SubRip) first, then falling back to OCR'ing a PGS (Blu-ray) or VobSub (DVD) bitmap
+    track with Tesseract - the same pgs_ocr.py/vobsub_ocr.py machinery main() already uses for
+    a file's OWN subtitle discovery (see Config.pgs_ocr/vobsub_ocr), just reused here for a
+    SIBLING edition's track instead. Confirmed needed, not hypothetical: Apollo 13 (1995)
+    (HD).mkv's only subtitle track is already "(Cleaned)" with no original anywhere on the
+    file itself, but its own sibling rip, "Apollo 13 (1995).mkv", carries an uncleaned English
+    PGS track - OCR is the only way to use it.
+
+    OCR output is cached next to `cand_media` (same naming convention as main()'s own OCR
+    calls) so repeated probes - e.g. from several different sibling editions pointing back at
+    the same candidate - don't pay to re-OCR it each time.
+
+    Returns (sub_units, description) or (None, None) if nothing usable is found. Never raises -
+    a missing Tesseract install, a corrupt bitmap track, or any other failure in this OPTIONAL
+    cross-reference path just means "nothing found", not a crashed clean.py run."""
+    import flag_language
+    try:
+        tracks_all = run_json([tools["mkvmerge"], "-J", str(cand_media)])["tracks"]
+    except Exception:
+        return None, None
+
+    sub_track = next((t for t in tracks_all if t["type"] == "subtitles"
+                      and t["codec"] == "SubRip/SRT"
+                      and "cleaned" not in (t["properties"].get("track_name") or "").lower()
+                      and (t["properties"].get("language") or "").lower() in ("eng", "en", "")),
+                     None)
+    if sub_track is not None:
         cand_srt = tmp / "sibling_cc.srt"
         try:
             run([tools["mkvextract"], "tracks", str(cand_media), f"{sub_track['id']}:{cand_srt}"],
                 capture_output=True, text=True)
+            if cand_srt.is_file():
+                return flag_language.parse_srt(cand_srt), "text subtitle"
         except Exception:
-            continue
-        if not cand_srt.is_file():
-            continue
-        sub_units = flag_language.parse_srt(cand_srt)
-        if flag_language._is_full_cc(sub_units):
-            print(f"  [note] borrowing {cand_media.name!r}'s CC track as a cross-reference for "
-                  f"the t<={cutoff:.0f}s window this file's own transcript matches it "
-                  f"exactly - see flag_language.find_shared_prefix_cutoff")
-            return sub_units, cutoff, own_segs, cand_segs
-    return None, None, None, None
+            pass
+
+    tesseract_cmd = locate_tesseract()
+    if tesseract_cmd is None:
+        return None, None
+
+    pgs_track = next((t for t in tracks_all if t["type"] == "subtitles"
+                      and (t["properties"].get("codec_id") or "").upper() == "S_HDMV/PGS"
+                      and "cleaned" not in (t["properties"].get("track_name") or "").lower()
+                      and (t["properties"].get("language") or "").lower() in ("eng", "en", "")),
+                     None)
+    if pgs_track is not None:
+        try:
+            if str(HERE) not in sys.path:
+                sys.path.insert(0, str(HERE))
+            import pgs_ocr
+            cache_base = cand_media.with_name(f"{cand_media.stem}.eng.pgsocr")
+            stats = pgs_ocr.analyze_pgs_track(tools["mkvextract"], cand_media, pgs_track["id"],
+                                              cache_base, lang="eng", tesseract_cmd=tesseract_cmd)
+            if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                return flag_language.parse_srt(stats["srt_path"]), "PGS-OCR'd subtitle"
+        except Exception:
+            pass
+
+    vobsub_track = next((t for t in tracks_all if t["type"] == "subtitles"
+                         and (t["properties"].get("codec_id") or "").upper() == "S_VOBSUB"
+                         and "cleaned" not in (t["properties"].get("track_name") or "").lower()
+                         and (t["properties"].get("language") or "").lower() in ("eng", "en", "")),
+                        None)
+    if vobsub_track is not None:
+        try:
+            if str(HERE) not in sys.path:
+                sys.path.insert(0, str(HERE))
+            import vobsub_ocr
+            cache_base = cand_media.with_name(f"{cand_media.stem}.eng.vobsubocr")
+            stats = vobsub_ocr.analyze_vobsub_track(tools["mkvextract"], cand_media, vobsub_track["id"],
+                                                     cache_base, lang="eng", tesseract_cmd=tesseract_cmd)
+            if srt_text_len(stats["srt_path"]) >= _MIN_USABLE_SRT_CHARS:
+                return flag_language.parse_srt(stats["srt_path"]), "VobSub-OCR'd subtitle"
+        except Exception:
+            pass
+
+    return None, None
 
 
 def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = None,
