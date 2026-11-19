@@ -27,6 +27,7 @@ transcript instead of anything in this file's own timestamps.
 """
 from __future__ import annotations
 
+import difflib
 import gzip
 import json
 import os
@@ -175,6 +176,52 @@ def search(query: dict, lang2: str, key: str) -> list[dict]:
     return results
 
 
+def _normalize_title(s: str) -> str:
+    return re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
+
+
+_MIN_TITLE_MATCH_RATIO = 0.6   # minimum difflib similarity between the search query and a
+#   result's own title before trusting it at all - see best_title_match's docstring for why
+#   this is needed: search()'s own ordering is pure download-count popularity, with NO title
+#   relevance check at all.
+
+
+def best_title_match(results: list[dict], query_title: str) -> dict | None:
+    """Re-ranks `results` (already sorted by download_count by search()) to prefer a result
+    whose own title actually resembles `query_title`, rather than blindly trusting position 0.
+    Confirmed needed 2026-11-19: search() can return results for a COMPLETELY different, more
+    popular film when a query is ambiguous or the correct title just has few results of its
+    own - "Dr Dolittle 2" (2001) returned several "Rush Hour 2" (2001) results ranked by
+    download count ahead of the one genuinely correct "Dr. Dolittle 2" result sitting further
+    down; "VeggieTales Minnesota Cuke and the Search for Noah's Umbrella" (2009) returned nothing
+    but other, unrelated 2009 films (The Princess and the Frog, Alvin and the Chipmunks...) -
+    OpenSubtitles may simply have no listing for an obscure title at all, in which case there's
+    nothing correct to rank UP to - only a popular wrong one to correctly refuse.
+
+    Filters to results whose feature_details.movie_name (falling back to the release string
+    when movie_name is missing) is a reasonably close text match to the query title (see
+    _MIN_TITLE_MATCH_RATIO), then keeps search()'s own download-count ordering among THOSE -
+    so a popular correct match still wins over an obscure correct one, but a popular WRONG
+    match never beats a correct one, and nothing is returned at all when no candidate clears
+    the bar (a caller falling back to "most popular overall" in that case would be worse than
+    finding nothing - see clean.py's own resync_external_srt match-fraction check for the
+    second, independent layer of defense against this same failure mode)."""
+    norm_query = _normalize_title(query_title)
+    for r in results:
+        attrs = r.get("attributes", {})
+        feat = attrs.get("feature_details") or {}
+        candidate_title = feat.get("movie_name") or attrs.get("release") or ""
+        # movie_name is typically "YYYY - Title" - strip a leading year so it doesn't dilute
+        # the similarity score against a query that's usually just the bare title.
+        candidate_title = re.sub(r"^\d{4}\s*-\s*", "", candidate_title)
+        norm_candidate = _normalize_title(candidate_title)
+        if not norm_candidate:
+            continue
+        if difflib.SequenceMatcher(None, norm_query, norm_candidate).ratio() >= _MIN_TITLE_MATCH_RATIO:
+            return r
+    return None
+
+
 def download(file_id: int, key: str, token: str | None) -> str:
     data = _request("POST", "/download", key, token=token, body={"file_id": int(file_id)})
     link = data.get("link")
@@ -242,7 +289,14 @@ def fetch_subtitle(media: Path, cfg, out_dir: Path | None = None,
             if not results:
                 print(f"  [warn] OpenSubtitles: no results for {q!r}", file=sys.stderr)
                 return None
-            attrs = results[0].get("attributes", {})
+            best = best_title_match(results, q["query"])
+            if best is None:
+                print(f"  [warn] OpenSubtitles: {len(results)} result(s) for {q!r}, but none "
+                      f"closely enough matched the title (top hit was "
+                      f"{results[0].get('attributes', {}).get('release')!r}) - discarding "
+                      f"rather than risk a wrong film", file=sys.stderr)
+                return None
+            attrs = best.get("attributes", {})
             files = attrs.get("files") or []
             if not files:
                 print("  [warn] OpenSubtitles: top match has no downloadable file", file=sys.stderr)
