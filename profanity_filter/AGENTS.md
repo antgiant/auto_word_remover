@@ -1240,6 +1240,44 @@ lands right after it as the next alt, and the raw uncensored narrated track
 default background ambience, censored-narrated as the next thing to reach
 for, raw original last).
 
+**Reusing that track's audio as `mute_fill="stems"` fill (2026-11-19):**
+until now, a later `mute` run on such a file still paid for a brand new
+separator pass to build its own fill audio, even though a whole-track,
+vocals-free instrumental for this exact source track already exists and is
+sitting right there in the container (a `--method dialog` run's own
+output) - noticed on a real file (Monkey Kingdom, cleaned once with
+`--method dialog` and made primary) where asking for a normal profanity
+clean afterward re-stemmed the entire track from scratch for no reason.
+`_existing_wordless_track()` looks for a no-narration track built from the
+SAME source lineage as the one about to be cleaned (same
+`_own_output_base_name()`/`_stale_track_base_name()` match
+`is_own_output_track()` already uses for `(Cleaned)` tracks, checked
+against both `cfg.dialog_track_suffix` and the known real-world suffix
+variants in `DIALOG_LINEAGE_SUFFIXES`). If found AND its channel count
+matches the track being cleaned, `_reuse_existing_wordless_instrumental()`
+decodes it straight out of `media` (one plain ffmpeg `-map`, no separator
+call at all) and hands it to `mute_track()` as `cached_whole_instrumental`
+- the exact same parameter `Config.stem_retranscribe`'s
+`build_vocals_stem(also_instrumental=True)` side effect already feeds it
+for a different reason (see "Always-stem muting" below), so
+`splice_whole_track_stem()` splices flagged spans out of it exactly the
+same way either source got there. A channel-count mismatch (the dialog
+run's stemmer could only manage a smaller output layout than the source -
+see "Center-channel-only removal" below) is refused rather than
+up/downmixed silently; the normal cost-model stemming runs instead. Only
+wired up for `cfg.method == "mute"` - `cfg.method == "replace"` also
+accepts `cached_whole_instrumental` but was deliberately kept out of this
+reuse path, same as it's kept out of the unrelated `also_instrumental`
+side-effect a few lines below (see that comment) - not revisited here
+since nothing about THIS mechanism's own separator-call avoidance implies
+the replace-detection-transcript concern that one was reverted over, but
+diffs stayed minimal until there's a real file to validate it against.
+Validated with a synthetic two-audio-track mkv (distinct tones standing in
+for "original" vs. "wordless") confirming the extracted fill audio is
+bit-for-bit the Wordless track's own content, not the original's, plus
+unit coverage of the match/no-match/different-lineage/channel-mismatch
+cases.
+
 ### "cut" (audio-only inputs only, e.g. audiobooks)
 
 Cutting removes time, so it fundamentally can't work the way `mute`/`bleep` do:

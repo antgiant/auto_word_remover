@@ -1949,6 +1949,71 @@ def is_own_output_track(t: dict, cfg: Config) -> bool:
             or _matches(SUBDL_TRACK_SUFFIX))
 
 
+DIALOG_LINEAGE_SUFFIXES = (" (Wordless)", " (No Narration)")
+#   Both known real-world suffixes a PAST --method dialog run's own no-narration track can carry
+#   - the default (cfg.dialog_track_suffix) plus no_narration_batch.py's project-specific
+#   override - checked together (regardless of which config actually built the track) so
+#   _existing_wordless_track() below recognizes either one. Same reasoning as
+#   is_own_output_track's identical double-suffix check for mute/faith tracks.
+
+
+def _existing_wordless_track(tracks_all: list[dict], chosen: dict, cfg: Config) -> dict | None:
+    """If `tracks_all` already carries a "(Wordless)"/"(No Narration)" track built by a PAST
+    --method dialog run on this exact source lineage (same base name/language as `chosen` - see
+    _own_output_base_name/_stale_track_base_name, the same lineage match is_own_output_track
+    uses), return it; None otherwise. Used by the mute path (see
+    _reuse_existing_wordless_instrumental) to splice flagged spans straight out of that track's
+    own audio instead of paying for a fresh separator pass."""
+    source_base = _own_output_base_name(chosen)
+    suffixes = (cfg.dialog_track_suffix,) + DIALOG_LINEAGE_SUFFIXES
+    for t in tracks_all:
+        if (t["type"] == "audio" and t["id"] != chosen["id"] and is_no_narration_track(t)
+                and _stale_track_base_name(t, suffixes) == source_base):
+            return t
+    return None
+
+
+def _reuse_existing_wordless_instrumental(ffmpeg: str, media: Path, tracks_all: list[dict],
+                                          chosen: dict, cp: dict, cfg: Config,
+                                          tmp: Path) -> Path | None:
+    """mute_fill="stems" normally pays for a fresh vocal-separator pass to build the fill audio
+    for every flagged span (splice_stemmed_spans) or the whole track (splice_whole_track_stem) -
+    but if a PAST --method dialog run already built a whole-track, vocals-free "(Wordless)" track
+    for this exact source (see _existing_wordless_track), that work is already done and sitting
+    right there in the same container: decode it straight out of `media` and hand it to
+    mute_track() as `cached_whole_instrumental` instead, skipping the separator entirely - added
+    2026-11-19 after noticing a file like Monkey Kingdom, cleaned once with --method dialog and
+    made primary, paid for a second full separator pass from scratch the moment a normal
+    --method mute run was asked for too, even though the exact instrumental it needed already
+    existed on disk.
+
+    Returns None (falls back to the normal cost-model stemming) when no matching track exists,
+    or when one does but its channel count doesn't match the track actually being cleaned (e.g.
+    the stemmer could only manage a smaller output layout for it when the dialog track was
+    built - see --method dialog's own docstring) - reusing a mismatched channel count would
+    silently up/downmix the wrong thing into the fill audio rather than fail loudly, so it's
+    refused instead and the normal re-stem path is used."""
+    existing = _existing_wordless_track(tracks_all, chosen, cfg)
+    if existing is None:
+        return None
+    w_props = existing["properties"]
+    w_name = w_props.get("track_name") or "(Wordless)"
+    w_ch = int(w_props.get("audio_channels") or 0)
+    n_ch = int(cp.get("audio_channels") or 2)
+    if w_ch != n_ch:
+        print(f"  [note] found an existing {w_name!r} track (id {existing['id']}) for this "
+              f"source, but its channel count ({w_ch}) doesn't match the track being cleaned "
+              f"({n_ch}) - re-stemming instead of reusing it")
+        return None
+    w_pos = [t["id"] for t in tracks_all if t["type"] == "audio"].index(existing["id"])
+    print(f"  fill: found an existing {w_name!r} track (id {existing['id']}) built from this "
+          f"same source - reusing it as the whole-track instrumental instead of stemming the "
+          f"track again")
+    out = tmp / "existing_wordless_instrumental.wav"
+    run([ffmpeg, "-hide_banner", "-y", "-i", str(media), "-map", f"0:a:{w_pos}", str(out)])
+    return out
+
+
 def _span_expr(spans) -> str:
     return "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e, _ in spans)
 
@@ -4184,6 +4249,9 @@ def main(argv: list[str] | None = None) -> int:
                     if resumed:
                         print(f"  [note] resuming from a previous interrupted attempt - reusing "
                               f"any already-stemmed span(s) found in {ckpt_dir.name}")
+                    if cached_instrumental is None:
+                        cached_instrumental = _reuse_existing_wordless_instrumental(
+                            ffmpeg, media, tracks_all, chosen, cp, cfg, tmp)
                 clean_audio, used_center = mute_track(ffmpeg, ffprobe, media, audio_pos, spans, cfg,
                                                       chosen, tmp, stem_tool, cached_instrumental,
                                                       ckpt_dir=ckpt_dir)
