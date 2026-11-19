@@ -689,6 +689,31 @@ _CC_MIN_SFX_FRACTION = 0.02   # share of cues that are a PURE bracketed sound-ef
 #   fan-resynced third-party source that was never trying to describe non-speech audio. 2%
 #   leaves wide margin below the real case while still requiring more than an occasional
 #   one-off bracketed aside ("(laughs)") in an otherwise dialogue-only track.
+_DIALOGUE_TRACK_MIN_CUES = 300   # minimum cues before trusting a DIALOGUE-ONLY subtitle (one
+#   that fails _is_full_cc - no SFX-cue coverage) for exclude_via_cc_word_absence specifically.
+#   Confirmed 2026-11-18: Balto (1995, 752-cue OpenSubtitles track) and Cars (2006, 2032-cue
+#   studio track) both correctly show no nearby cue for confirmed-fake "fuck" hallucinations
+#   (the REAL line in Cars - "You were booking!" - reveals exactly how "booking" got misheard
+#   as "fucking"); Big (1988)'s 995-cue English dialogue track shows the matching line VERBATIM
+#   for one "fuck" hit (a real, MPAA-permitted single use in a PG film) and nothing nearby for
+#   a second, confirmed-fake one in the SAME file - word-presence/absence from a merely dense
+#   dialogue track is just as reliable as rescue_via_subtitle already assumes (that function has
+#   never required _is_full_cc). Set well above _CC_MIN_CUES (50) specifically to exclude thin
+#   forced/signs-only tracks, not to second-guess SDH classification - confirmed on the SAME
+#   Big (1988) file, which also ships an 8-cue French forced track and an 11-cue Spanish one.
+#   Deliberately NOT applied to exclude_via_cc_absence (the stricter "no cue of ANY kind"
+#   check) - that one's claim is broader (nothing happened at all, not just nothing SAID) and
+#   a dialogue-only track was never trying to describe non-speech audio, so staying full-CC-
+#   only there is still the right call.
+
+
+def _is_substantial_dialogue_track(sub_units: list[Unit]) -> bool:
+    """True if `sub_units` has enough cues to trust as a working dialogue subtitle (see
+    _DIALOGUE_TRACK_MIN_CUES) - weaker than _is_full_cc (doesn't require describing non-
+    dialogue audio), but still enough to rule out a near-empty forced/signs-only track."""
+    return len(sub_units) >= _DIALOGUE_TRACK_MIN_CUES
+
+
 _HALLUCINATION_NO_CC_WINDOW_S = 12.0   # how far from a hit's own timestamp to look for ANY cue
 #   (dialogue or sound-effect) before treating total silence in a full CC track as independent
 #   confirmation nothing was said there at all. Wider than _HALLUCINATION_RESCUE_WINDOW_S
@@ -855,16 +880,24 @@ def exclude_via_cc_word_absence(hits: list[dict], sub_units: list[Unit],
     _HALLUCINATION_RESCUE_WINDOW_S), just inverted and applied to hits the caller hasn't
     already flagged - a hit this WOULD rescue if it were already flagged is, by construction,
     never caught here, so the two functions can't contradict each other on the same hit.
-    Gated on _is_full_cc like exclude_via_cc_absence, for the same reason: a dialogue-only
-    source saying nothing about a word doesn't mean nothing was said, just that this track
-    was never trying to catch everything.
+
+    Gated on _is_full_cc OR _is_substantial_dialogue_track - unlike exclude_via_cc_absence,
+    which stays full-CC-only (its claim is broader: nothing happened at all, not just nothing
+    SAID). Confirmed 2026-11-18 this widening is safe: a merely dense dialogue-only track
+    (Balto (1995)'s 752-cue OpenSubtitles track, Cars (2006)'s 2032-cue studio track, Big
+    (1988)'s 995-cue English track) is just as reliable here as rescue_via_subtitle already
+    assumes for the opposite direction (that function has never required _is_full_cc either).
+    Big (1988) is the clean proof: its own dialogue track correctly shows nothing nearby for
+    one "fuck" hit (fake) and the line VERBATIM for a different one (a real, MPAA-permitted
+    single use in this PG film) - word-presence/absence works the same regardless of whether
+    the track also covers sound effects, since it was always about SPEECH specifically.
 
     Carries real risk a plain silence check doesn't: even a thorough SDH track can occasionally
     paraphrase a quick exclamation into a generic cue ("(EXCLAIMS)") rather than transcribing it
     verbatim, which would make this wrongly treat a real line as absent. Verify the blast radius
     broadly (not just on one already-confirmed file) before trusting this at library scale -
     see the 2026-11-18 commit message for how this was checked before shipping."""
-    if not _is_full_cc(sub_units):
+    if not (_is_full_cc(sub_units) or _is_substantial_dialogue_track(sub_units)):
         return
     for h in hits:
         if h.get("suspected_hallucination"):

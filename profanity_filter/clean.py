@@ -879,7 +879,8 @@ def find_sibling_edition_cc(media: Path, js: Path, tools: dict, tmp: Path):
             continue
         sub_track = next((t for t in tracks_all if t["type"] == "subtitles"
                           and t["codec"] == "SubRip/SRT"
-                          and "cleaned" not in (t["properties"].get("track_name") or "").lower()),
+                          and "cleaned" not in (t["properties"].get("track_name") or "").lower()
+                          and (t["properties"].get("language") or "").lower() in ("eng", "en", "")),
                          None)
         if sub_track is None:
             continue
