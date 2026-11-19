@@ -950,18 +950,30 @@ redo the (often expensive - stemming, PGS OCR) work either. `main()`
 fetches `tracks_all` (mkvmerge `-J`) and splits off `stale_ids` - every
 audio/subtitle track whose `track_name` ends with `cfg.track_name_suffix`/
 `cfg.dialog_track_suffix` (`is_own_output_track()`) - i.e. a track THIS TOOL
-added on a prior run. Everything that picks a track to work from
-(`choose_audio`/`choose_subs`/`choose_pgs`/`dialog_remove_track`'s dialogue-
-timing derivation) only ever sees the **stale-filtered** `tracks` list, so a
-rerun always re-detects from the true original source, never re-cleans an
-already-cleaned track or re-censors an already-censored subtitle.
+added on a prior run, from ANY source track. Everything that picks a track
+to work from (`choose_audio`/`choose_subs`/`choose_pgs`/
+`dialog_remove_track`'s dialogue-timing derivation) only ever sees the
+**stale-filtered** `tracks` list, so a rerun always re-detects from the true
+original source, never re-cleans an already-cleaned track or re-censors an
+already-censored subtitle - regardless of which original track it came from.
+
+Once `chosen` (the source track THIS run is cleaning) is known, `stale_ids`
+is narrowed further to `stale_audio_ids`/`stale_subs_ids` - only the
+previously-built own-output track(s) whose base name (`clean_label()`'s name-
+before-the-suffix, recovered in reverse by `_stale_track_base_name()`)
+matches `chosen`'s own (`_own_output_base_name()`). This is what makes
+"Cleaning more than one audio track in the same file" below safe: a stale
+track from a DIFFERENT source track's own prior run never gets compared
+against, rebuilt over, or dropped by this run.
 
 A fresh detection pass then runs exactly as normal (transcript reused from
 cache, wordlists re-scanned, PGS OCR cache reused) and its word set -
 `sorted({h["match"].lower() for ... in spans for h in hs})` - is compared
-against the PREVIOUS run's own `<final_dest.stem>.bleeps.json`
+against the PREVIOUS run's own `<final_dest.stem><report_tag>.bleeps.json`
 (`_load_prev_flagged_words()` - already exactly what that report's `spans`
-field records, no new state file needed):
+field records, no new state file needed; `report_tag` is empty for the
+default/primary source track - the common case, and the only one that
+existed before multi-track support - see below for when it isn't):
 
 - **Same set** (and no `--force`): skip the rebuild entirely - no ffmpeg/
   mkvmerge/stemming/PGS-censoring work, source untouched. This is the
@@ -969,14 +981,70 @@ field records, no new state file needed):
   scheduled recheck, or rerunning after an unrelated crash).
 - **Different set**, or `--force` given: rebuild as normal. `remux()`'s
   `exclude_audio_ids`/`exclude_subs_ids` (built from `tracks_all`, since the
-  stale ids no longer exist in the filtered `tracks`) drop the stale
-  track(s) from `media`'s import via mkvmerge's `--audio-tracks
+  stale ids no longer exist in the filtered `tracks`) drop the stale,
+  SAME-LINEAGE track(s) from `media`'s import via mkvmerge's `--audio-tracks
   '!id,id'`/`--subtitle-tracks '!id,id'` negation syntax - the fresh track
   REPLACES the stale one in the same build, rather than a second rebuild
-  needing to clean up after the first.
-- **Nothing flagged on this pass** (spans empty) but a `(Cleaned)` track
-  already exists: the existing track is left as-is - there's nothing to
-  build a replacement from, and this tool doesn't "un-clean" a file.
+  needing to clean up after the first. Any own-output track from a
+  DIFFERENT source track's lineage passes through untouched.
+- **Nothing flagged on this pass** (spans empty) but a same-lineage
+  `(Cleaned)` track already exists: the existing track is left as-is -
+  there's nothing to build a replacement from, and this tool doesn't
+  "un-clean" a file.
+
+### Cleaning more than one audio track in the same file (2026-11-19)
+
+`--source-track` (`choose_audio`) always let you point the whole pipeline at
+any audio track by index or language - not just the default dialogue one -
+but until this date doing that a SECOND time on a file that already had a
+different track cleaned was actively dangerous: `stale_ids` was computed
+once, globally, with no notion of which source track produced which prior
+`(Cleaned)` output, and `remux()`'s `exclude_audio_ids` dropped every
+own-output track matching the suffix - not just the one tied to this run's
+source. Cleaning a commentary or descriptive-audio track after the main
+dialogue track was already cleaned would silently DROP the dialogue track's
+`(Cleaned)` output from the rebuild instead of adding a second one alongside
+it. The `.bleeps.json` sidecar had the same problem one level up: it's keyed
+by filename alone (`<stem>.bleeps.json`, read/written by every batch script
+and the hallucination-fix backlog in this project), so a commentary-track
+run would read the DIALOGUE track's prior report for its own "did the
+flagged words change" comparison, and overwrite it with the commentary
+track's own report on completion.
+
+Both are fixed by making "is this track's prior output *mine*" ask "mine,
+AND built from the same source track" rather than just "mine":
+
+- `stale_audio_ids`/`stale_subs_ids` are computed from `chosen`/`chosen_subs`
+  onward (not before track selection), scoped via
+  `_own_output_base_name()`/`_stale_track_base_name()` - see above.
+- The `.bleeps.json` sidecar gets a `report_tag` suffix
+  (`<stem>.<slugified base name>.bleeps.json`, via `_filename_slug()`) when
+  `chosen` ISN'T the same track `choose_audio(tracks, "default")` would pick
+  - i.e. only for a non-default `--source-track` run. The default/primary
+  track keeps the exact plain `<stem>.bleeps.json` name every existing tool
+  already depends on - zero behavior change there.
+
+End state: `clean.py "<file>" --source-track 2` (the commentary track, say)
+on a file whose main dialogue track is already cleaned now produces a
+SEPARATE `Commentary (Cleaned)` audio track (named from track 2's own
+`track_name`/language, same as `clean_label()` always did) alongside the
+existing `Surround 5.1 (Cleaned)` one, with its own `<stem>.Commentary.bleeps.json`
+sidecar, and reruns against either track independently replace only that
+one's own prior output.
+
+**Known gap, not fixed here**: `--source-track` still only accepts
+`default`/a numeric index/a 3-letter language - there's no name-based
+"commentary"/"descriptive audio" auto-detection the way subtitle-candidate
+picking already skips commentary/karaoke tracks by name
+(`_SKIP_IMAGE_SUB_NAME_RE`). Finding the right index still means reading
+`mkvmerge -i` yourself. A file whose chosen source track has no name AND no
+recognized language also still has the ambiguity this whole scheme can't
+resolve: `_own_output_base_name()` falls back to `""` for ANY such track, so
+two differently-positioned nameless/unrecognized-language tracks would
+collide on the same bare `(Cleaned)` output name and the same untagged
+`.bleeps.json` - same ambiguity a human would have looking at the container,
+not something worth solving with track-ID tracking (ids aren't stable
+across a real rebuild anyway).
 
 Scoped to `mute`/`bleep`/`replace` only, matching what the user actually
 asked for ("only if that would result in a different set of words"):

@@ -1758,15 +1758,47 @@ def resync_external_srt(raw_srt_path: Path, js: Path, lang3: str, track_suffix: 
     return synced_path, track_name
 
 
-def clean_label(track: dict, suffix: str) -> str:
-    p = track["properties"]
+def _own_output_base_name(source_track: dict) -> str:
+    """The name portion clean_label() builds a fresh output track's name from, for this SOURCE
+    track - reused in reverse by _stale_track_base_name() to recognize which PREVIOUS
+    own-output track (if any) was built from this same source lineage, as opposed to a
+    different source track in the same file (e.g. a commentary or descriptive-audio track
+    cleaned in a separate run - see "Cleaning more than one audio track in the same file" in
+    AGENTS.md). "" means clean_label() would fall back to a bare suffix (no name, no recognized
+    language on the source track)."""
+    p = source_track["properties"]
     name = p.get("track_name") or ""
-    lang = p.get("language") or "und"
     if name:
-        return name + suffix
-    if LANG_NAMES.get(lang):
-        return LANG_NAMES[lang] + suffix
-    return suffix.strip()
+        return name
+    lang = p.get("language") or "und"
+    return LANG_NAMES.get(lang) or ""
+
+
+def _stale_track_base_name(t: dict, suffixes: tuple[str, ...]) -> str | None:
+    """If `t`'s track_name matches one of `suffixes` (bare, or appended to a base name - see
+    clean_label()), return the base name with that suffix stripped ("" for the bare case).
+    `None` if none of `suffixes` match at all - `t` isn't recognized as this kind of own-output
+    track. Compare the result against _own_output_base_name(this_run's_chosen_source_track) to
+    tell "this IS the previous output for the exact track I'm about to clean again" apart from
+    "this is a DIFFERENT source track's own-output, leave it alone"."""
+    name = t.get("properties", {}).get("track_name") or ""
+    for suffix in suffixes:
+        if name == suffix.strip():
+            return ""
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return None
+
+
+def clean_label(track: dict, suffix: str) -> str:
+    base = _own_output_base_name(track)
+    return base + suffix if base else suffix.strip()
+
+
+def _filename_slug(text: str) -> str:
+    """Filesystem-safe tag for a non-default --source-track's own .bleeps.json sidecar (see
+    main()'s report_tag) - strip characters Windows paths reject and collapse whitespace."""
+    return re.sub(r"\s+", "_", re.sub(r'[\\/:*?"<>|]', "", text)).strip("_") or "track"
 
 
 NO_NARRATION_NAME_MARKERS = ("no narration", "wordless")  # matched case-insensitively against a
@@ -3520,16 +3552,27 @@ def main(argv: list[str] | None = None) -> int:
     # exclude_audio_ids/exclude_subs_ids, so a fresh rebuild REPLACES the
     # stale track instead of piling up another one alongside it.
     tracks = [t for t in tracks_all if t["id"] not in stale_ids]
-    stale_audio_ids = [t["id"] for t in tracks_all if t["type"] == "audio" and t["id"] in stale_ids]
-    stale_subs_ids = [t["id"] for t in tracks_all if t["type"] == "subtitles" and t["id"] in stale_ids]
     if already_cleaned:
         print(f"  [note] {len(stale_ids)} pre-existing (Cleaned)/(Wordless) track(s) found - "
-              f"re-detecting from the original source; a fresh build only replaces them if the "
-              f"flagged words differ (--force to always replace)")
+              f"re-detecting from the original source; a fresh build only replaces the one(s) "
+              f"built from the SAME source track as this run, and only if the flagged words "
+              f"differ (--force to always replace). A previously-cleaned DIFFERENT source track "
+              f"(e.g. a commentary or descriptive-audio track cleaned in an earlier --source-track "
+              f"run) is left alone entirely - see _own_output_base_name/_stale_track_base_name.")
     chosen, _filtered_audio_pos = choose_audio(tracks, cfg.source_track)
     if chosen is None:
         print(f"  [warn] {media.name} has no audio track - skipping clean")
         return 0
+    # Stale-track exclusion is scoped to THIS run's chosen source track's own lineage (matched by
+    # base name - see _own_output_base_name/_stale_track_base_name) rather than every own-output
+    # track in the file: a file can legitimately carry more than one simultaneous (Cleaned) track
+    # (main dialogue, a commentary track, a descriptive-audio track, each cleaned via its own
+    # --source-track run) and a rebuild of one must never drop the others.
+    audio_suffixes = ((cfg.dialog_track_suffix,) if cfg.method == "dialog"
+                      else (cfg.track_name_suffix, cfg.faith_track_suffix))
+    this_audio_base = _own_output_base_name(chosen)
+    stale_audio_ids = [t["id"] for t in tracks_all if t["id"] in stale_ids and t["type"] == "audio"
+                       and _stale_track_base_name(t, audio_suffixes) == this_audio_base]
     # choose_audio()'s own index is computed within the STALE-FILTERED
     # `tracks` list, which is correct for picking WHICH track but wrong for
     # -map 0:a:{audio_pos}: every caller maps that number against the real,
@@ -3547,6 +3590,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  cleaning audio #{audio_pos}: "
           f"{cp.get('language', 'und')} / {cp.get('track_name') or '<no name>'} / "
           f"{cp.get('audio_channels', '?')}ch {cp.get('codec_id', '')}")
+
+    # The .bleeps.json sidecar report is keyed by filename alone (media.with_name(stem +
+    # ".bleeps.json")) everywhere else in this project (every batch script, the hallucination-fix
+    # backlog, etc.) - that convention MUST stay untouched for the default/primary audio track, or
+    # every existing tool that reads it by that exact path breaks. Only a run explicitly cleaning
+    # a DIFFERENT (non-default) source track - a commentary or descriptive-audio track alongside
+    # an already-cleaned primary one - gets a distinct, track-tagged sidecar name instead, so its
+    # own "no change since last run"/"(Cleaned) track" comparison reads the right prior report
+    # instead of colliding with (and overwriting) the primary track's.
+    default_chosen, _ = choose_audio(tracks, "default")
+    is_primary_audio = default_chosen is not None and chosen["id"] == default_chosen["id"]
+    report_tag = "" if is_primary_audio else f".{_filename_slug(this_audio_base or f'track{audio_pos}')}"
 
     subs_enabled = cfg.method not in ("cut", "dialog") and str(cfg.subs_track).lower() not in ("none", "skip", "off", "")
     chosen_subs, subs_tid = (None, None)
@@ -3902,8 +3957,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             new_words = sorted({h["match"].lower() for s, e, hs in spans for h in hs})
-            if already_cleaned:
-                prev_report = final_dest.parent / f"{final_dest.stem}.bleeps.json"
+            if stale_audio_ids:
+                prev_report = final_dest.parent / f"{final_dest.stem}{report_tag}.bleeps.json"
                 old_words = _load_prev_flagged_words(prev_report)
                 if old_words is not None and old_words == new_words and not args.force:
                     shown = ", ".join(new_words) if new_words else "(none)"
@@ -3920,11 +3975,11 @@ def main(argv: list[str] | None = None) -> int:
                     print("  --force: rebuilding regardless of whether the flagged words changed")
 
             if not spans:
-                if already_cleaned:
+                if stale_audio_ids:
                     print("  nothing flagged on this pass - leaving the existing (Cleaned) track "
                           "as-is (nothing to rebuild it from)")
                 elif args.record_clean:
-                    report = final_dest.parent / f"{final_dest.stem}.bleeps.json"
+                    report = final_dest.parent / f"{final_dest.stem}{report_tag}.bleeps.json"
                     report.write_text(json.dumps({
                         "source": str(media),
                         "output": None,
@@ -4034,7 +4089,7 @@ def main(argv: list[str] | None = None) -> int:
                 subs_stats = {"cues": ncues, "words": nwords}
                 print(f"  subtitles: {nwords} word(s) {action} across {ncues} cue(s)")
 
-        report = final_dest.parent / f"{final_dest.stem}.bleeps.json"
+        report = final_dest.parent / f"{final_dest.stem}{report_tag}.bleeps.json"
 
         def _build_report() -> dict:
             return {
@@ -4057,6 +4112,21 @@ def main(argv: list[str] | None = None) -> int:
                 "spans": [{"start": round(s, 3), "end": round(e, 3),
                            "matches": sorted({h["match"] for h in hs})} for s, e, hs in spans],
             }
+
+        # Same lineage-scoping as stale_audio_ids above (computed once chosen is known, before
+        # the TemporaryDirectory block), now that chosen_subs has settled into its final value -
+        # every synthetic dict assigned to it above (OpenSubtitles/sidecar/subdl/CC-608 fallback)
+        # always carries "properties": {"track_name": ...}, so _own_output_base_name() works the
+        # same way on it as on a real container track. Nothing to scope when this run never
+        # settled on a subtitle source at all (chosen_subs still None) - any existing cleaned
+        # subtitle track is left untouched, same as a different-lineage audio track.
+        stale_subs_ids: list = []
+        if chosen_subs is not None:
+            subs_suffixes = (cfg.track_name_suffix, cfg.faith_track_suffix,
+                             OPENSUBS_TRACK_SUFFIX, SIDECAR_TRACK_SUFFIX, SUBDL_TRACK_SUFFIX)
+            this_subs_base = _own_output_base_name(chosen_subs)
+            stale_subs_ids = [t["id"] for t in tracks_all if t["id"] in stale_ids and t["type"] == "subtitles"
+                              and _stale_track_base_name(t, subs_suffixes) == this_subs_base]
 
         id3_info = None
         if cfg.method == "cut":
