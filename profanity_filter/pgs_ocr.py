@@ -708,6 +708,32 @@ def censor_pgs_track(sup_path: Path, json_path: Path, spans, matchers: dict,
     return {"display_sets_touched": len(redactions), "words_redacted": words_redacted}
 
 
+def _transparent_index(palette: dict[int, int]) -> int:
+    """The palette index THIS stream's own PDS actually treats as background/
+    transparent (lowest alpha) - not assumed to be index 0. Confirmed
+    2026-11-19 as the root cause of reported "black box instead of
+    transparent" PGS redactions: _splice_sup previously hardcoded index 0
+    unconditionally. That's right for the overwhelming majority of real PGS
+    streams - index 0 gets its own dedicated compact RLE encoding (see
+    _decode_rle/_encode_rle's flag 0x00/0x40 cases) specifically because
+    background/transparent runs are so common, so most encoders DO put the
+    transparent color there - but it's a bitstream-compression convenience,
+    not a guarantee: a stream whose PDS assigns a non-zero alpha to index 0
+    and alpha 0 to a different index would have every "redacted" pixel
+    decode to an OPAQUE color (often black) instead of invisible, with
+    nothing in the OCR/rendering path catching it (render_cues already
+    builds its own alpha_lut from each display set's real palette, so
+    detection was never affected - only this write path was). Mirrors
+    vobsub_ocr.censor_vobsub_track's own `transparent_value = min(range(4),
+    key=lambda v: entry.info.contr[v])` for VobSub's fixed 4-entry palette,
+    generalised to PGS's up-to-256-entry one. Falls back to 0 only when a
+    display set's palette is empty (a PDS segment never arrived) - no
+    information to improve on in that case anyway."""
+    if not palette:
+        return 0
+    return min(palette, key=palette.get)
+
+
 def _splice_sup(sup_path: Path, display_sets: list[DisplaySet],
                  redactions: dict[int, dict[int, list]], out_sup_path: Path) -> None:
     """Copy `sup_path` through to `out_sup_path` byte-for-byte, except: for
@@ -731,12 +757,14 @@ def _splice_sup(sup_path: Path, display_sets: list[DisplaySet],
             if obj_id in redact_objs:
                 if seg.payload[3] & 0x40:  # first fragment - build+emit the replacement once
                     w, h, idx_bytes = display_sets[ds_index].images[obj_id]
+                    transparent_idx = _transparent_index(display_sets[ds_index].palette)
+                    fill = bytes([transparent_idx])
                     arr = bytearray(idx_bytes)
                     for (bx, by, bw, bh) in redactions[ds_index][obj_id]:
                         for row in range(max(0, by), min(h, by + bh)):
                             rs, re_ = row * w + max(0, bx), row * w + min(w, bx + bw)
                             if re_ > rs:
-                                arr[rs:re_] = bytes(re_ - rs)  # -> palette index 0 (transparent)
+                                arr[rs:re_] = fill * (re_ - rs)
                     out += _build_ods_segments(seg.pts, obj_id, w, h, _encode_rle(w, h, bytes(arr)))
                 continue  # drop the original fragment (first or continuation) - already replaced
         out += data[start_off:end_off]
