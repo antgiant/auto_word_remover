@@ -430,6 +430,34 @@ _HALLUCINATION_EPISODE_MAX_GAP_S = 120.0  # max elapsed time between two ADJACEN
 #   stretch, not literally back-to-back) - an earlier 20s cap missed most of that same episode
 #   entirely. 120s gives real margin above the worst gap actually seen while still well under
 #   a genuine scene-to-scene jump.
+_HALLUCINATION_BASELINE_MIN_WORDS = 5  # a segment needs at least this many words to count toward
+#   the "file's own typical confidence" baseline both hallucination checks below gate against -
+#   added 2026-11-20 after Wings of Life (2011): a third of its 177 segments were near-empty
+#   junk ("." repeated three times in a row, avg_logprob ~-0.99) from WhisperX decoding a
+#   near-silent/music-bed stretch into almost nothing. Averaging those into the file's own
+#   median dragged it down to -0.922 - low enough that an ACTUAL hallucinated sentence ("What
+#   the hell is wrong with you, you stupid bastard?", a known-phrase hit, avg_logprob -0.722)
+#   no longer looked anomalous relative to that self-contaminated baseline and went unexcluded.
+#   Restricting the baseline to segments with real sentence content fixes that without touching
+#   which segments get flagged, or any matching logic - confirmed to not move the baseline at
+#   all on files with a healthy transcript (God of Wonders, Of Penguins and Men: <10% junk
+#   segments, median shifts by <0.01).
+
+
+def _robust_median_logprob(segs: list[dict]) -> float | None:
+    """The shared baseline both detect_repeated_segments() and
+    detect_known_hallucination_phrases() gate against - median avg_logprob of segments with
+    enough real words to not be near-empty junk (WhisperX's own "nothing was really said here"
+    artifact, not a sign of real speech at all - see _HALLUCINATION_BASELINE_MIN_WORDS). Falls
+    back to every segment with an avg_logprob at all if none clear the word-count bar, rather
+    than returning None and disabling both checks outright on a short/sparse-transcript file."""
+    robust = [s["avg_logprob"] for s in segs
+             if s.get("avg_logprob") is not None
+             and len((s.get("text") or "").split()) >= _HALLUCINATION_BASELINE_MIN_WORDS]
+    if robust:
+        return statistics.median(robust)
+    all_lp = [s["avg_logprob"] for s in segs if s.get("avg_logprob") is not None]
+    return statistics.median(all_lp) if all_lp else None
 
 
 def _normalize_for_repeat_check(text: str) -> str:
@@ -478,10 +506,9 @@ def detect_repeated_segments(path: str | Path) -> dict[str, dict]:
     if not segs:
         return {}
 
-    logprobs = [s.get("avg_logprob") for s in segs if s.get("avg_logprob") is not None]
-    if not logprobs:
+    median_lp = _robust_median_logprob(segs)
+    if median_lp is None:
         return {}  # no confidence data at all - repeated text alone isn't trustworthy enough
-    median_lp = statistics.median(logprobs)
     threshold_lp = median_lp - _HALLUCINATION_LOGPROB_GAP
 
     normalized = [_normalize_for_repeat_check(s.get("text") or "") for s in segs]
@@ -634,10 +661,9 @@ def detect_known_hallucination_phrases(path: str | Path) -> dict[str, dict]:
     segs = data.get("segments") if isinstance(data, dict) else None
     if not segs:
         return {}
-    logprobs = [s.get("avg_logprob") for s in segs if s.get("avg_logprob") is not None]
-    if not logprobs:
+    median_lp = _robust_median_logprob(segs)
+    if median_lp is None:
         return {}
-    median_lp = statistics.median(logprobs)
     threshold_lp = median_lp - _HALLUCINATION_LOGPROB_GAP
     suspects: dict[str, dict] = {}
     for i, s in enumerate(segs):
