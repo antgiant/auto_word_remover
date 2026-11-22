@@ -21,10 +21,19 @@ newer transformers than this project's main WhisperX/pyannote stack is pinned to
 reason to risk that stack's pinned versions for an optional corroboration check that already
 degrades gracefully to "not installed" everywhere else in this codebase.
 
-Usage: parakeet_transcribe.py <input.wav> [--formats json|text] [--output-dir DIR]
-Writes "<input stem>.json" ({"text": "..."}) or "<input stem>.txt" (plain text) next to the
-input, or into --output-dir if given. Mirrors voice_to_text/transcribe.py's own CLI shape
-closely enough that clean.py's subprocess-invocation code looks the same either way."""
+Usage: parakeet_transcribe.py <input.wav> [<input2.wav> ...] [--formats json|text] [--output-dir DIR]
+Writes "<input stem>.json" ({"text": "..."}) or "<input stem>.txt" (plain text) next to each
+input, or into --output-dir if given - one output file per input, same as voice_to_text/
+transcribe.py's own CLI shape, so clean.py's existing per-clip output-reading code needs no
+changes.
+
+Accepts MULTIPLE inputs in one call on purpose (2026-11-22): the model loads once regardless of
+input count (~2-3s, confirmed) and transcribes a whole list in one `pipeline()` call - batching
+every hit a single file needs checked into ONE subprocess call instead of one per hit cuts the
+dominant cost (repeated model-load overhead) by the hit count. Added after finding the
+per-hit-subprocess design (parakeet_second_opinion_rescue/parakeet_audit_combined_mutes's
+original shape) would make auditing the ~343-file hallucination-fix backlog take many hours of
+pure reload overhead alone - see those two functions' own callers for the batching rewrite."""
 from __future__ import annotations
 
 import argparse
@@ -38,7 +47,7 @@ MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("input", type=Path)
+    ap.add_argument("inputs", type=Path, nargs="+")
     ap.add_argument("--formats", default="json", choices=["json", "text"])
     ap.add_argument("--output-dir", type=Path, default=None)
     ap.add_argument("--quiet", action="store_true")
@@ -52,7 +61,9 @@ def main() -> int:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gpu_lock"))
         try:
             import gpu_lock
-            gpu_ctx = gpu_lock.hold("Parakeet", f"transcribing {args.input.name}")
+            names = ", ".join(p.name for p in args.inputs[:3]) + (
+                "..." if len(args.inputs) > 3 else "")
+            gpu_ctx = gpu_lock.hold("Parakeet", f"transcribing {names}")
         except ImportError:
             pass  # gpu_lock is optional - only useful if you have other GPU tools to share with
 
@@ -61,20 +72,23 @@ def main() -> int:
     device = 0 if torch.cuda.is_available() else -1
     with gpu_ctx:
         asr = pipeline("automatic-speech-recognition", model=MODEL_ID, device=device)
-        result = asr(str(args.input))
-    text = result["text"] if isinstance(result, dict) else str(result)
+        results = asr([str(p) for p in args.inputs])
+    if isinstance(results, dict):
+        results = [results]  # a single input still comes back as one dict, not a 1-list
 
-    out_dir = args.output_dir or args.input.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if args.formats == "json":
-        out_path = out_dir / f"{args.input.stem}.json"
-        out_path.write_text(json.dumps({"text": text}, ensure_ascii=False, indent=2),
-                            encoding="utf-8")
-    else:
-        out_path = out_dir / f"{args.input.stem}.txt"
-        out_path.write_text(text, encoding="utf-8")
-    if not args.quiet:
-        print(f"wrote: {out_path}", file=sys.stderr)
+    for inp, result in zip(args.inputs, results):
+        text = result["text"] if isinstance(result, dict) else str(result)
+        out_dir = args.output_dir or inp.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if args.formats == "json":
+            out_path = out_dir / f"{inp.stem}.json"
+            out_path.write_text(json.dumps({"text": text}, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+        else:
+            out_path = out_dir / f"{inp.stem}.txt"
+            out_path.write_text(text, encoding="utf-8")
+        if not args.quiet:
+            print(f"wrote: {out_path}", file=sys.stderr)
     return 0
 
 

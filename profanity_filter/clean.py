@@ -1129,6 +1129,39 @@ find_spans() calls this for two kinds of hit, confirmed 2026-11-19: (a) the "tru
             print(f"    {h['time_hms']} {h['match']!r}")
 
 
+def _parakeet_batch_transcribe(py: str, clips: list[Path], out_dir: Path) -> dict[Path, str | None]:
+    """Runs parakeet_transcribe.py ONCE over every clip in `clips` - the model loads once
+    regardless of how many clips are passed (see that script's own docstring, ~2-3s either way,
+    confirmed) - instead of once per clip. Added 2026-11-22: auditing the full ~343-file
+    hallucination-fix backlog with the original one-subprocess-per-hit shape would have spent
+    many hours on pure model-reload overhead alone. Returns {clip: text}; a clip missing from
+    the result (this whole batch call failed, or Parakeet silently produced no output file for
+    it) maps to None - a caller must never treat None as a confirmed absence of the word."""
+    script = HERE / "parakeet_transcribe.py"
+    result: dict[Path, str | None] = {c: None for c in clips}
+    if not clips:
+        return result
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        run([py, str(script), *[str(c) for c in clips], "--formats", "json",
+             "--output-dir", str(out_dir), "--quiet"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except Exception as exc:
+        print(f"  [warn] Parakeet batch transcription failed outright ({exc!r}) - every clip "
+              f"in this batch stays unconfirmed", file=sys.stderr)
+        return result
+    for c in clips:
+        out_json = out_dir / f"{c.stem}.json"
+        if not out_json.is_file():
+            continue
+        try:
+            data = json.loads(out_json.read_text(encoding="utf-8"))
+            result[c] = data.get("text") or ""
+        except (OSError, json.JSONDecodeError):
+            pass
+    return result
+
+
 def parakeet_second_opinion_rescue(hits: list[dict], media: Path, tools: dict, tmp: Path) -> None:
     """Mutates `hits` in place. For each still-UNCONFIRMED bare-hallucination-word CANDIDATE
     (h["bare_word_candidate"], see flag_language.detect_bare_hallucination_word_candidates -
@@ -1165,7 +1198,6 @@ def parakeet_second_opinion_rescue(hits: list[dict], media: Path, tools: dict, t
     if py is None:
         return  # not installed - every candidate here just stays an unconfirmed, uncounted
         #   candidate forever (never excluded on its own say-so - see that key's docstring)
-    script = HERE / "parakeet_transcribe.py"
     try:
         tracks_all = run_json([mkvmerge, "-J", str(media)])["tracks"]
         chosen, _ = choose_audio(tracks_all, "default")
@@ -1177,7 +1209,10 @@ def parakeet_second_opinion_rescue(hits: list[dict], media: Path, tools: dict, t
         return
 
     import flag_language
-    confirmed = []
+    # Pass 1: extract every candidate's clip up front (cheap, ffmpeg-only) so pass 2 can check
+    # them ALL in one batched Parakeet call instead of one subprocess per hit - see
+    # _parakeet_batch_transcribe's own docstring for why that matters at scale.
+    pending = []  # (h, word, clip)
     for h in hits:
         t = h.get("time")
         if t is None:
@@ -1187,33 +1222,32 @@ def parakeet_second_opinion_rescue(hits: list[dict], media: Path, tools: dict, t
             continue
         start = max(0.0, t - _SECOND_OPINION_WINDOW_S / 2)
         clip = tmp / f"parakeet_{id(h)}.wav"
-        clip_out = tmp / f"parakeet_{id(h)}_out"
         try:
             run([ffmpeg, "-hide_banner", "-y", "-i", str(media), "-ss", f"{start:.3f}",
                  "-t", f"{_SECOND_OPINION_WINDOW_S:.3f}", "-map", f"0:a:{audio_pos}",
                  "-ar", "16000", "-ac", "1", str(clip)], capture_output=True)
-            clip_out.mkdir(exist_ok=True)
-            run([py, str(script), str(clip), "--formats", "json", "--output-dir", str(clip_out),
-                 "--quiet"], capture_output=True, text=True, encoding="utf-8", errors="replace")
-            out_json = clip_out / f"{clip.stem}.json"
-            if not out_json.is_file():
-                continue  # Parakeet failed for some reason - don't exclude on an absence we
-                #   can't actually trust
-            data = json.loads(out_json.read_text(encoding="utf-8"))
-            tokens = [flag_language._norm_tok(tok) for tok in (data.get("text") or "").split()]
-            if word not in tokens:
-                h["suspected_hallucination"] = h.pop("bare_word_candidate")
-                h["suspected_hallucination"]["confirmed_by_parakeet"] = True
-                confirmed.append(h)
-            else:
-                h.pop("bare_word_candidate", None)
+            pending.append((h, word, clip))
         except Exception as exc:
-            print(f"  [warn] Parakeet corroboration failed for {h.get('time_hms')} ({exc!r}) - "
-                  f"leaving this candidate unconfirmed (not excluded)", file=sys.stderr)
+            print(f"  [warn] Parakeet corroboration: couldn't extract a clip for "
+                  f"{h.get('time_hms')} ({exc!r}) - skipping", file=sys.stderr)
+
+    clip_out = tmp / "parakeet_rescue_batch_out"
+    texts = _parakeet_batch_transcribe(py, [c for _, _, c in pending], clip_out)
+
+    confirmed = []
+    for h, word, clip in pending:
+        text = texts.get(clip)
+        clip.unlink(missing_ok=True)
+        if text is None:
+            continue  # Parakeet failed for this clip - don't exclude on an absence we can't trust
+        tokens = [flag_language._norm_tok(tok) for tok in text.split()]
+        if word not in tokens:
+            h["suspected_hallucination"] = h.pop("bare_word_candidate")
+            h["suspected_hallucination"]["confirmed_by_parakeet"] = True
+            confirmed.append(h)
+        else:
             h.pop("bare_word_candidate", None)
-        finally:
-            clip.unlink(missing_ok=True)
-            shutil.rmtree(clip_out, ignore_errors=True)
+    shutil.rmtree(clip_out, ignore_errors=True)
     if confirmed:
         print(f"  [note] {len(confirmed)} additional hit(s) excluded - a bare word from the "
               f"known cross-film decoder-bias set (hell/shit/dick/bastard/ass/damn), scored "
@@ -1259,7 +1293,6 @@ def parakeet_audit_combined_mutes(hits: list[dict], media: Path, tools: dict, tm
     mkvmerge = tools.get("mkvmerge")
     if not ffmpeg or not mkvmerge:
         return report
-    script = HERE / "parakeet_transcribe.py"
     try:
         tracks_all = run_json([mkvmerge, "-J", str(media)])["tracks"]
         chosen, _ = choose_audio(tracks_all, "default")
@@ -1271,8 +1304,11 @@ def parakeet_audit_combined_mutes(hits: list[dict], media: Path, tools: dict, tm
         return report
 
     import flag_language
-    newly_excluded = []
-    cc_disagreements = []
+    # Pass 1: figure out which hits need checking and extract every clip up front, so pass 2
+    # can check them ALL in one batched Parakeet call - see _parakeet_batch_transcribe's own
+    # docstring for why that matters at scale (this is the audit that runs across the WHOLE
+    # backlog, not just one file, so the per-hit-subprocess cost multiplies hard here).
+    pending = []  # (h, word, cc_verified, clip)
     for h in hits:
         if h.get("suspected_hallucination"):
             continue  # already excluded by an earlier, cheaper check - no need to spend a
@@ -1284,31 +1320,29 @@ def parakeet_audit_combined_mutes(hits: list[dict], media: Path, tools: dict, tm
         if not word:
             continue
         cc_verified = sub_units is not None and flag_language.is_cc_confirmed(h, sub_units)
-
         start = max(0.0, t - _SECOND_OPINION_WINDOW_S / 2)
         clip = tmp / f"parakeet_audit_{id(h)}.wav"
-        clip_out = tmp / f"parakeet_audit_{id(h)}_out"
         try:
             run([ffmpeg, "-hide_banner", "-y", "-i", str(media), "-ss", f"{start:.3f}",
                  "-t", f"{_SECOND_OPINION_WINDOW_S:.3f}", "-map", f"0:a:{audio_pos}",
                  "-ar", "16000", "-ac", "1", str(clip)], capture_output=True)
-            clip_out.mkdir(exist_ok=True)
-            run([py, str(script), str(clip), "--formats", "json", "--output-dir", str(clip_out),
-                 "--quiet"], capture_output=True, text=True, encoding="utf-8", errors="replace")
-            out_json = clip_out / f"{clip.stem}.json"
-            if not out_json.is_file():
-                continue  # Parakeet failed for some reason - don't exclude (or count) on an
-                #   absence we can't actually trust
-            data = json.loads(out_json.read_text(encoding="utf-8"))
-            tokens = [flag_language._norm_tok(tok) for tok in (data.get("text") or "").split()]
-            heard = word in tokens
+            pending.append((h, word, cc_verified, clip))
         except Exception as exc:
-            print(f"  [warn] Parakeet combined-mute audit failed for {h.get('time_hms')} "
-                  f"({exc!r}) - leaving it as-is", file=sys.stderr)
-            continue
-        finally:
-            clip.unlink(missing_ok=True)
-            shutil.rmtree(clip_out, ignore_errors=True)
+            print(f"  [warn] Parakeet combined-mute audit: couldn't extract a clip for "
+                  f"{h.get('time_hms')} ({exc!r}) - skipping", file=sys.stderr)
+
+    clip_out = tmp / "parakeet_audit_batch_out"
+    texts = _parakeet_batch_transcribe(py, [c for _, _, _, c in pending], clip_out)
+
+    newly_excluded = []
+    cc_disagreements = []
+    for h, word, cc_verified, clip in pending:
+        text = texts.get(clip)
+        clip.unlink(missing_ok=True)
+        if text is None:
+            continue  # Parakeet failed for this clip - don't exclude (or count) on an absence
+            #   we can't actually trust
+        heard = word in [flag_language._norm_tok(tok) for tok in text.split()]
 
         if cc_verified:
             report["cc_checked"] += 1
@@ -1326,6 +1360,7 @@ def parakeet_audit_combined_mutes(hits: list[dict], media: Path, tools: dict, tm
                     "confirmed_by_parakeet": True,
                 }
                 newly_excluded.append(h)
+    shutil.rmtree(clip_out, ignore_errors=True)
 
     if newly_excluded:
         print(f"  [note] {len(newly_excluded)} additional hit(s) excluded by the combined-mute "
