@@ -873,14 +873,10 @@ literally no other corroboration available.
 
    Deliberately scoped NARROW - this is a targeted fix for a confirmed, specific bias, not a
    blanket re-verification of every span lacking CC backing. A hit whose matched word is outside
-   the small bare-word set above gets no Parakeet cross-check at all unless it separately hits
-   the repetition/known-phrase/CC-absence paths. Widening it to cover every CC-less span was
-   considered and deliberately deferred: Parakeet's own false-negative behavior on content
-   OUTSIDE what's been validated here (other words, other failure shapes) is simply unknown, and
-   trusting its absence-verdict on cases never tested against would risk a NEW class of false
-   negative (real profanity silently cleared) that doesn't exist in the narrow version - the
-   same "don't widen past what's actually been validated" caution `_KNOWN_HALLUCINATION_PHRASES`
-   itself was already built with.
+   the small bare-word set above gets no Parakeet cross-check at all from THIS function unless it
+   separately hits the repetition/known-phrase/CC-absence paths - see
+   `parakeet_audit_combined_mutes()` below for the broader, user-requested version of this same
+   idea, with its own explicit CC-protection rule.
 
    **Setup**: separate venv (`.venv-parakeet`, sibling to `.venv-stem`/`voice_to_text/.venv`) -
    `python -m venv .venv-parakeet`, then `pip install torch --index-url
@@ -902,6 +898,43 @@ literally no other corroboration available.
    own false-negative rate on REAL profanity in messy film audio (as opposed to clean ASR
    benchmark speech, where it outperforms Whisper on paper) is also simply untested - it was
    validated here only against the specific hallucination pattern it was brought in to catch.
+
+5. **`parakeet_audit_combined_mutes()`** (2026-11-21, `clean.py`, `--method mute` only) - the
+   broader version of point 4 the user explicitly asked for: run Parakeet over EVERY hit about
+   to go into the combined mute file, not just the narrow bare-word-set candidates. Runs once,
+   late in `find_spans()`, right before SRT backfill adds any new (inherently CC-backed) hits -
+   only spends a Parakeet call on a hit that isn't ALREADY excluded by one of the cheaper checks
+   above.
+
+   **The one hard rule, by explicit request**: a hit `flag_language.is_cc_confirmed()` finds
+   independent subtitle/CC evidence for is NEVER excluded here, no matter what Parakeet says -
+   CC evidence always outranks any ASR cross-check, this project's own included. `is_cc_confirmed()`
+   is the exact same window/word-match logic `rescue_via_subtitle()` already used (refactored out
+   so both share it, 2026-11-21) - exposed standalone so it can be asked of ANY hit, not just an
+   already-suspected one. Only a hit with NO independent confirmation either way can actually be
+   newly excluded by Parakeet's say-so here.
+
+   **Logging, by explicit request** - two rates, both printed every run (not just available on
+   inspection):
+   - **False-negative rate** = among CC-confirmed hits checked, how many Parakeet did NOT hear
+     ("the CC-verified words Parakeet couldn't find" - the user's own framing). These stay muted
+     regardless (the hard rule above), but the rate itself is a direct measure of how often
+     Parakeet's own blind spot would be wrong if it were ever trusted alone on a CC-backed case -
+     useful signal for whether this mechanism is trustworthy enough to lean on harder later.
+   - **False-positive rate** = among hits with NO CC backing checked, how many got newly excluded
+     because Parakeet also heard nothing there. This is the "the mute file called this profanity
+     but nothing independently confirms it, and an independent ASR cross-check agrees it's
+     hallucinated" population - the broader catch this function exists for.
+
+   Validated end to end against real data (not just by code review): a known-hallucinated hit
+   given a SYNTHETIC CC confirmation stayed muted despite Parakeet hearing nothing, correctly
+   counted as a false negative; a second known-hallucinated hit with no CC backing was correctly
+   newly excluded, counted as a false positive; both rates computed correctly from the report
+   dict. Caught and fixed along the way: both this function and `parakeet_second_opinion_rescue()`
+   were missing `encoding="utf-8", errors="replace"` on their `transcribe.py`/`parakeet_transcribe.py`
+   subprocess calls - Parakeet's own console output can contain bytes Windows' default cp1252
+   console codec can't decode, raising an unhandled background-thread exception (non-fatal, but
+   noisy and silently truncates captured output) on some clips.
 
 ### Word lists
 

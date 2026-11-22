@@ -1194,7 +1194,7 @@ def parakeet_second_opinion_rescue(hits: list[dict], media: Path, tools: dict, t
                  "-ar", "16000", "-ac", "1", str(clip)], capture_output=True)
             clip_out.mkdir(exist_ok=True)
             run([py, str(script), str(clip), "--formats", "json", "--output-dir", str(clip_out),
-                 "--quiet"], capture_output=True, text=True)
+                 "--quiet"], capture_output=True, text=True, encoding="utf-8", errors="replace")
             out_json = clip_out / f"{clip.stem}.json"
             if not out_json.is_file():
                 continue  # Parakeet failed for some reason - don't exclude on an absence we
@@ -1222,6 +1222,133 @@ def parakeet_second_opinion_rescue(hits: list[dict], media: Path, tools: dict, t
               f"either (see parakeet_second_opinion_rescue):")
         for h in confirmed:
             print(f"    {h['time_hms']} {h['match']!r}")
+
+
+def parakeet_audit_combined_mutes(hits: list[dict], media: Path, tools: dict, tmp: Path,
+                                  sub_units) -> dict:
+    """Runs over the FULL set of hits about to be combined into the final muted output - every
+    hit not already excluded by an earlier check, regardless of which word it is - broader than
+    parakeet_second_opinion_rescue()'s narrow bare-word-set population. Added 2026-11-21 at the
+    user's explicit request for comprehensive coverage of "the combined mute file", with one
+    hard rule: a hit an independent subtitle/CC cue confirms
+    (flag_language.is_cc_confirmed) is NEVER excluded here no matter what Parakeet says - CC
+    evidence always outranks an ASR cross-check, this project's own included. Parakeet is only
+    trusted to actually REMOVE a mute for a hit with NO independent confirmation either way.
+
+    Mutates `hits` in place (sets suspected_hallucination on newly-caught, CC-less hits only)
+    and returns a report dict:
+      cc_checked / cc_disagreed       - CC-confirmed hits checked, and how many of those
+                                         Parakeet did NOT hear (kept muted regardless - this is
+                                         the "CC-verified words Parakeet couldn't find" false-
+                                         negative rate: how often Parakeet's own blind spot
+                                         would be wrong if it were ever trusted alone on a
+                                         CC-confirmed case).
+      unverified_checked / unverified_excluded - hits with no CC backing checked, and how many
+                                         got newly excluded because Parakeet ALSO heard nothing
+                                         there - the false-positive rate: how often a hit this
+                                         file was about to mute with no independent confirmation
+                                         at all turns out to not hold up under an independent
+                                         cross-check.
+    Prints both rates directly (see main()'s own call site) so they land in every run's log,
+    not just where a caller bothers to inspect the return value."""
+    report = {"cc_checked": 0, "cc_disagreed": 0, "unverified_checked": 0, "unverified_excluded": 0}
+    py = locate_parakeet_tool()
+    if py is None or not hits:
+        return report
+    ffmpeg = tools.get("ffmpeg")
+    mkvmerge = tools.get("mkvmerge")
+    if not ffmpeg or not mkvmerge:
+        return report
+    script = HERE / "parakeet_transcribe.py"
+    try:
+        tracks_all = run_json([mkvmerge, "-J", str(media)])["tracks"]
+        chosen, _ = choose_audio(tracks_all, "default")
+        audio = [t for t in tracks_all if t["type"] == "audio"]
+        audio_pos = audio.index(chosen)
+    except Exception as exc:
+        print(f"  [warn] Parakeet combined-mute audit: couldn't pick an audio track ({exc!r}) - "
+              f"skipping", file=sys.stderr)
+        return report
+
+    import flag_language
+    newly_excluded = []
+    cc_disagreements = []
+    for h in hits:
+        if h.get("suspected_hallucination"):
+            continue  # already excluded by an earlier, cheaper check - no need to spend a
+            #   Parakeet call confirming something that's already decided
+        t = h.get("time")
+        if t is None:
+            continue
+        word = flag_language._norm_tok(h["match"].split()[-1])
+        if not word:
+            continue
+        cc_verified = sub_units is not None and flag_language.is_cc_confirmed(h, sub_units)
+
+        start = max(0.0, t - _SECOND_OPINION_WINDOW_S / 2)
+        clip = tmp / f"parakeet_audit_{id(h)}.wav"
+        clip_out = tmp / f"parakeet_audit_{id(h)}_out"
+        try:
+            run([ffmpeg, "-hide_banner", "-y", "-i", str(media), "-ss", f"{start:.3f}",
+                 "-t", f"{_SECOND_OPINION_WINDOW_S:.3f}", "-map", f"0:a:{audio_pos}",
+                 "-ar", "16000", "-ac", "1", str(clip)], capture_output=True)
+            clip_out.mkdir(exist_ok=True)
+            run([py, str(script), str(clip), "--formats", "json", "--output-dir", str(clip_out),
+                 "--quiet"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+            out_json = clip_out / f"{clip.stem}.json"
+            if not out_json.is_file():
+                continue  # Parakeet failed for some reason - don't exclude (or count) on an
+                #   absence we can't actually trust
+            data = json.loads(out_json.read_text(encoding="utf-8"))
+            tokens = [flag_language._norm_tok(tok) for tok in (data.get("text") or "").split()]
+            heard = word in tokens
+        except Exception as exc:
+            print(f"  [warn] Parakeet combined-mute audit failed for {h.get('time_hms')} "
+                  f"({exc!r}) - leaving it as-is", file=sys.stderr)
+            continue
+        finally:
+            clip.unlink(missing_ok=True)
+            shutil.rmtree(clip_out, ignore_errors=True)
+
+        if cc_verified:
+            report["cc_checked"] += 1
+            if not heard:
+                report["cc_disagreed"] += 1
+                cc_disagreements.append(h)
+            # NEVER excluded past this point, regardless of `heard` - CC evidence always wins
+        else:
+            report["unverified_checked"] += 1
+            if not heard:
+                report["unverified_excluded"] += 1
+                h["suspected_hallucination"] = {
+                    "reason": "parakeet-combined-mute-audit", "matched_locator": None,
+                    "gap_s": None, "avg_logprob": None, "median_avg_logprob": None,
+                    "confirmed_by_parakeet": True,
+                }
+                newly_excluded.append(h)
+
+    if newly_excluded:
+        print(f"  [note] {len(newly_excluded)} additional hit(s) excluded by the combined-mute "
+              f"Parakeet audit - no independent CC confirmation, and Parakeet heard nothing "
+              f"there either (see parakeet_audit_combined_mutes):")
+        for h in newly_excluded:
+            print(f"    {h['time_hms']} {h['match']!r}")
+    if cc_disagreements:
+        print(f"  [note] {len(cc_disagreements)} CC-CONFIRMED hit(s) Parakeet did NOT hear - "
+              f"kept muted regardless (CC evidence always outranks an ASR cross-check), logged "
+              f"as a Parakeet false negative:")
+        for h in cc_disagreements:
+            print(f"    {h['time_hms']} {h['match']!r}")
+
+    fn_rate = (f"{report['cc_disagreed'] / report['cc_checked'] * 100:.1f}%"
+              if report["cc_checked"] else "n/a (no CC-verified hits to check)")
+    fp_rate = (f"{report['unverified_excluded'] / report['unverified_checked'] * 100:.1f}%"
+              if report["unverified_checked"] else "n/a (no unverified hits to check)")
+    print(f"  [note] Parakeet combined-mute audit: {report['cc_checked']} CC-verified hit(s) "
+          f"checked, false-negative rate (CC-verified words Parakeet couldn't find) = {fn_rate}; "
+          f"{report['unverified_checked']} unverified hit(s) checked, false-positive rate "
+          f"(unverified hits newly excluded as hallucinations) = {fp_rate}")
+    return report
 
 
 def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = None,
@@ -1452,6 +1579,18 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
                 print(f"    {h['time_hms']} {h['match']!r} "
                       f"(avg_logprob {info['avg_logprob']:.2f} vs file median "
                       f"{info['median_avg_logprob']:.2f})")
+
+    # Comprehensive combined-mute-file audit (2026-11-21, user-requested) - covers every hit
+    # about to be muted, not just the narrow bare-word-set population above. mute-only: this
+    # is specifically about auditing what mute_track() is about to combine into the final
+    # output; bleep/cut/replace never asked for this broader (and more expensive - one
+    # Parakeet call per still-standing hit) pass.
+    if cfg.method == "mute" and media is not None and tools is not None and tmp is not None:
+        try:
+            parakeet_audit_combined_mutes(hits, media, tools, tmp, sub_units)
+            hits = [h for h in hits if not h.get("suspected_hallucination")]
+        except Exception as exc:
+            print(f"  [warn] Parakeet combined-mute audit failed ({exc!r})", file=sys.stderr)
 
     if cfg.srt_backfill and srt_path is not None and srt_path.is_file():
         try:

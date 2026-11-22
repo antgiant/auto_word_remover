@@ -746,6 +746,26 @@ _HALLUCINATION_RESCUE_WINDOW_S = 8.0  # how far from a suspected-hallucination h
 #   coincidental use of the same word elsewhere in a busy scene.
 
 
+def is_cc_confirmed(hit: dict, sub_units: list[Unit]) -> bool:
+    """True when an independent subtitle/CC cue near `hit`'s own timestamp actually contains
+    its matched word - the exact confirmation check rescue_via_subtitle() uses (see that
+    function below, which is now just this plus the suspected_hallucination bookkeeping),
+    exposed standalone so a caller can ask it of ANY hit, not just an already-suspected one.
+    Added 2026-11-21 for clean.py's parakeet_audit_combined_mutes() - it needs to know, for
+    EVERY hit about to be muted, whether independent CC evidence already backs it, since a
+    CC-confirmed hit must never be excluded no matter what a Parakeet cross-check says."""
+    t = hit.get("time")
+    if t is None or not sub_units:
+        return False
+    word = _norm_tok(hit["match"].split()[-1])
+    return any(
+        u.start is not None and u.start - _HALLUCINATION_RESCUE_WINDOW_S <= t
+        <= (u.end if u.end is not None else u.start) + _HALLUCINATION_RESCUE_WINDOW_S
+        and any(_norm_tok(tok) == word for tok in u.text.split())
+        for u in sub_units
+    )
+
+
 def rescue_via_subtitle(hallucinated_hits: list[dict], sub_units: list[Unit]) -> list[dict]:
     """Un-flags a suspected-hallucination hit when an INDEPENDENTLY-authored subtitle/CC cue
     near its timestamp actually contains the matched word. A hallucination filter trades real
@@ -770,18 +790,10 @@ def rescue_via_subtitle(hallucinated_hits: list[dict], sub_units: list[Unit]) ->
     identity if it wants to report what got rescued - this function itself only filters)."""
     still_bad = []
     for h in hallucinated_hits:
-        t = h["time"]
-        if t is None:
+        if h["time"] is None:
             still_bad.append(h)
             continue
-        word = _norm_tok(h["match"].split()[-1])
-        confirmed = any(
-            u.start is not None and u.start - _HALLUCINATION_RESCUE_WINDOW_S <= t
-            <= (u.end if u.end is not None else u.start) + _HALLUCINATION_RESCUE_WINDOW_S
-            and any(_norm_tok(tok) == word for tok in u.text.split())
-            for u in sub_units
-        )
-        if confirmed:
+        if is_cc_confirmed(h, sub_units):
             h["suspected_hallucination"]["rescued_by_subtitle"] = True
         else:
             still_bad.append(h)
