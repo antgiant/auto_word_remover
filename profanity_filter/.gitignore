@@ -17,6 +17,10 @@ __pycache__/
 # README.md "TTS/Voice-Conversion setup" to recreate
 /.venv-tts/
 
+# Parakeet hallucination-corroboration venv (transformers + CUDA torch,
+# several GB) - see README.md "Requirements summary" to recreate
+/.venv-parakeet/
+
 # per-speaker voice-conversion models trained from a specific media file's
 # own audio (see word_replace_synth.py) - cached next to the media, not
 # source

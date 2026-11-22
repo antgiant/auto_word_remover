@@ -812,6 +812,97 @@ warning (never a hard failure) when no stemmer is installed - same
 degrade-gracefully posture as `mute_fill = "stems"`/`--method dialog`.
 `--no-stem-retranscribe` on the CLI.
 
+### Transcription-hallucination detection (`flag_language.py`'s `detect_*` family)
+
+A known Whisper-family failure mode: during a stretch of audio with little or no real matching
+speech (silence, music, ambience), the decoder can fabricate plausible-sounding dialogue instead
+of transcribing nothing. Three independent checks, each gated by the SAME confidence signal (a
+segment's `avg_logprob` scoring notably below `_robust_median_logprob()` - the file's own
+"typical" confidence, computed from segments with real sentence content only so a file half full
+of near-empty junk segments doesn't drag its own baseline down into looking normal - see that
+function's docstring for the real Wings of Life (2011) case this was built against, 2026-11-20):
+
+1. **`detect_repeated_segments()`** - a segment whose text is a near-verbatim repeat of an
+   EARLIER segment, well separated in time. First confirmed on Elemental (2023), 2026-11-17: a
+   real line spoken once was replayed 7 more times during an unrelated musical climax.
+2. **`detect_known_hallucination_phrases()`** - a segment matching one of a handful of
+   DISTINCTIVE COMPOUND phrases ("stupid bastard", "stop being such a dick", ...) confirmed
+   recurring across wildly unrelated films regardless of genre/era/rating - trusted on
+   confidence alone since no real dialogue plausibly repeats these exact unusual phrasings that
+   often by coincidence.
+3. **`detect_bare_hallucination_word_candidates()`** (2026-11-20) - the SAME small vocabulary as
+   above (hell/shit/dick/bastard/ass/damn), but as ISOLATED BARE WORDS rather than wrapped in one
+   of the compound phrases - confirmed recurring the same way across four unrelated
+   narration-heavy documentaries (God of Wonders (2008), Final Events of Bible Prophecy, Of
+   Penguins and Men (2005), Disneynature's Wings of Life (2011); the first two also independent
+   evidence this is NOT specific to faith-based content). A bare single word is far too common
+   in genuine dialogue to trust on confidence alone the way the distinctive compound phrases
+   above can - so this function only ever returns CANDIDATES (a separate `bare_word_candidate`
+   key, never `suspected_hallucination` directly) - see point 4.
+
+Rescue/corroboration, in order of strength: an own subtitle/CC cue (`rescue_via_subtitle`) beats
+a sibling edition's CC (`find_sibling_edition_cc`) beats a second independent ASR pass. Up
+through 2026-11-19, that second pass was `second_opinion_rescue()` - a DIFFERENT WhisperX
+checkpoint (`_SECOND_OPINION_MODEL`) re-transcribing a wide raw-mix window, used for hits with
+literally no other corroboration available.
+
+4. **`parakeet_second_opinion_rescue()`** (2026-11-20, `clean.py`) - the actual gate for every
+   bare-word CANDIDATE from point 3 above. Re-transcribes the same wide window with **Parakeet**
+   (`parakeet_transcribe.py`, NVIDIA's `nvidia/parakeet-tdt-0.6b-v3` - FastConformer encoder +
+   TDT decoder, loaded via `transformers`' native support, NOT Whisper-derived at all) and
+   CONFIRMS the exclusion only if that independent pass hears nothing there either; if Parakeet
+   DOES hear the word, the candidate is cleared and the hit stays real. Built after confirming
+   `second_opinion_rescue()`'s own cross-checkpoint design does NOT help for this specific
+   failure mode: re-transcribing the same raw-mix window, and separately an isolated VOCALS stem
+   of it (audio-separator's `Vocals` stem, on the theory that stripping music/ambience would
+   leave Whisper nothing to hallucinate from), with a different WhisperX checkpoint reproduced
+   the IDENTICAL hallucinated text in every case tested, vocals-isolated or not - two Whisper
+   checkpoints share the same decoder bias on this content. Parakeet, tested against the exact
+   same clips, correctly returned EMPTY output for every one of those hallucinated windows while
+   still correctly transcribing real narration elsewhere in the same files. Validated end to end
+   (not just on cherry-picked clips) against all four real titles above: 14 of 14 bare-word
+   candidates across all four files were confirmed as hallucinations by Parakeet, 0 false clears
+   - though note all 14 happened to BE hallucinations (these four titles have little real
+   swearing to begin with), so this hasn't yet exercised the "Parakeet correctly clears a real
+   bare-word hit" path on live data, only on the synthetic real-narration clips used during
+   initial development. NVIDIA's Canary (`nvidia/canary-1b-v2`, via the full NeMo toolkit rather
+   than bare `transformers`) was also tried on the same clips for comparison - identical verdicts
+   on every point, but ~5-10x slower per clip and far heavier to install (NeMo pulls in
+   pytorch-lightning and a lot more); no accuracy advantage found to justify that cost, so it was
+   not integrated.
+
+   Deliberately scoped NARROW - this is a targeted fix for a confirmed, specific bias, not a
+   blanket re-verification of every span lacking CC backing. A hit whose matched word is outside
+   the small bare-word set above gets no Parakeet cross-check at all unless it separately hits
+   the repetition/known-phrase/CC-absence paths. Widening it to cover every CC-less span was
+   considered and deliberately deferred: Parakeet's own false-negative behavior on content
+   OUTSIDE what's been validated here (other words, other failure shapes) is simply unknown, and
+   trusting its absence-verdict on cases never tested against would risk a NEW class of false
+   negative (real profanity silently cleared) that doesn't exist in the narrow version - the
+   same "don't widen past what's actually been validated" caution `_KNOWN_HALLUCINATION_PHRASES`
+   itself was already built with.
+
+   **Setup**: separate venv (`.venv-parakeet`, sibling to `.venv-stem`/`voice_to_text/.venv`) -
+   `python -m venv .venv-parakeet`, then `pip install torch --index-url
+   https://download.pytorch.org/whl/cu128` and `pip install "transformers>=5.23" soundfile`.
+   Kept separate rather than added to `voice_to_text`'s own environment: Parakeet's
+   `transformers` support needs a newer `transformers` than the main WhisperX/pyannote stack is
+   pinned to, and there's no reason to risk that stack's pinned versions for an optional
+   corroboration check. `locate_parakeet_tool()` returning `None` (venv/script missing) just
+   means every bare-word candidate stays an unconfirmed, uncounted candidate forever - same
+   degrade-gracefully posture as the stemmer/OpenSubtitles/TMDB/Tesseract integrations, never a
+   hard failure.
+
+   Why NOT a primary-transcription-engine replacement: considered and rejected for this role.
+   WhisperX's forced-alignment word-level timestamps (needed for exact-span muting) and
+   diarization (needed for `--method replace`) have no equivalent in how Parakeet is used here;
+   replacing the primary engine would mean re-validating this whole pipeline's existing feature
+   set (SRT backfill, CC-absence checks, sibling-edition alignment, ...) against a different
+   transcript shape, a much bigger undertaking than a targeted corroboration check. Parakeet's
+   own false-negative rate on REAL profanity in messy film audio (as opposed to clean ASR
+   benchmark speech, where it outperforms Whisper on paper) is also simply untested - it was
+   validated here only against the specific hallucination pattern it was brought in to catch.
+
 ### Word lists
 
 One entry per line: literal phrase (whole-word, case-insensitive) or

@@ -122,6 +122,23 @@ mode", the torch build is still CPU-only):
 The default model (`UVR-MDX-NET-Inst_HQ_3.onnx`) downloads automatically on
 first use and is cached under the venv for later runs.
 
+The hallucination-detection safety net's bare-word corroboration check uses
+[Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (NVIDIA's
+FastConformer-TDT ASR, a non-Whisper architecture - see AGENTS.md's
+"Transcription-hallucination detection" for why), in its own venv,
+`.venv-parakeet\`, same isolation reasoning as `.venv-stem\` above. Optional -
+degrades gracefully to "no corroboration available" when not set up, same as
+every other optional integration here:
+
+```powershell
+python -m venv .venv-parakeet
+.venv-parakeet\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu128
+.venv-parakeet\Scripts\pip install "transformers>=5.23" soundfile
+```
+
+The model (~2.4 GB) downloads automatically on first use and is cached for
+later runs.
+
 A >2-channel track with no clean center channel is the slow case for
 `--method dialog` — the stemmer runs once *per channel* (see
 `build_instrumental_stem`) to keep the output at the source's channel count,
@@ -243,6 +260,7 @@ replacement" known limitations.
 - [ ] `ffmpeg` / `ffprobe` on PATH
 - [ ] `bin\mkvtoolnix\mkvmerge.exe` present (or MKVToolNix installed system-wide)
 - [ ] *(optional)* `.venv-stem\` set up per step 4, GPU verified if you have one
+- [ ] *(optional)* `.venv-parakeet\` set up, for the bare-word hallucination corroboration check
 - [ ] *(optional)* an OpenSubtitles API key per step 5, for the TV-recording subtitle fallback
 - [ ] *(optional)* a TMDB API key per step 6, for automatic faith-based detection
 - [ ] *(optional)* `.venv-tts\` set up per step 7, for `--method replace`
@@ -549,11 +567,15 @@ word_replace_synth.py / word_replace_tts_driver.py
 word_replace_prosody.py / word_replace_blend.py / word_replace_score.py
                      pitch/energy transplant, scene blending, candidate scoring
 _whisperx_check.py   experimental: validate a center-mute with real ASR
+parakeet_transcribe.py  bare-word hallucination corroboration (see AGENTS.md's
+                     "Transcription-hallucination detection"); runs under its
+                     own .venv-parakeet
 config.toml          defaults for clean.py (copy + --config to override)
 wordlists\           profanity.txt / irreverence.txt / profanity_strict.txt /
                      irreverence_strict.txt / replacements.txt - edit freely
 bin\                 gitignored - mkvmerge/mkvextract go here (see Install)
 .venv-stem\          gitignored - optional stemmer venv (see Install step 4)
+.venv-parakeet\      gitignored - optional hallucination-corroboration venv
 .venv-tts\           gitignored - optional TTS/voice-conversion venv (step 7)
 out\                 scratch dir (temp files + --keep-temp debug artifacts) -
                      the cleaned result replaces the source in place instead
@@ -576,3 +598,7 @@ AGENTS.md            engineering notes: how things work, known gotchas,
 - **Piper + RVC + pyworld**, in their own `.venv-tts\` — only needed for
   `--method replace`; see [TTS/Voice-Conversion setup](#7-ttsvoice-conversion-setup-optional).
   Degrades gracefully (falls back to muting every occurrence) without it.
+- **Parakeet** (`transformers` + `torch`), in its own `.venv-parakeet\` —
+  only needed for the bare-word hallucination corroboration check (see
+  AGENTS.md). Degrades gracefully (candidates stay unconfirmed, never
+  excluded) without it.

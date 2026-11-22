@@ -682,6 +682,63 @@ def detect_known_hallucination_phrases(path: str | Path) -> dict[str, dict]:
     return suspects
 
 
+_BARE_HALLUCINATION_WORDS = {"hell", "shit", "dick", "bastard", "ass", "damn"}
+#   The same small, closed vocabulary _KNOWN_HALLUCINATION_PHRASES' compound phrases are built
+#   from - confirmed 2026-11-20 to ALSO recur as ISOLATED bare words (not wrapped in one of this
+#   module's known compound phrases at all) across four completely unrelated narration-heavy
+#   documentaries (God of Wonders (2008), Final Events of Bible Prophecy, Of Penguins and Men
+#   (2005), Disneynature's Wings of Life (2011)) - dozens to hundreds of hits per file, the large
+#   majority of which neither detect_repeated_segments() (no verbatim repeat - the surrounding
+#   wording differs each time) nor detect_known_hallucination_phrases() (no compound-phrase
+#   match - it's just the bare word alone) ever even looked at.
+
+
+def detect_bare_hallucination_word_candidates(path: str | Path) -> dict[str, dict]:
+    """CANDIDATES only, not confirmed hallucinations - unlike every other check in this module,
+    this one is NEVER trusted on its own. A segment scoring notably below this file's own robust
+    median confidence (same gate every other check here uses) and containing one of
+    _BARE_HALLUCINATION_WORDS as one of its words is flagged as a candidate - but a bare single
+    word is far too common in genuine dialogue to exclude on confidence alone the way a
+    DISTINCTIVE compound phrase can (see detect_known_hallucination_phrases' own reasoning for
+    why compound phrases were judged safe and bare words explicitly were not, when this module's
+    phrase list was first built). clean.py's own parakeet_second_opinion_rescue() is the actual
+    gate: every candidate here gets an independent re-transcription pass with Parakeet (NVIDIA's
+    FastConformer-TDT architecture - NOT Whisper-derived, confirmed 2026-11-20 to not share
+    Whisper's own decoder bias on this exact content, unlike a second WhisperX checkpoint, which
+    reproduced the identical hallucinated text in every case tested) and is only actually
+    excluded if that independent pass ALSO fails to hear the word. Returns the same
+    {locator: {...}} shape as every other check here, but reason is "bare-hallucination-word-
+    candidate" - a caller filtering by presence of `suspected_hallucination` alone would wrongly
+    treat an unconfirmed candidate as an already-decided exclusion, so clean.py's own wiring
+    keeps this population separate until Parakeet has had its say."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    segs = data.get("segments") if isinstance(data, dict) else None
+    if not segs:
+        return {}
+    median_lp = _robust_median_logprob(segs)
+    if median_lp is None:
+        return {}
+    threshold_lp = median_lp - _HALLUCINATION_LOGPROB_GAP
+    candidates: dict[str, dict] = {}
+    for i, s in enumerate(segs):
+        lp = s.get("avg_logprob")
+        if lp is None or lp > threshold_lp:
+            continue
+        tokens = _normalize_for_repeat_check(s.get("text") or "").split()
+        if any(tok in _BARE_HALLUCINATION_WORDS for tok in tokens):
+            candidates[f"segment {i}"] = {
+                "reason": "bare-hallucination-word-candidate",
+                "matched_locator": None,
+                "gap_s": None,
+                "avg_logprob": lp,
+                "median_avg_logprob": median_lp,
+            }
+    return candidates
+
+
 _HALLUCINATION_RESCUE_WINDOW_S = 8.0  # how far from a suspected-hallucination hit's own
 #   timestamp to look for a confirming subtitle/CC cue - generous enough to absorb the
 #   transcript's own small timing slop (and the coarser cue-level timing a sidecar/OpenSubtitles
@@ -1030,6 +1087,16 @@ def scan_file(path: str | Path, matchers: dict[str, re.Pattern | None],
             info = phrase_suspects.get(h["locator"])
             if info is not None:
                 h["suspected_hallucination"] = info
+        bare_word_candidates = detect_bare_hallucination_word_candidates(path)
+        for h in hits:
+            # NOT stored under suspected_hallucination - these aren't decided exclusions yet,
+            # just candidates for clean.py's own Parakeet corroboration step (see that key's own
+            # docstring note above on detect_bare_hallucination_word_candidates).
+            if h.get("suspected_hallucination"):
+                continue
+            info = bare_word_candidates.get(h["locator"])
+            if info is not None:
+                h["bare_word_candidate"] = info
     hits.sort(key=lambda h: (h["time"] is None, h["time"] or 0.0, str(h["locator"])))
     return hits, fmt
 

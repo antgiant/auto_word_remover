@@ -562,6 +562,22 @@ def locate_stem_tool() -> str | None:
     return str(exe) if exe.is_file() else None
 
 
+PARAKEET_VENV = HERE / ".venv-parakeet"
+#   Separate from STEM_VENV/VOICE_TO_TEXT's own venv on purpose - see parakeet_transcribe.py's
+#   own docstring for why (needs a newer transformers than the main WhisperX/pyannote stack is
+#   pinned to). Optional, same degrade-gracefully posture as the stemmer/OpenSubtitles/TMDB/
+#   Tesseract integrations: locate_parakeet_tool() returning None just means
+#   parakeet_second_opinion_rescue()'s bare-word-hallucination-candidate population falls back
+#   to being left alone (never excluded on unconfirmed candidate status alone), not a hard
+#   failure anywhere in the pipeline.
+
+
+def locate_parakeet_tool() -> str | None:
+    exe = PARAKEET_VENV / "Scripts" / "python.exe"
+    script = HERE / "parakeet_transcribe.py"
+    return str(exe) if exe.is_file() and script.is_file() else None
+
+
 def locate_tesseract() -> str | None:
     """Tesseract OCR binary for pgs_ocr.py (PGS bitmap-subtitle OCR fallback -
     see Config.pgs_ocr). Checked at fixed install locations first, not just
@@ -1113,6 +1129,101 @@ find_spans() calls this for two kinds of hit, confirmed 2026-11-19: (a) the "tru
             print(f"    {h['time_hms']} {h['match']!r}")
 
 
+def parakeet_second_opinion_rescue(hits: list[dict], media: Path, tools: dict, tmp: Path) -> None:
+    """Mutates `hits` in place. For each still-UNCONFIRMED bare-hallucination-word CANDIDATE
+    (h["bare_word_candidate"], see flag_language.detect_bare_hallucination_word_candidates -
+    these are NOT yet suspected_hallucination, just candidates), re-transcribes a wide
+    raw-mixed-audio window with Parakeet (parakeet_transcribe.py, NVIDIA's FastConformer-TDT -
+    a structurally different ASR architecture, not Whisper-derived) and CONFIRMS the exclusion
+    (promotes it to a real h["suspected_hallucination"]) only if that independent pass does NOT
+    hear the matched word either. If Parakeet DOES hear it, the candidate is cleared and the hit
+    stays a normal, counted hit - same conservative direction second_opinion_rescue() already
+    takes, just inverted (that function CONFIRMS a rescue on presence; this one CONFIRMS an
+    exclusion on absence, since a bare word was never excluded in the first place without this
+    check - see that function's own docstring for why a bare word can't be trusted on confidence
+    alone the way the compound phrases it rescues can).
+
+    Built 2026-11-20 after confirming second_opinion_rescue()'s own cross-WhisperX-checkpoint
+    design doesn't help for this specific failure mode: re-transcribing the SAME raw-mix window,
+    and separately an ISOLATED VOCALS stem of it, with a different WhisperX checkpoint
+    (_SECOND_OPINION_MODEL) reproduced the IDENTICAL hallucinated text in every case tested
+    across God of Wonders (2008), Disneynature's Wings of Life (2011), and Of Penguins and Men
+    (2005) - two Whisper checkpoints share the same decoder bias on this content, vocals-isolated
+    or not. Parakeet, tested against the exact same clips, correctly returned EMPTY output for
+    every one of those same hallucinated windows while still correctly transcribing real
+    narration elsewhere in the same files - see parakeet_transcribe.py's own docstring for the
+    full validation writeup. No equivalent "known blind spot" has been found for Parakeet yet the
+    way second_opinion_rescue() documents one for the cross-checkpoint approach (screamed/
+    non-verbal exclamations) - revisit this docstring if one turns up."""
+    if not hits:
+        return
+    ffmpeg = tools.get("ffmpeg")
+    mkvmerge = tools.get("mkvmerge")
+    if not ffmpeg or not mkvmerge:
+        return
+    py = locate_parakeet_tool()
+    if py is None:
+        return  # not installed - every candidate here just stays an unconfirmed, uncounted
+        #   candidate forever (never excluded on its own say-so - see that key's docstring)
+    script = HERE / "parakeet_transcribe.py"
+    try:
+        tracks_all = run_json([mkvmerge, "-J", str(media)])["tracks"]
+        chosen, _ = choose_audio(tracks_all, "default")
+        audio = [t for t in tracks_all if t["type"] == "audio"]
+        audio_pos = audio.index(chosen)
+    except Exception as exc:
+        print(f"  [warn] Parakeet corroboration: couldn't pick an audio track ({exc!r}) - "
+              f"skipping", file=sys.stderr)
+        return
+
+    import flag_language
+    confirmed = []
+    for h in hits:
+        t = h.get("time")
+        if t is None:
+            continue
+        word = flag_language._norm_tok(h["match"].split()[-1])
+        if not word:
+            continue
+        start = max(0.0, t - _SECOND_OPINION_WINDOW_S / 2)
+        clip = tmp / f"parakeet_{id(h)}.wav"
+        clip_out = tmp / f"parakeet_{id(h)}_out"
+        try:
+            run([ffmpeg, "-hide_banner", "-y", "-i", str(media), "-ss", f"{start:.3f}",
+                 "-t", f"{_SECOND_OPINION_WINDOW_S:.3f}", "-map", f"0:a:{audio_pos}",
+                 "-ar", "16000", "-ac", "1", str(clip)], capture_output=True)
+            clip_out.mkdir(exist_ok=True)
+            run([py, str(script), str(clip), "--formats", "json", "--output-dir", str(clip_out),
+                 "--quiet"], capture_output=True, text=True)
+            out_json = clip_out / f"{clip.stem}.json"
+            if not out_json.is_file():
+                continue  # Parakeet failed for some reason - don't exclude on an absence we
+                #   can't actually trust
+            data = json.loads(out_json.read_text(encoding="utf-8"))
+            tokens = [flag_language._norm_tok(tok) for tok in (data.get("text") or "").split()]
+            if word not in tokens:
+                h["suspected_hallucination"] = h.pop("bare_word_candidate")
+                h["suspected_hallucination"]["confirmed_by_parakeet"] = True
+                confirmed.append(h)
+            else:
+                h.pop("bare_word_candidate", None)
+        except Exception as exc:
+            print(f"  [warn] Parakeet corroboration failed for {h.get('time_hms')} ({exc!r}) - "
+                  f"leaving this candidate unconfirmed (not excluded)", file=sys.stderr)
+            h.pop("bare_word_candidate", None)
+        finally:
+            clip.unlink(missing_ok=True)
+            shutil.rmtree(clip_out, ignore_errors=True)
+    if confirmed:
+        print(f"  [note] {len(confirmed)} additional hit(s) excluded - a bare word from the "
+              f"known cross-film decoder-bias set (hell/shit/dick/bastard/ass/damn), scored "
+              f"well below this file's own confidence, confirmed as a hallucination by an "
+              f"independent Parakeet (non-Whisper) re-transcription that heard nothing there "
+              f"either (see parakeet_second_opinion_rescue):")
+        for h in confirmed:
+            print(f"    {h['time_hms']} {h['match']!r}")
+
+
 def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = None,
                extra_hits: list[dict] | None = None, vocals_hits: list[dict] | None = None,
                media: Path | None = None, tools: dict | None = None, tmp: Path | None = None):
@@ -1270,6 +1381,23 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
                            if not h["suspected_hallucination"].get("rescued_by_subtitle")]
         except Exception as exc:
             print(f"  [warn] second-opinion rescue check failed ({exc!r})", file=sys.stderr)
+
+    # Bare-hallucination-word candidates (see flag_language.detect_bare_hallucination_word_
+    # candidates) are a separate population from `hallucinated` above - they were never
+    # suspected_hallucination in the first place (a bare word alone isn't trusted on confidence
+    # alone), so they need their OWN corroboration pass rather than reusing second_opinion_rescue's
+    # candidate list.
+    bare_word_population = [h for h in hits
+                            if h.get("bare_word_candidate") and not h.get("suspected_hallucination")]
+    if bare_word_population and media is not None and tools is not None and tmp is not None:
+        try:
+            parakeet_second_opinion_rescue(bare_word_population, media, tools, tmp)
+            new_bare_word_excluded = [h for h in bare_word_population
+                                      if h.get("suspected_hallucination")]
+            hallucinated = hallucinated + new_bare_word_excluded
+        except Exception as exc:
+            print(f"  [warn] Parakeet bare-word corroboration check failed ({exc!r})",
+                  file=sys.stderr)
 
     if hallucinated:
         rescued = [h for h in hits if h.get("suspected_hallucination", {}).get("rescued_by_subtitle")]
