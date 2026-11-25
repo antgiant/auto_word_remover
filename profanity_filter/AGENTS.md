@@ -902,9 +902,9 @@ literally no other corroboration available.
 5. **`parakeet_audit_combined_mutes()`** (2026-11-21, `clean.py`, `--method mute` only) - the
    broader version of point 4 the user explicitly asked for: run Parakeet over EVERY hit about
    to go into the combined mute file, not just the narrow bare-word-set candidates. Runs once,
-   late in `find_spans()`, right before SRT backfill adds any new (inherently CC-backed) hits -
-   only spends a Parakeet call on a hit that isn't ALREADY excluded by one of the cheaper checks
-   above.
+   late in `find_spans()` - after the vocals-stem rescan merges in anything it found (point 7
+   below), right before SRT backfill adds any new (inherently CC-backed) hits - only spends a
+   Parakeet call on a hit that isn't ALREADY excluded by one of the cheaper checks above.
 
    **The one hard rule, by explicit request**: a hit `flag_language.is_cc_confirmed()` finds
    independent subtitle/CC evidence for is NEVER excluded here, no matter what Parakeet says -
@@ -935,6 +935,57 @@ literally no other corroboration available.
    subprocess calls - Parakeet's own console output can contain bytes Windows' default cp1252
    console codec can't decode, raising an unhandled background-thread exception (non-fatal, but
    noisy and silently truncates captured output) on some clips.
+
+6. **`second_opinion_rescue()` batching** (2026-11-22, `clean.py`) - the original cross-
+   WhisperX-checkpoint rescue from point 3's intro paragraph (used for hits with literally no
+   subtitle/CC corroboration at all) extracted every candidate's clip and spawned its OWN
+   `transcribe.py` subprocess per hit - a fresh `_SECOND_OPINION_MODEL` load every time.
+   Investigating why Apollo 13 (1995) was missing 8 real swears a user actually heard found the
+   cause: of 12 hits that SHOULD have been rescued by this exact check, only 4 landed in the
+   file's real muted output - the other 8 were apparently lost to this mechanism's own fragility
+   under GPU contention (the Daily Movie Sweep/STT Sweep running concurrently, as they normally
+   do) sometime during the original rebuild. The same per-hit-subprocess shape was separately
+   confirmed as the cause of 2h timeouts on Blind Side (2009) and Hamilton (2020)
+   {edition-Sing-Along} during the Parakeet backlog audit - both have many hits with zero
+   subtitle/CC backing, each spawning its own model load serially. Fixed the same way
+   `_parakeet_batch_transcribe()` (point 4) already batches Parakeet: a new
+   `_second_opinion_batch_transcribe()` extracts every candidate clip first, then makes ONE
+   `transcribe.py` call for the whole batch (model loads once). Verified against Apollo 13:
+   identical, correct 12/12 rescue result post-fix - this doesn't change what the check decides,
+   only how many subprocess/model-load round trips it costs, which is what actually matters at
+   backlog scale.
+
+7. **Vocals-stem rescan ordering fix** (2026-11-25, `clean.py`) - a SEPARATE hallucination
+   source from points 1-6 above, found while investigating why The General (1926) and Hamilton
+   (2020) {edition-Sing-Along} had unexpectedly high final mute counts during the full-backlog
+   rerun that point 6 motivated. `_dedupe_vocals_hits()`'s merge (`hits = hits + new_from_vocals`
+   - a FRESH ASR re-transcription of the isolated vocals stem, exactly the same hallucination
+   risk profile as the primary transcript's own hits) used to run AFTER
+   `parakeet_audit_combined_mutes()` (point 5) had already finished auditing `hits` - so every
+   hit the vocals-stem rescan added bypassed EVERY hallucination safeguard in this file
+   entirely: no CC-confirmation, no Parakeet cross-check, nothing. For a file with real dialogue
+   this mostly went unnoticed (the vocals stem mostly does carry real speech). For a file with
+   little or none - The General (1926) is a true silent film, just an orchestral score - it was
+   catastrophic: all 291 of its flagged hits came from this one unvetted path, and all 291 got
+   muted. Confirmed NOT isolated to that one film: God of Wonders (2008) and Disneynature's
+   Wings of Life (2011) - two of the four ORIGINAL titles that started this whole investigation
+   (point 3's intro) - were STILL broken via this separate code path after every other fix,
+   along with 44 other titles in the same backlog (some by 1-2 spurious spans, several
+   narration-light documentaries by 80-140). Hamilton's own high count, checked the same way,
+   turned out to be real (CC-confirmed sung/rapped profanity, not from this path at all) - the
+   Sing-Along edition isn't a content-edited cut, just the same audio with karaoke captions.
+
+   Fix: moved the vocals-stem merge to run BEFORE `parakeet_audit_combined_mutes()` instead of
+   after (SRT backfill, by contrast, deliberately stays AFTER the audit and unmoved - those
+   hits are already subtitle-text-confirmed by construction, nothing to cross-check them
+   against). `parakeet_audit_combined_mutes()` re-transcribes a clip from the ORIGINAL media
+   around each hit's own timestamp, so it works identically regardless of which transcript
+   (primary or vocals-stem) a hit came from - no vocals-stem-specific handling needed, just the
+   reorder. Verified on The General: 291 flagged hits -> 0 post-fix, Parakeet correctly hearing
+   nothing in every clip. Every file already rebuilt under the old order before this fix (46
+   titles, found via a grep for `"vocals-stem rescan: +N"` where N > 0 across that rebuild's own
+   logs) needed a second `--force` pass with the corrected code - see
+   `_redo_vocals_rescan_affected.py` in the Profanity_Filter shell.
 
 ### Word lists
 

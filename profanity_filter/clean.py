@@ -1047,6 +1047,47 @@ _SECOND_OPINION_WINDOW_S = 60.0   # wide enough for the second pass to have real
 #   specifically to avoid stacking a second source of artifacts on top of a second model.
 
 
+def _second_opinion_batch_transcribe(py: Path, script: Path, clips: list[Path],
+                                      out_dir: Path) -> dict[Path, list[str] | None]:
+    """Runs transcribe.py ONCE over every clip in `clips` with _SECOND_OPINION_MODEL - its own
+    main() loads the ASR model before looping over `inputs`, confirmed - instead of once per
+    clip. Mirrors _parakeet_batch_transcribe's reasoning below; added 2026-11-22 after the
+    original per-hit-subprocess shape here (fresh ffmpeg extract + fresh model load per hit) was
+    found to be the likely cause of both multi-hour timeouts on hit-heavy no-subtitle files
+    (Blind Side, Hamilton) and incomplete rescue passes on files like Apollo 13 (1995), where
+    several hits that should have been rescued by this exact check never were - see this
+    project's own session notes for that investigation. Returns {clip: tokens}; a clip missing
+    from the result (the whole batch call failed outright, or transcribe.py produced no output
+    file for it) maps to None - a caller must never treat None as a confirmed absence of the
+    word, only as "couldn't check"."""
+    result: dict[Path, list[str] | None] = {c: None for c in clips}
+    if not clips:
+        return result
+    out_dir.mkdir(parents=True, exist_ok=True)
+    import flag_language
+    try:
+        run([str(py), "-X", "utf8", str(script), *[str(c) for c in clips],
+             "--model", _SECOND_OPINION_MODEL, "--no-diarize", "--formats", "json",
+             "--output-dir", str(out_dir), "--overwrite", "--quiet"],
+            cwd=str(VOICE_TO_TEXT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace")
+    except Exception as exc:
+        print(f"  [warn] second-opinion batch transcription failed outright ({exc!r}) - every "
+              f"clip in this batch stays unrescued", file=sys.stderr)
+        return result
+    for c in clips:
+        out_json = out_dir / f"{c.stem}.json"
+        if not out_json.is_file():
+            continue
+        try:
+            data = json.loads(out_json.read_text(encoding="utf-8"))
+            result[c] = [flag_language._norm_tok(tok)
+                        for seg in data.get("segments", []) for tok in seg["text"].split()]
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+    return result
+
+
 def second_opinion_rescue(hits: list[dict], media: Path, tools: dict, tmp: Path) -> None:
     """Mutates `hits` in place. For each still-suspected-hallucination hit, re-transcribes a
     wide raw-mixed-audio window around its own timestamp with a DIFFERENT WhisperX checkpoint
@@ -1063,7 +1104,11 @@ find_spans() calls this for two kinds of hit, confirmed 2026-11-19: (a) the "tru
     not containing a word isn't the same as proof nothing was said at all). See
     _SECOND_OPINION_MODEL's comment above for the validation data and its one known blind spot
     (screamed/non-verbal exclamations), which only ever errs toward leaving a hit muted, never
-    toward wrongly unmuting a real one."""
+    toward wrongly unmuting a real one.
+
+    Batched 2026-11-22 (see _second_opinion_batch_transcribe) - every candidate's clip is
+    extracted up front, then checked in ONE transcribe.py call instead of one fresh model load
+    per hit."""
     if not hits:
         return
     ffmpeg = tools.get("ffmpeg")
@@ -1085,7 +1130,9 @@ find_spans() calls this for two kinds of hit, confirmed 2026-11-19: (a) the "tru
         return
 
     import flag_language
-    rescued = []
+    # Pass 1: extract every candidate's clip up front (cheap, ffmpeg-only) so pass 2 can check
+    # them ALL in one batched transcribe.py call instead of one subprocess per hit.
+    pending = []  # (h, word, clip)
     for h in hits:
         t = h.get("time")
         if t is None:
@@ -1095,31 +1142,31 @@ find_spans() calls this for two kinds of hit, confirmed 2026-11-19: (a) the "tru
             continue
         start = max(0.0, t - _SECOND_OPINION_WINDOW_S / 2)
         clip = tmp / f"second_opinion_{id(h)}.wav"
-        clip_out = tmp / f"second_opinion_{id(h)}_out"
         try:
             run([ffmpeg, "-hide_banner", "-y", "-i", str(media), "-ss", f"{start:.3f}",
                  "-t", f"{_SECOND_OPINION_WINDOW_S:.3f}", "-map", f"0:a:{audio_pos}",
                  "-ar", "16000", "-ac", "1", str(clip)], capture_output=True)
-            clip_out.mkdir(exist_ok=True)
-            run([str(py), "-X", "utf8", str(script), str(clip), "--model", _SECOND_OPINION_MODEL,
-                 "--no-diarize", "--formats", "json", "--output-dir", str(clip_out),
-                 "--overwrite", "--quiet"], cwd=str(VOICE_TO_TEXT), capture_output=True, text=True)
-            out_json = clip_out / (clip.stem + ".json")
-            if not out_json.is_file():
-                continue
-            data = json.loads(out_json.read_text(encoding="utf-8"))
-            tokens = [flag_language._norm_tok(tok)
-                     for seg in data.get("segments", []) for tok in seg["text"].split()]
-            if word in tokens:
-                h["suspected_hallucination"]["rescued_by_subtitle"] = True
-                h["suspected_hallucination"]["rescued_by_second_opinion"] = True
-                rescued.append(h)
+            pending.append((h, word, clip))
         except Exception as exc:
-            print(f"  [warn] second-opinion rescue failed for {h.get('time_hms')} ({exc!r}) - "
-                  f"leaving it excluded", file=sys.stderr)
-        finally:
-            clip.unlink(missing_ok=True)
-            shutil.rmtree(clip_out, ignore_errors=True)
+            print(f"  [warn] second-opinion rescue: couldn't extract a clip for "
+                  f"{h.get('time_hms')} ({exc!r}) - leaving it excluded", file=sys.stderr)
+
+    clip_out = tmp / "second_opinion_batch_out"
+    tokens_by_clip = _second_opinion_batch_transcribe(py, script, [c for _, _, c in pending],
+                                                       clip_out)
+
+    rescued = []
+    for h, word, clip in pending:
+        tokens = tokens_by_clip.get(clip)
+        clip.unlink(missing_ok=True)
+        if tokens is None:
+            continue  # couldn't check this clip - leave the hit excluded, same fallback the
+            #   original per-hit try/except used on any failure
+        if word in tokens:
+            h["suspected_hallucination"]["rescued_by_subtitle"] = True
+            h["suspected_hallucination"]["rescued_by_second_opinion"] = True
+            rescued.append(h)
+    shutil.rmtree(clip_out, ignore_errors=True)
     if rescued:
         print(f"  [note] {len(rescued)} hit(s) RESCUED by an independent second-ASR-checkpoint "
               f"pass ({_SECOND_OPINION_MODEL}) over a wider raw-audio window - that pass still "
@@ -1615,6 +1662,30 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
                       f"(avg_logprob {info['avg_logprob']:.2f} vs file median "
                       f"{info['median_avg_logprob']:.2f})")
 
+    # Vocals-stem rescan hits are a FRESH ASR re-transcription (of the isolated vocals stem),
+    # not subtitle/CC-backed text - exactly the same hallucination risk profile as the primary
+    # transcript's own hits (confirmed 2026-11-25: on a near-silent-film/music-heavy file with no
+    # real vocals, the isolated "vocals" stem is mostly score/ambience, and WhisperX hallucinates
+    # against it just as readily as it does the raw mix - see The General (1926), 291/291 of its
+    # flagged hits from this exact path, and God of Wonders (2008)/Disneynature: Wings of Life
+    # (2011) - two of the ORIGINAL four films that started this whole hallucination
+    # investigation, still broken via this separate code path after every other fix). Merged in
+    # BEFORE parakeet_audit_combined_mutes() (moved down from its old spot after that audit, plus
+    # after srt_backfill) specifically so these hits get the exact same independent Parakeet
+    # cross-check every other still-standing hit already gets - that audit re-transcribes a clip
+    # from the ORIGINAL media around each hit's own timestamp, so it works identically regardless
+    # of which transcript (primary or vocals-stem) a hit came from. srt_backfill hits are
+    # deliberately NOT subject to this reordering - those are already subtitle-text-confirmed by
+    # construction, nothing to cross-check them against.
+    if vocals_hits:
+        new_from_vocals = _dedupe_vocals_hits(hits, vocals_hits, cfg.stem_retranscribe_min_gain_s)
+        if new_from_vocals:
+            hits = hits + new_from_vocals
+            print(f"  vocals-stem rescan: +{len(new_from_vocals)} word(s) the original transcript "
+                  f"missed entirely (isolated-vocals re-transcription)")
+        else:
+            print("  vocals-stem rescan: found nothing the original transcript hadn't already caught")
+
     # Comprehensive combined-mute-file audit (2026-11-21, user-requested) - covers every hit
     # about to be muted, not just the narrow bare-word-set population above. mute-only: this
     # is specifically about auditing what mute_track() is about to combine into the final
@@ -1638,15 +1709,6 @@ def find_spans(js: Path, cfg: Config, matchers: dict, srt_path: Path | None = No
                       f"({n_before} -> {len(hits)})")
         except Exception as exc:
             print(f"  [warn] srt backfill failed ({exc!r})", file=sys.stderr)
-
-    if vocals_hits:
-        new_from_vocals = _dedupe_vocals_hits(hits, vocals_hits, cfg.stem_retranscribe_min_gain_s)
-        if new_from_vocals:
-            hits = hits + new_from_vocals
-            print(f"  vocals-stem rescan: +{len(new_from_vocals)} word(s) the original transcript "
-                  f"missed entirely (isolated-vocals re-transcription)")
-        else:
-            print("  vocals-stem rescan: found nothing the original transcript hadn't already caught")
 
     extra_hits = extra_hits or []
     if extra_hits:
